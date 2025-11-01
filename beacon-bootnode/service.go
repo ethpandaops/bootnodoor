@@ -3,6 +3,7 @@ package bootnode
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -45,6 +46,9 @@ type Service struct {
 
 	// ping handles liveness checks
 	ping *discover.PingService
+
+	// ipDiscovery handles automatic IP detection from PONG responses (optional)
+	ipDiscovery *discv5.IPDiscovery
 
 	// startTime records when the service started
 	startTime time.Time
@@ -141,12 +145,6 @@ func New(cfg *Config) (*Service, error) {
 	discv5Config.MaxSessions = cfg.MaxSessions
 	discv5Config.Logger = cfg.Logger
 
-	// Set response filter
-	discv5Config.ResponseFilter = protocol.ChainResponseFilters(
-		protocol.LANAwareResponseFilter(),
-		forkFilter.ResponseFilter(),
-	)
-
 	// Set callbacks for protocol events
 	discv5Config.OnHandshakeComplete = func(n *node.Node, incoming bool) {
 		// Check and add node through service (handles all admission checks)
@@ -158,43 +156,41 @@ func New(cfg *Config) (*Service, error) {
 		s.CheckAndAddNode(n)
 	}
 
-	discv5Config.OnFindNode = func(msg *protocol.FindNode) []*node.Node {
-		// Serve FINDNODE requests from routing table
-		if len(msg.Distances) == 1 && msg.Distances[0] == 256 {
-			// Special case: return closest nodes (or random for flat table)
-			return routingTable.FindClosestNodes(localID, 16)
-		}
+	discv5Config.OnFindNode = func(msg *protocol.FindNode, requester *net.UDPAddr) []*node.Node {
+		// Serve FINDNODE requests from routing table with score-weighted random selection
+		nodes := routingTable.GetNodesByDistance(localID, msg.Distances, 16)
 
-		// Try to get bucket nodes (for backward compatibility with bucket-based table)
-		// This will return nil for FlatTable
-		var collectedNodes []*node.Node
-		for _, distance := range msg.Distances {
-			// Validate distance is in valid range (0-255)
-			if distance >= 256 {
-				continue
-			}
-
-			// Get nodes from the bucket at this distance
-			bucketNodes := routingTable.GetBucketNodes(int(distance))
-			collectedNodes = append(collectedNodes, bucketNodes...)
-
-			// Limit total nodes to 16 (standard Kademlia bucket size)
-			if len(collectedNodes) >= 16 {
-				collectedNodes = collectedNodes[:16]
-				break
-			}
-		}
-
-		// If we got no bucket nodes (e.g., using FlatTable), return random closest nodes
-		if len(collectedNodes) == 0 {
-			collectedNodes = routingTable.FindClosestNodes(localID, 16)
-		}
-
-		return collectedNodes
+		// Apply LAN-aware filtering
+		return s.filterNodesForRequester(nodes, requester)
 	}
 
 	// OnTalkReq can be nil for now (no TALKREQ support)
 	discv5Config.OnTalkReq = nil
+
+	// Set up IP discovery if enabled
+	if cfg.EnableIPDiscovery {
+		// Create IP discovery service with callback for consensus
+		ipDiscoveryConfig := discv5.IPDiscoveryConfig{
+			MinReports:        3,
+			MajorityThreshold: 0.75,
+			ReportExpiry:      30 * time.Minute,
+			RecentWindow:      5 * time.Minute,
+			OnConsensusReached: func(ip net.IP) {
+				s.handleIPConsensus(ip)
+			},
+			Logger: cfg.Logger,
+		}
+		s.ipDiscovery = discv5.NewIPDiscovery(ipDiscoveryConfig)
+
+		// Wire up OnPongReceived callback to feed IPs to discovery service
+		discv5Config.OnPongReceived = func(remoteNodeID node.ID, reportedIP net.IP) {
+			if s.ipDiscovery != nil {
+				s.ipDiscovery.ReportIP(reportedIP, remoteNodeID.String())
+			}
+		}
+
+		cfg.Logger.Info("IP discovery enabled - will detect public IP from PONG responses")
+	}
 
 	// Create the discv5 service
 	s.discv5Service, err = discv5.New(discv5Config)
@@ -723,4 +719,109 @@ func (s *Service) GetTotalChecks() int {
 
 func (s *Service) GetNetworkName() string {
 	return s.forkFilter.GetNetworkName()
+}
+
+// filterNodesForRequester applies LAN-aware filtering to nodes based on requester address.
+//
+// LAN requesters receive all nodes (LAN and WAN).
+// WAN requesters only receive WAN nodes (prevents leaking private network topology).
+func (s *Service) filterNodesForRequester(nodes []*node.Node, requester *net.UDPAddr) []*node.Node {
+	requesterIsLAN := node.IsLANAddress(requester.IP)
+	if requesterIsLAN {
+		// LAN requesters get all nodes
+		return nodes
+	}
+
+	// WAN requesters only get WAN nodes
+	filtered := make([]*node.Node, 0, len(nodes))
+	for _, n := range nodes {
+		nodeIP := n.Record().IP()
+		if nodeIP == nil {
+			nodeIP = n.Record().IP6()
+		}
+		if nodeIP == nil {
+			// No IP in ENR, skip
+			continue
+		}
+
+		// Only include WAN nodes for WAN requesters
+		if !node.IsLANAddress(nodeIP) {
+			filtered = append(filtered, n)
+		}
+	}
+
+	return filtered
+}
+
+// handleIPConsensus is called when IP discovery reaches consensus on a public IP.
+// It updates the local node's ENR with the discovered IP address.
+func (s *Service) handleIPConsensus(ip net.IP) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	localNode := s.discv5Service.LocalNode()
+	currentRecord := localNode.Record()
+
+	s.config.Logger.WithFields(logrus.Fields{
+		"ip":     ip.String(),
+		"oldSeq": currentRecord.Seq(),
+	}).Info("IP discovery consensus reached - updating ENR")
+
+	// Create new ENR with updated IP
+	newRecord := enr.New()
+
+	// Increment sequence number
+	newRecord.SetSeq(currentRecord.Seq() + 1)
+
+	// Set IPv4 address
+	if ip.To4() != nil {
+		newRecord.Set("ip", ip.To4())
+	} else {
+		// IPv6 (shouldn't happen as we only track IPv4 in IP discovery)
+		newRecord.Set("ip6", ip)
+	}
+
+	// Copy UDP port from current record
+	if udpPort := currentRecord.UDP(); udpPort != 0 {
+		newRecord.Set("udp", udpPort)
+	}
+
+	// Copy TCP port if present
+	if tcpPort := currentRecord.TCP(); tcpPort != 0 {
+		newRecord.Set("tcp", tcpPort)
+	}
+
+	// Copy secp256k1 public key from current record
+	var pubKey []byte
+	if err := currentRecord.Get("secp256k1", &pubKey); err == nil {
+		newRecord.Set("secp256k1", pubKey)
+	}
+
+	// Copy eth2 field if present
+	var eth2 []byte
+	if err := currentRecord.Get("eth2", &eth2); err == nil {
+		newRecord.Set("eth2", eth2)
+	}
+
+	// Copy IPv6 address if present in old record
+	if ip6 := currentRecord.IP6(); ip6 != nil {
+		newRecord.Set("ip6", ip6)
+	}
+
+	// Sign the new record
+	if err := newRecord.Sign(s.config.PrivateKey); err != nil {
+		s.config.Logger.WithError(err).Error("failed to sign updated ENR")
+		return
+	}
+
+	// Update local node's ENR
+	if updated := localNode.UpdateENR(newRecord); updated {
+		s.config.Logger.WithFields(logrus.Fields{
+			"ip":     ip.String(),
+			"newSeq": newRecord.Seq(),
+			"enr":    newRecord.String(),
+		}).Info("successfully updated local ENR with discovered IP")
+	} else {
+		s.config.Logger.Warn("failed to update local ENR (sequence number issue)")
+	}
 }

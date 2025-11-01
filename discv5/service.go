@@ -111,7 +111,7 @@ func New(cfg *Config) (*Service, error) {
 		OnNodeUpdate:        cfg.OnNodeUpdate,
 		OnFindNode:          cfg.OnFindNode,
 		OnTalkReq:           cfg.OnTalkReq,
-		ResponseFilter:      cfg.ResponseFilter,
+		OnPongReceived:      cfg.OnPongReceived,
 		Logger:              cfg.Logger,
 	}
 	protocolHandler := protocol.NewHandler(ctx, handlerConfig)

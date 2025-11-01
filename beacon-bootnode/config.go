@@ -68,6 +68,9 @@ type Config struct {
 	// MaxFailures is the maximum consecutive failures (default 3)
 	MaxFailures int
 
+	// EnableIPDiscovery enables automatic IP discovery from PONG responses (default false)
+	EnableIPDiscovery bool
+
 	// Logger for debug messages
 	Logger logrus.FieldLogger
 }

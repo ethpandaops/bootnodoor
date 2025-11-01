@@ -36,6 +36,7 @@ var (
 	enrIP                 string
 	enrIP6                string
 	enrPort               int
+	enableIPDiscovery     bool
 	genesisValidatorsRoot string
 	genesisTime           uint64
 	gracePeriod           time.Duration
@@ -80,10 +81,10 @@ func init() {
 	rootCmd.Flags().IntVar(&bindPort, "bind-port", 9000, "UDP port to bind to")
 
 	// ENR configuration (advertised address)
-	rootCmd.Flags().StringVar(&enrIP, "enr-ip", "", "IPv4 address to advertise in ENR (required)")
+	rootCmd.Flags().StringVar(&enrIP, "enr-ip", "", "IPv4 address to advertise in ENR (auto-detected if not specified)")
 	rootCmd.Flags().StringVar(&enrIP6, "enr-ip6", "", "IPv6 address to advertise in ENR (optional)")
 	rootCmd.Flags().IntVar(&enrPort, "enr-port", 0, "UDP port to advertise in ENR (0 = use bind-port)")
-	rootCmd.MarkFlagRequired("enr-ip")
+	rootCmd.Flags().BoolVar(&enableIPDiscovery, "enable-ip-discovery", false, "Enable automatic IP discovery from PONG responses (default: enabled when --enr-ip not specified, disabled when specified)")
 
 	// Genesis configuration
 	rootCmd.Flags().StringVar(&genesisValidatorsRoot, "genesis-validators-root", "", "Genesis validators root (hex, required)")
@@ -114,6 +115,27 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// getLocalIP attempts to detect a local non-loopback IP address.
+// This is used as a fallback when --enr-ip is not specified.
+func getLocalIP() net.IP {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP
+			}
+		}
+	}
+
+	// Fallback to 0.0.0.0 if no suitable IP found
+	// This will be replaced by IP discovery
+	return net.ParseIP("0.0.0.0")
 }
 
 func runBootnode(cmd *cobra.Command, args []string) error {
@@ -219,11 +241,30 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid bind address: %s", bindAddr)
 	}
 
+	// Determine if we should enable IP discovery
+	// Default behavior:
+	// - If --enr-ip is not specified: enable IP discovery (can be overridden with --enable-ip-discovery=false)
+	// - If --enr-ip is specified: disable IP discovery (can be overridden with --enable-ip-discovery=true)
+	var shouldEnableIPDiscovery bool
+	if cmd.Flags().Changed("enable-ip-discovery") {
+		// Flag was explicitly set, use that value
+		shouldEnableIPDiscovery = enableIPDiscovery
+	} else {
+		// Use default based on whether --enr-ip is specified
+		shouldEnableIPDiscovery = enrIP == ""
+	}
+
+	// Validate configuration
+	if enrIP == "" && !shouldEnableIPDiscovery {
+		return fmt.Errorf("--enr-ip is required when IP discovery is disabled (--enable-ip-discovery=false)")
+	}
+
 	// Parse ENR IP addresses
 	var enrIPv4 net.IP
 	var enrIPv6 net.IP
 
 	if enrIP != "" {
+		// User provided explicit IP
 		enrIPv4 = net.ParseIP(enrIP)
 		if enrIPv4 == nil {
 			return fmt.Errorf("invalid ENR IP address: %s", enrIP)
@@ -232,6 +273,11 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		if enrIPv4.To4() == nil {
 			return fmt.Errorf("--enr-ip must be an IPv4 address, got: %s", enrIP)
 		}
+		logger.WithField("ip", enrIPv4.String()).Info("using provided ENR IP address")
+	} else if shouldEnableIPDiscovery {
+		// Use local IP as fallback when IP discovery is enabled
+		enrIPv4 = getLocalIP()
+		logger.WithField("ip", enrIPv4.String()).Info("using local IP as temporary ENR address (will be updated via IP discovery)")
 	}
 
 	if enrIP6 != "" {
@@ -298,6 +344,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.NodeDB = ndb
 	config.MaxNodesPerIP = maxNodesPerIP
 	config.BootNodes = bootNodes
+	config.EnableIPDiscovery = shouldEnableIPDiscovery
 	config.Logger = logger
 
 	service, err := bootnode.New(config)

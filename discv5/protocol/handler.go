@@ -46,10 +46,15 @@ type OnHandshakeCompleteCallback func(n *node.Node, incoming bool)
 type OnNodeUpdateCallback func(n *node.Node)
 
 // OnFindNodeCallback is called when a FINDNODE request is received.
-type OnFindNodeCallback func(msg *FindNode) []*node.Node
+// The requester parameter provides the requesting node's address for context-aware filtering (e.g., LAN-aware filtering).
+type OnFindNodeCallback func(msg *FindNode, requester *net.UDPAddr) []*node.Node
 
 // OnTalkReqCallback is called when a TALKREQ request is received.
 type OnTalkReqCallback func(msg *TalkReq) []byte
+
+// OnPongReceivedCallback is called when a PONG response is received.
+// Parameters: remoteNodeID, reportedIP (our IP as seen by the remote peer)
+type OnPongReceivedCallback func(remoteNodeID node.ID, reportedIP net.IP)
 
 // Handler handles incoming and outgoing protocol messages.
 //
@@ -131,9 +136,7 @@ type HandlerConfig struct {
 	OnNodeUpdate        OnNodeUpdateCallback
 	OnFindNode          OnFindNodeCallback
 	OnTalkReq           OnTalkReqCallback
-
-	// ResponseFilter is applied when serving FINDNODE responses (Stage 2)
-	ResponseFilter ResponseFilter
+	OnPongReceived      OnPongReceivedCallback
 
 	// RequestTimeout is the timeout for requests
 	RequestTimeout time.Duration
@@ -158,14 +161,9 @@ type HandlerConfig struct {
 //	handler := NewHandler(HandlerConfig{
 //	    LocalNode: myNode,
 //	    Sessions: sessionCache,
-//	    OnFindNode: func(msg *FindNode) []*node.Node { ... },
-//	    ResponseFilter: LANAwareResponseFilter(),
+//	    OnFindNode: func(msg *FindNode, requester *net.UDPAddr) []*node.Node { ... },
 //	})
 func NewHandler(ctx context.Context, cfg HandlerConfig) *Handler {
-	if cfg.ResponseFilter == nil {
-		cfg.ResponseFilter = LANAwareResponseFilter()
-	}
-
 	// Apply defaults for limits
 	if cfg.MaxPendingHandshakes <= 0 {
 		cfg.MaxPendingHandshakes = defaultMaxPendingHandshakes
@@ -858,6 +856,13 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, rem
 	// Match with pending request
 	h.requests.MatchResponse(msg.RequestID, remoteID, msg)
 
+	// Call OnPongReceived callback with the IP reported in the PONG
+	// The IP field in PONG contains our IP address as seen by the remote peer
+	if h.config.OnPongReceived != nil && len(msg.IP) > 0 {
+		reportedIP := net.IP(msg.IP)
+		h.config.OnPongReceived(remoteID, reportedIP)
+	}
+
 	// Update node's last seen time
 	if remoteNode != nil {
 		// Check if remote has a higher ENR sequence than what we have
@@ -898,9 +903,9 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 			"nodeID": remoteID.String()[:16],
 		}).Debug("handler: FINDNODE distance 0, returning our ENR")
 	} else {
-		// Use OnFindNode callback to get nodes
+		// Use OnFindNode callback to get nodes (callback handles filtering)
 		if h.config.OnFindNode != nil {
-			nodes = h.config.OnFindNode(msg)
+			nodes = h.config.OnFindNode(msg, from)
 		}
 
 		h.config.Logger.WithFields(logrus.Fields{
@@ -911,21 +916,12 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 		}).Debug("handler: FINDNODE lookup completed via callback")
 	}
 
-	// Apply response filter (Stage 2)
-	filteredNodes := FilterNodes(from, nodes, h.config.ResponseFilter)
-
-	if len(filteredNodes) < len(nodes) {
-		h.mu.Lock()
-		h.filteredResponses += (len(nodes) - len(filteredNodes))
-		h.mu.Unlock()
-	}
-
 	// Split nodes into multiple packets if needed to stay under max packet size
 	// Each ENR is typically 200-400 bytes, so we limit to 3 nodes per packet to be safe
 	const maxNodesPerPacket = 3
 
 	// Calculate total number of packets needed
-	totalPackets := (len(filteredNodes) + maxNodesPerPacket - 1) / maxNodesPerPacket
+	totalPackets := (len(nodes) + maxNodesPerPacket - 1) / maxNodesPerPacket
 	if totalPackets == 0 {
 		totalPackets = 1 // Always send at least one response, even if empty
 	}
@@ -934,11 +930,11 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 	for i := 0; i < totalPackets; i++ {
 		start := i * maxNodesPerPacket
 		end := start + maxNodesPerPacket
-		if end > len(filteredNodes) {
-			end = len(filteredNodes)
+		if end > len(nodes) {
+			end = len(nodes)
 		}
 
-		chunk := filteredNodes[start:end]
+		chunk := nodes[start:end]
 		records := make([]*enr.Record, len(chunk))
 		for j, n := range chunk {
 			records[j] = n.Record()

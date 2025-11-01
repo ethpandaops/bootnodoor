@@ -2,7 +2,6 @@ package config
 
 import (
 	"encoding/binary"
-	"net"
 	"sync"
 	"time"
 
@@ -245,61 +244,6 @@ func (f *ForkDigestFilter) Update() {
 		if now.Sub(activationTime) > f.gracePeriod {
 			delete(f.oldForkDigests, digest)
 		}
-	}
-}
-
-// ResponseFilter returns a response filter for FINDNODE responses.
-//
-// This filter only includes nodes with current or recently old fork digests
-// (within grace period) in FINDNODE responses. Nodes with very old historical
-// digests are excluded from responses but remain in the routing table where
-// they continue to be pinged (triggering ENR updates).
-//
-// Example:
-//
-//	filter := NewForkDigestFilter(config, 60*time.Minute)
-//	service, _ := discv5.New(&discv5.Config{
-//	    AdmissionFilter: filter.Filter(),
-//	    ResponseFilter: filter.ResponseFilter(),
-//	})
-func (f *ForkDigestFilter) ResponseFilter() func(requester *net.UDPAddr, record *enr.Record) bool {
-	return func(requester *net.UDPAddr, record *enr.Record) bool {
-		// Get eth2 field from ENR
-		var eth2Data []byte
-		if err := record.Get("eth2", &eth2Data); err != nil {
-			// No eth2 field, exclude from response
-			return false
-		}
-
-		// Parse fork digest (first 4 bytes only)
-		forkDigest, err := ParseETH2Field(eth2Data)
-		if err != nil {
-			// Invalid eth2 field, exclude from response
-			return false
-		}
-
-		f.mu.RLock()
-		currentDigest := f.currentForkDigest
-		oldDigests := f.oldForkDigests
-		gracePeriod := f.gracePeriod
-		f.mu.RUnlock()
-
-		// Include if current fork digest
-		if forkDigest == currentDigest {
-			return true
-		}
-
-		// Include if old fork digest within grace period
-		if activationTime, exists := oldDigests[forkDigest]; exists {
-			age := time.Since(activationTime)
-			if age <= gracePeriod {
-				return true
-			}
-		}
-
-		// Exclude nodes with very old historical digests
-		// They stay in the table and get pinged, but aren't advertised
-		return false
 	}
 }
 

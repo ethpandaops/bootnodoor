@@ -51,8 +51,8 @@ type Config struct {
 	// OnTalkReq is called when a TALKREQ request is received
 	OnTalkReq protocol.OnTalkReqCallback
 
-	// ResponseFilter is applied when serving FINDNODE responses (Stage 2)
-	ResponseFilter protocol.ResponseFilter
+	// OnPongReceived is called when a PONG response is received
+	OnPongReceived protocol.OnPongReceivedCallback
 
 	// SessionLifetime is how long sessions remain valid (default 12 hours)
 	SessionLifetime time.Duration

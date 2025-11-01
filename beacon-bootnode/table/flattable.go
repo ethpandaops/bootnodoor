@@ -751,3 +751,125 @@ func (t *FlatTable) SetForkScoringInfo(info *node.ForkScoringInfo) {
 	defer t.mu.Unlock()
 	t.forkScoringInfo = info
 }
+
+// GetNodesByDistance returns nodes at specific distances with score-weighted random selection.
+//
+// For each requested distance, it finds all matching nodes and selects up to k nodes
+// with probability weighted by their score (RTT, success rate, fork compatibility).
+//
+// This ensures:
+//   - Different results on each call (randomized)
+//   - Better nodes are returned more frequently (score-weighted)
+//   - Specific distances are respected
+func (t *FlatTable) GetNodesByDistance(targetID node.ID, distances []uint, k int) []*node.Node {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if len(t.activeNodes) == 0 {
+		return nil
+	}
+
+	// Collect all active nodes
+	allNodes := make([]*node.Node, 0, len(t.activeNodes))
+	for _, n := range t.activeNodes {
+		allNodes = append(allNodes, n)
+	}
+
+	// Filter by distance if not requesting all (256)
+	var candidateNodes []*node.Node
+	if len(distances) == 1 && distances[0] == 256 {
+		// Special case: return all nodes
+		candidateNodes = allNodes
+	} else {
+		// Filter by specific distances
+		distanceMap := make(map[int]bool)
+		for _, d := range distances {
+			distanceMap[int(d)] = true
+		}
+
+		for _, n := range allNodes {
+			dist := node.LogDistance(targetID, n.ID())
+			if distanceMap[dist] {
+				candidateNodes = append(candidateNodes, n)
+			}
+		}
+	}
+
+	if len(candidateNodes) == 0 {
+		return nil
+	}
+
+	// If we have fewer candidates than k, return all
+	if len(candidateNodes) <= k {
+		return candidateNodes
+	}
+
+	// Score-weighted random selection
+	return t.selectByScore(candidateNodes, k)
+}
+
+// selectByScore performs score-weighted random selection of k nodes.
+//
+// Nodes with higher scores have higher probability of being selected.
+// This ensures diversity while favoring better nodes.
+func (t *FlatTable) selectByScore(nodes []*node.Node, k int) []*node.Node {
+	if len(nodes) <= k {
+		return nodes
+	}
+
+	// Calculate scores for all nodes
+	type scoredNode struct {
+		node  *node.Node
+		score float64
+	}
+
+	scoredNodes := make([]scoredNode, len(nodes))
+	totalScore := 0.0
+
+	for i, n := range nodes {
+		score := n.CalculateScore(t.forkScoringInfo)
+		// Add small baseline to ensure all nodes have some probability
+		score = score + 0.1
+		scoredNodes[i] = scoredNode{node: n, score: score}
+		totalScore += score
+	}
+
+	// If total score is zero (shouldn't happen with baseline), fall back to random
+	if totalScore == 0 {
+		rand.Shuffle(len(nodes), func(i, j int) {
+			nodes[i], nodes[j] = nodes[j], nodes[i]
+		})
+		return nodes[:k]
+	}
+
+	// Weighted random selection without replacement
+	selected := make([]*node.Node, 0, k)
+	remaining := make([]scoredNode, len(scoredNodes))
+	copy(remaining, scoredNodes)
+	currentTotal := totalScore
+
+	for i := 0; i < k && len(remaining) > 0; i++ {
+		// Pick a random value in [0, currentTotal)
+		r := rand.Float64() * currentTotal
+
+		// Find the node corresponding to this value
+		sum := 0.0
+		selectedIdx := 0
+		for idx, sn := range remaining {
+			sum += sn.score
+			if sum >= r {
+				selectedIdx = idx
+				break
+			}
+		}
+
+		// Add selected node
+		selected = append(selected, remaining[selectedIdx].node)
+
+		// Remove from remaining and update total
+		currentTotal -= remaining[selectedIdx].score
+		remaining = append(remaining[:selectedIdx], remaining[selectedIdx+1:]...)
+	}
+
+	return selected
+}
