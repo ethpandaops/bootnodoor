@@ -350,6 +350,11 @@ func (c *Config) GetCurrentForkDigest() ForkDigest {
 	return c.GetForkDigestForEpoch(currentEpoch)
 }
 
+// GetGenesisForkDigest returns the fork digest for the genesis fork (Phase 0).
+func (c *Config) GetGenesisForkDigest() ForkDigest {
+	return c.GetForkDigest(c.genesisForkVersion, nil)
+}
+
 // getFallbackForkDigest returns the latest fork with a realistic epoch.
 // Used as fallback when genesis time is not available.
 func (c *Config) getFallbackForkDigest() ForkDigest {

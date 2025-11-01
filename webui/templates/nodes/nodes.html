@@ -9,8 +9,8 @@
          data-bs-trigger="hover focus"
          data-bs-placement="bottom"
          data-bs-html="true"
-         data-bs-title="Kademlia Routing Table"
-         data-bs-content="The routing table stores discovered nodes organized into 256 buckets based on their XOR distance from this node. Each bucket holds nodes at a specific distance range, ensuring efficient peer discovery across the network."></i>
+         data-bs-title="Active Node Pool"
+         data-bs-content="This table shows only active nodes (max 500) in the in-memory pool. These nodes are actively monitored and shared with clients. The 'Alive' status indicates whether the node is currently responding to pings. Inactive nodes are stored in the database and periodically rotated into the active pool."></i>
     </h3>
 
     <!-- Summary Card -->
@@ -20,6 +20,14 @@
           <div class="col-auto">
             <strong>Total Nodes:</strong>
             <span class="badge rounded-pill text-bg-primary fs-6 ms-1">{{ .TotalNodes }}</span>
+          </div>
+          <div class="col-auto">
+            <strong>Active Pool:</strong>
+            <span class="badge rounded-pill text-bg-success fs-6 ms-1">{{ .ActiveNodes }}</span>
+          </div>
+          <div class="col-auto">
+            <strong>Inactive (DB):</strong>
+            <span class="badge rounded-pill text-bg-secondary fs-6 ms-1">{{ .InactiveNodes }}</span>
           </div>
           {{ if .CurrentForkDigest }}
           <div class="col-auto">
@@ -31,14 +39,13 @@
       </div>
     </div>
 
-    {{ if .Buckets }}
+    {{ if .Nodes }}
     <div class="card mt-3">
       <div class="card-body p-0">
         <div class="table-responsive">
           <table class="table table-sm table-hover mb-0">
             <thead class="sticky-top">
               <tr>
-                <th style="width: 60px;">Bucket</th>
                 <th>Peer ID</th>
                 <th style="width: 140px;">IP:Port</th>
                 <th style="width: 100px;">Fork</th>
@@ -48,28 +55,16 @@
                 <th style="width: 100px;">Last Seen</th>
                 <th style="width: 70px;">Success</th>
                 <th style="width: 70px;">Failures</th>
-                <th style="width: 60px;">Score</th>
-                <th style="width: 70px;">Status</th>
+                <th style="width: 70px;">Avg RTT</th>
+                <th style="width: 70px;">Score</th>
+                <th style="width: 70px;">Alive</th>
               </tr>
             </thead>
             <tbody>
-              {{ range $bucketIdx, $bucket := .Buckets }}
-              <!-- Bucket Divider Row -->
-              <tr class="bucket-divider">
-                <td colspan="12" class="py-1 px-3">
-                  <small class="text-muted">
-                    Bucket {{ $bucket.Index }}
-                    <span class="mx-2">•</span>
-                    {{ $bucket.NodeCount }} {{ if eq $bucket.NodeCount 1 }}node{{ else }}nodes{{ end }}
-                  </small>
-                </td>
-              </tr>
-              <!-- Bucket Nodes -->
-              {{ range $nodeIdx, $node := $bucket.Nodes }}
+              {{ range $nodeIdx, $node := .Nodes }}
               <tr>
-                <td class="text-muted text-center"><small>{{ $bucket.Index }}</small></td>
                 <td class="node-id-cell">
-                  <code class="text-truncate d-inline-block" style="max-width: 400px; font-size: 0.85em;">{{ $node.PeerID }}</code>
+                  <code class="peer-id-code">{{ $node.PeerID }}</code>
                   <i class="fa fa-copy text-muted ms-1" role="button" data-bs-toggle="tooltip" title="Copy Peer ID" data-clipboard-text="{{ $node.PeerID }}"></i>
                 </td>
                 <td>
@@ -109,7 +104,10 @@
                   <small class="text-danger">{{ $node.FailureCount }}</small>
                 </td>
                 <td class="text-center">
-                  <small class="{{ if gtf (toFloat64 $node.Score) 0.0 }}text-success{{ else if ltf (toFloat64 $node.Score) 0.0 }}text-warning{{ else }}text-muted{{ end }}">{{ $node.Score }}</small>
+                  <small class="text-muted">{{ if gt $node.AvgRTT 0 }}{{ printf "%.0fms" (divDuration $node.AvgRTT 1000000) }}{{ else }}-{{ end }}</small>
+                </td>
+                <td class="text-center">
+                  <small class="{{ if gtf $node.Score 0.5 }}text-success{{ else if gtf $node.Score 0.2 }}text-warning{{ else }}text-danger{{ end }}">{{ printf "%.2f" $node.Score }}</small>
                 </td>
                 <td class="text-center">
                   {{ if $node.IsAlive }}
@@ -119,7 +117,6 @@
                   {{ end }}
                 </td>
               </tr>
-              {{ end }}
               {{ end }}
             </tbody>
           </table>
@@ -267,8 +264,8 @@
     vertical-align: middle;
 }
 
-/* Bucket divider styling - more subtle */
-.bucket-divider td {
+/* Group divider styling - more subtle */
+.group-divider td {
     background-color: var(--bs-tertiary-bg) !important;
     border-top: 1px solid var(--bs-border-color) !important;
     border-bottom: 1px solid var(--bs-border-color-translucent) !important;
@@ -276,7 +273,7 @@
     letter-spacing: 0.3px;
 }
 
-.bucket-divider:hover {
+.group-divider:hover {
     background-color: var(--bs-tertiary-bg) !important;
 }
 
@@ -295,19 +292,38 @@ thead.sticky-top {
 
 /* Node ID cell styling */
 .node-id-cell {
-    max-width: 400px;
+    /* No max-width constraint for the cell itself */
 }
 
-.node-id-cell code {
+.peer-id-code {
     font-size: 0.85em;
+    word-break: break-all;
+}
+
+/* Only truncate peer ID on smaller screens */
+@media (max-width: 1399px) {
+    .peer-id-code {
+        display: inline-block;
+        max-width: 350px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+}
+
+/* On large screens (1400px+), show full peer ID */
+@media (min-width: 1400px) {
+    .peer-id-code {
+        /* Full peer ID visible - no truncation */
+    }
 }
 
 /* Table hover effect */
-tbody tr:not(.bucket-divider):hover {
+tbody tr:not(.group-divider):hover {
     background-color: rgba(var(--bs-primary-rgb), 0.03);
 }
 
-[data-bs-theme="dark"] tbody tr:not(.bucket-divider):hover {
+[data-bs-theme="dark"] tbody tr:not(.group-divider):hover {
     background-color: rgba(var(--bs-primary-rgb), 0.1);
 }
 

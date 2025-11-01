@@ -1,502 +1,480 @@
-// Package nodedb provides persistent storage for discovered nodes.
-//
-// The database tracks:
-//   - Node ENR records
-//   - Network statistics (last seen, RTT, failure counts)
-//   - Node aliveness status
-//
-// It supports:
-//   - Thread-safe concurrent access
-//   - ENR-based queries with filtering
-//   - Automatic expiration of old nodes
 package nodedb
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/jmoiron/sqlx"
+	"github.com/pk910/bootoor/beacon-bootnode/db"
 	"github.com/pk910/bootoor/discv5/enr"
 	"github.com/pk910/bootoor/discv5/node"
 	"github.com/sirupsen/logrus"
 )
 
-// DB is the interface for node database implementations.
-//
-// Implementations must be thread-safe and support concurrent access.
-type DB interface {
-	// Store stores or updates a node in the database
-	Store(n *node.Node) error
+// updateType represents the type of update to perform
+type updateType uint8
 
-	// Load retrieves a node by ID
-	Load(id node.ID) (*node.Node, error)
+const (
+	updateTypeENR        updateType = iota // Update seq+enr+ip only (preserve stats & timestamps)
+	updateTypeFull                         // Full update including stats (after ping/stats change)
+	updateTypeLastActive                   // Update last_active timestamp only
+	updateTypeLastSeen                     // Update last_seen timestamp only
+)
 
-	// Delete removes a node from the database
-	Delete(id node.ID) error
-
-	// List returns all nodes in the database
-	List() []*node.Node
-
-	// Query returns nodes matching the given filter
-	Query(filter enr.ENRFilter) []*node.Node
-
-	// Count returns the total number of nodes
-	Count() int
-
-	// StoreLocalENR stores the local node's ENR record
-	StoreLocalENR(enrBytes []byte) error
-
-	// LoadLocalENR loads the local node's ENR record (returns nil, nil if not found)
-	LoadLocalENR() ([]byte, error)
-
-	// StoreRejection stores a rejection entry to prevent log spam
-	StoreRejection(id node.ID, reason uint8, timestamp time.Time) error
-
-	// LoadRejection retrieves a rejection entry
-	LoadRejection(id node.ID) (flags uint8, timestamp time.Time, found bool, err error)
-
-	// DeleteRejection removes a rejection entry
-	DeleteRejection(id node.ID) error
-
-	// ExpireRejections removes rejection entries older than the given duration
-	ExpireRejections(ttl time.Duration) (int, error)
-
-	// Close closes the database and releases resources
-	Close() error
+// nodeUpdate represents a pending database update for a node.
+type nodeUpdate struct {
+	nodeID     node.ID
+	updateType updateType
+	node       *node.Node // For ENR and full updates
+	active     bool       // For last_active updates
+	timestamp  time.Time  // For last_seen updates
 }
 
-// RejectionEntry tracks when we last logged a rejection for a node.
-type RejectionEntry struct {
-	Flags     uint8
-	Timestamp time.Time
-}
-
-// MemoryDB is an in-memory implementation of the node database.
-//
-// All data is stored in memory and lost when the process exits.
-// This is suitable for most use cases and provides fast access.
-type MemoryDB struct {
-	// nodes maps node ID to node
-	nodes map[node.ID]*node.Node
-
-	// rejections tracks rejected nodes to avoid log spam
-	rejections map[node.ID]*RejectionEntry
-
-	// localENR stores the local node's ENR
-	localENR []byte
-
-	// mu protects nodes map and localENR
-	mu sync.RWMutex
-
-	// stats tracks database statistics
-	stats Stats
-
-	// logger for debug messages
+// NodeDB wraps the Database and provides node storage with async updates.
+type NodeDB struct {
+	db     *db.Database
 	logger logrus.FieldLogger
+	ctx    context.Context
+
+	// Update queue for async DB writes (50 per batch with sleep)
+	updateQueue     chan nodeUpdate
+	updateQueueSet  map[node.ID]*nodeUpdate // Tracks pending updates, can merge
+	updateQueueLock sync.Mutex
+
+	wg sync.WaitGroup
 }
 
-// Stats contains statistics about the database.
-type Stats struct {
-	// TotalNodes is the total number of nodes stored
-	TotalNodes int
-
-	// AliveNodes is the number of nodes considered alive
-	AliveNodes int
-
-	// OldestSeen is the oldest last-seen time
-	OldestSeen time.Time
-
-	// NewestSeen is the newest last-seen time
-	NewestSeen time.Time
-}
-
-// NewMemoryDB creates a new in-memory node database.
-//
-// Example:
-//
-//	db := NewMemoryDB(logger)
-//	defer db.Close()
-func NewMemoryDB(logger logrus.FieldLogger) *MemoryDB {
-	return &MemoryDB{
-		nodes:      make(map[node.ID]*node.Node),
-		rejections: make(map[node.ID]*RejectionEntry),
-		logger:     logger,
+// NewNodeDB creates a new node database wrapper.
+func NewNodeDB(ctx context.Context, database *db.Database, logger logrus.FieldLogger) *NodeDB {
+	ndb := &NodeDB{
+		db:             database,
+		logger:         logger,
+		ctx:            ctx,
+		updateQueue:    make(chan nodeUpdate, 1000),
+		updateQueueSet: make(map[node.ID]*nodeUpdate),
 	}
+
+	// Start update queue processor
+	ndb.wg.Add(1)
+	go ndb.processUpdateQueue()
+
+	return ndb
 }
 
-// Store stores or updates a node in the database.
-//
-// If a node with the same ID already exists:
-//   - The ENR is updated if the new sequence number is higher
-//   - Statistics are preserved and updated
-//
-// Example:
-//
-//	if err := db.Store(node); err != nil {
-//	    log.Printf("Failed to store node: %v", err)
-//	}
-func (db *MemoryDB) Store(n *node.Node) error {
+// UpdateNodeENR queues an ENR update (seq+enr+ip only, preserves stats & timestamps).
+// Use this when receiving nodes from discovery (FINDNODE responses).
+func (ndb *NodeDB) UpdateNodeENR(n *node.Node) error {
 	if n == nil {
-		return fmt.Errorf("nodedb: nil node")
+		return fmt.Errorf("cannot update nil node")
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	update := nodeUpdate{
+		nodeID:     n.ID(),
+		updateType: updateTypeENR,
+		node:       n,
+	}
 
-	id := n.ID()
+	return ndb.queueUpdate(update)
+}
 
-	// Check if node already exists
-	existing, exists := db.nodes[id]
-	if exists {
-		// Update ENR if sequence number is higher
-		if n.Record().Seq() > existing.Record().Seq() {
-			existing.UpdateENR(n.Record())
-		}
+// UpdateNodeFull queues a full node update including stats.
+// Use this after pinging or when stats have changed.
+func (ndb *NodeDB) UpdateNodeFull(n *node.Node) error {
+	if n == nil {
+		return fmt.Errorf("cannot update nil node")
+	}
 
-		// Copy over statistics from new node
-		// (assumes caller has updated these)
-		stats := n.GetStats()
-		if !stats.LastSeen.IsZero() {
-			existing.SetLastSeen(stats.LastSeen)
+	update := nodeUpdate{
+		nodeID:     n.ID(),
+		updateType: updateTypeFull,
+		node:       n,
+	}
+
+	return ndb.queueUpdate(update)
+}
+
+// UpdateLastActive queues a last_active timestamp update.
+func (ndb *NodeDB) UpdateLastActive(id node.ID, active bool) error {
+	update := nodeUpdate{
+		nodeID:     id,
+		updateType: updateTypeLastActive,
+		active:     active,
+	}
+
+	return ndb.queueUpdate(update)
+}
+
+// UpdateLastSeen queues a last_seen timestamp update.
+func (ndb *NodeDB) UpdateLastSeen(id node.ID, timestamp time.Time) error {
+	update := nodeUpdate{
+		nodeID:     id,
+		updateType: updateTypeLastSeen,
+		timestamp:  timestamp,
+	}
+
+	return ndb.queueUpdate(update)
+}
+
+// queueUpdate queues an update, merging with existing pending updates if possible.
+func (ndb *NodeDB) queueUpdate(update nodeUpdate) error {
+	ndb.updateQueueLock.Lock()
+	defer ndb.updateQueueLock.Unlock()
+
+	// Check if there's already a pending update for this node
+	if existing, ok := ndb.updateQueueSet[update.nodeID]; ok {
+		// Merge updates based on priority:
+		// updateTypeFull > updateTypeENR > updateTypeLastActive/updateTypeLastSeen
+
+		if update.updateType == updateTypeFull {
+			// Full update takes precedence over everything
+			existing.updateType = updateTypeFull
+			existing.node = update.node
+		} else if existing.updateType == updateTypeFull {
+			// Don't downgrade from full update
+			return nil
+		} else if update.updateType == updateTypeENR {
+			// ENR update takes precedence over timestamp updates
+			if existing.updateType != updateTypeENR {
+				existing.updateType = updateTypeENR
+				existing.node = update.node
+			}
+		} else if existing.updateType == updateTypeENR {
+			// Don't downgrade from ENR update
+			return nil
+		} else {
+			// Merge timestamp updates
+			if update.updateType == updateTypeLastActive {
+				existing.active = update.active
+			} else if update.updateType == updateTypeLastSeen {
+				existing.timestamp = update.timestamp
+			}
 		}
-		if !stats.LastPing.IsZero() {
-			existing.SetLastPing(stats.LastPing)
+		return nil
+	}
+
+	// Add to queue set
+	ndb.updateQueueSet[update.nodeID] = &update
+
+	// Send to queue (non-blocking)
+	select {
+	case ndb.updateQueue <- update:
+		return nil
+	default:
+		// Queue full, remove from set
+		delete(ndb.updateQueueSet, update.nodeID)
+		return fmt.Errorf("update queue full")
+	}
+}
+
+// processUpdateQueue processes the async update queue in batches of 50.
+func (ndb *NodeDB) processUpdateQueue() {
+	defer ndb.wg.Done()
+
+	batch := make([]nodeUpdate, 0, 50)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ndb.ctx.Done():
+			// Process remaining batch
+			if len(batch) > 0 {
+				ndb.batchUpdate(batch)
+			}
+			return
+
+		case update := <-ndb.updateQueue:
+			batch = append(batch, update)
+
+			// Process when batch reaches 50 items
+			if len(batch) >= 50 {
+				ndb.batchUpdate(batch)
+				batch = batch[:0]
+				time.Sleep(10 * time.Millisecond) // Avoid hammering DB
+			}
+
+		case <-ticker.C:
+			// Process any pending items
+			if len(batch) > 0 {
+				ndb.batchUpdate(batch)
+				batch = batch[:0]
+			}
 		}
+	}
+}
+
+// batchUpdate performs a batch update of node updates.
+func (ndb *NodeDB) batchUpdate(updates []nodeUpdate) {
+	if len(updates) == 0 {
+		return
+	}
+
+	err := ndb.db.RunDBTransaction(func(tx *sqlx.Tx) error {
+		for _, update := range updates {
+			var err error
+			switch update.updateType {
+			case updateTypeENR:
+				err = ndb.updateNodeENRTx(tx, update.node)
+			case updateTypeFull:
+				err = ndb.upsertNodeTx(tx, update.node)
+			case updateTypeLastActive:
+				err = ndb.db.UpdateNodeLastActive(tx, update.nodeID[:], update.active)
+			case updateTypeLastSeen:
+				err = ndb.updateNodeLastSeenTx(tx, update.nodeID, update.timestamp)
+			}
+
+			if err != nil {
+				ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update node in batch")
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		ndb.logger.WithError(err).Error("failed to commit batch transaction")
+	}
+
+	// Remove updates from queue set
+	ndb.updateQueueLock.Lock()
+	for _, update := range updates {
+		delete(ndb.updateQueueSet, update.nodeID)
+	}
+	ndb.updateQueueLock.Unlock()
+}
+
+// updateNodeENRTx updates only ENR info (seq+enr+ip) within a transaction, preserving stats.
+func (ndb *NodeDB) updateNodeENRTx(tx *sqlx.Tx, n *node.Node) error {
+	nodeID := n.ID()
+	ip := n.IP()
+	var ipv4, ipv6 []byte
+
+	if ip.To4() != nil {
+		ipv4 = ip.To4()
 	} else {
-		// New node - set FirstSeen if not already set
-		stats := n.GetStats()
-		if stats.FirstSeen.IsZero() {
-			n.SetFirstSeen(time.Now())
-		}
-		// Store new node
-		db.nodes[id] = n
+		ipv6 = ip.To16()
 	}
 
-	return nil
+	port := int(n.UDPPort())
+	seq := n.Record().Seq()
+
+	var forkDigest []byte
+	if eth2, ok := n.Record().Eth2(); ok {
+		forkDigest = eth2.ForkDigest[:]
+	}
+
+	enrBytes, err := n.Record().EncodeRLP()
+	if err != nil {
+		return fmt.Errorf("failed to encode ENR: %w", err)
+	}
+
+	return ndb.db.UpdateNodeENR(tx, nodeID[:], ipv4, ipv6, port, seq, forkDigest, enrBytes)
+}
+
+// updateNodeLastSeenTx updates only the last_seen timestamp within a transaction.
+func (ndb *NodeDB) updateNodeLastSeenTx(tx *sqlx.Tx, id node.ID, timestamp time.Time) error {
+	return ndb.db.UpdateNodeLastSeen(tx, id[:], timestamp.Unix())
+}
+
+// upsertNodeTx upserts a node within a transaction.
+func (ndb *NodeDB) upsertNodeTx(tx *sqlx.Tx, n *node.Node) error {
+	nodeID := n.ID()
+	ip := n.IP()
+	var ipv4, ipv6 []byte
+
+	if ip.To4() != nil {
+		ipv4 = ip.To4()
+	} else {
+		ipv6 = ip.To16()
+	}
+
+	port := int(n.UDPPort())
+	seq := n.Record().Seq()
+
+	var forkDigest []byte
+	if eth2, ok := n.Record().Eth2(); ok {
+		forkDigest = eth2.ForkDigest[:]
+	}
+
+	enrBytes, err := n.Record().EncodeRLP()
+	if err != nil {
+		return fmt.Errorf("failed to encode ENR: %w", err)
+	}
+
+	stats := n.GetStats()
+	firstSeen := stats.FirstSeen.Unix()
+
+	lastSeen := sql.NullInt64{}
+	if !stats.LastSeen.IsZero() {
+		lastSeen.Valid = true
+		lastSeen.Int64 = stats.LastSeen.Unix()
+	}
+
+	// Note: last_active is not set here - it's managed separately via UpdateLastActive()
+	// State is implicit based on membership in the active set, not stored in the node.
+	dbNode := &db.Node{
+		NodeID:       nodeID[:],
+		IP:           ipv4,
+		IPv6:         ipv6,
+		Port:         port,
+		Seq:          seq,
+		ForkDigest:   forkDigest,
+		FirstSeen:    firstSeen,
+		LastSeen:     lastSeen,
+		LastActive:   sql.NullInt64{}, // NULL by default, updated via UpdateLastActive()
+		ENR:          enrBytes,
+		SuccessCount: stats.SuccessCount,
+		FailureCount: stats.FailureCount,
+		AvgRTT:       int(stats.AvgRTT.Milliseconds()),
+	}
+
+	return ndb.db.UpsertNode(tx, dbNode)
 }
 
 // Load retrieves a node by ID.
-//
-// Returns node.ErrNodeNotFound if the node doesn't exist.
-//
-// Example:
-//
-//	node, err := db.Load(nodeID)
-//	if err == node.ErrNodeNotFound {
-//	    // Node not in database
-//	}
-func (db *MemoryDB) Load(id node.ID) (*node.Node, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	n, exists := db.nodes[id]
-	if !exists {
+func (ndb *NodeDB) Load(id node.ID) (*node.Node, error) {
+	dbNode, err := ndb.db.GetNode(id[:])
+	if err == sql.ErrNoRows {
 		return nil, node.ErrNodeNotFound
 	}
+	if err != nil {
+		return nil, err
+	}
 
+	return ndb.buildNodeFromDB(dbNode)
+}
+
+// NodeExists checks if a node exists in the database.
+func (ndb *NodeDB) NodeExists(id node.ID) (bool, uint64) {
+	exists, seq, err := ndb.db.NodeExists(id[:])
+	if err != nil {
+		return false, 0
+	}
+	return exists, seq
+}
+
+// buildNodeFromDB constructs a node from database row data.
+func (ndb *NodeDB) buildNodeFromDB(dbNode *db.Node) (*node.Node, error) {
+	// Decode ENR
+	var record enr.Record
+	if err := record.DecodeRLPBytes(dbNode.ENR); err != nil {
+		return nil, fmt.Errorf("failed to decode ENR: %w", err)
+	}
+
+	// Create node from ENR
+	n, err := node.New(&record)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create node: %w", err)
+	}
+
+	// Restore statistics
+	n.SetFirstSeen(time.Unix(dbNode.FirstSeen, 0))
+	if dbNode.LastSeen.Valid {
+		n.SetLastSeen(time.Unix(dbNode.LastSeen.Int64, 0))
+	}
+	n.SetSuccessCount(dbNode.SuccessCount)
+	n.SetFailureCount(dbNode.FailureCount)
+
+	// Note: State is implicit based on membership in active set, not stored in node
 	return n, nil
 }
 
 // Delete removes a node from the database.
-//
-// Returns node.ErrNodeNotFound if the node doesn't exist.
-//
-// Example:
-//
-//	if err := db.Delete(nodeID); err != nil {
-//	    log.Printf("Failed to delete node: %v", err)
-//	}
-func (db *MemoryDB) Delete(id node.ID) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if _, exists := db.nodes[id]; !exists {
-		return node.ErrNodeNotFound
-	}
-
-	delete(db.nodes, id)
-	return nil
+func (ndb *NodeDB) Delete(id node.ID) error {
+	return ndb.db.RunDBTransaction(func(tx *sqlx.Tx) error {
+		return ndb.db.DeleteNode(tx, id[:])
+	})
 }
 
 // List returns all nodes in the database.
-//
-// The returned slice is a copy and can be safely modified.
-//
-// Example:
-//
-//	nodes := db.List()
-//	fmt.Printf("Database contains %d nodes\n", len(nodes))
-func (db *MemoryDB) List() []*node.Node {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	result := make([]*node.Node, 0, len(db.nodes))
-	for _, n := range db.nodes {
-		result = append(result, n)
-	}
-
-	return result
-}
-
-// Query returns nodes matching the given ENR filter.
-//
-// If filter is nil, all nodes are returned.
-//
-// Example:
-//
-//	// Find all nodes with eth2 field
-//	filter := enr.ByKey("eth2")
-//	nodes := db.Query(filter)
-func (db *MemoryDB) Query(filter enr.ENRFilter) []*node.Node {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	var result []*node.Node
-
-	for _, n := range db.nodes {
-		if filter == nil || filter(n.Record()) {
-			result = append(result, n)
-		}
-	}
-
-	return result
-}
-
-// Count returns the total number of nodes in the database.
-func (db *MemoryDB) Count() int {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	return len(db.nodes)
-}
-
-// Stats returns statistics about the database.
-//
-// Example:
-//
-//	stats := db.Stats()
-//	fmt.Printf("Total nodes: %d, Alive: %d\n",
-//	    stats.TotalNodes, stats.AliveNodes)
-func (db *MemoryDB) Stats() Stats {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	stats := Stats{
-		TotalNodes: len(db.nodes),
-	}
-
-	var oldestSeen, newestSeen time.Time
-	maxAge := 24 * time.Hour
-	maxFailures := 3
-
-	for _, n := range db.nodes {
-		// Count alive nodes
-		if n.IsAlive(maxAge, maxFailures) {
-			stats.AliveNodes++
-		}
-
-		// Track oldest/newest seen
-		lastSeen := n.LastSeen()
-		if !lastSeen.IsZero() {
-			if oldestSeen.IsZero() || lastSeen.Before(oldestSeen) {
-				oldestSeen = lastSeen
-			}
-			if newestSeen.IsZero() || lastSeen.After(newestSeen) {
-				newestSeen = lastSeen
-			}
-		}
-	}
-
-	stats.OldestSeen = oldestSeen
-	stats.NewestSeen = newestSeen
-
-	return stats
-}
-
-// ExpireOld removes nodes that haven't been seen recently.
-//
-// Nodes are removed if:
-//   - They haven't been seen in maxAge, OR
-//   - They have more than maxFailures consecutive failures
-//
-// Returns the number of nodes removed.
-//
-// Example:
-//
-//	// Remove nodes not seen in 24 hours
-//	count := db.ExpireOld(24 * time.Hour, 3)
-//	log.Printf("Removed %d expired nodes", count)
-func (db *MemoryDB) ExpireOld(maxAge time.Duration, maxFailures int) int {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	var toDelete []node.ID
-
-	for id, n := range db.nodes {
-		if !n.IsAlive(maxAge, maxFailures) {
-			toDelete = append(toDelete, id)
-		}
-	}
-
-	for _, id := range toDelete {
-		delete(db.nodes, id)
-	}
-
-	if len(toDelete) > 0 {
-		db.logger.Info("nodedb: expired old nodes", "count", len(toDelete))
-	}
-
-	return len(toDelete)
-}
-
-// Close closes the database and releases resources.
-//
-// For MemoryDB, this is a no-op but satisfies the DB interface.
-func (db *MemoryDB) Close() error {
-	return nil
-}
-
-// StoreLocalENR stores the local node's ENR record.
-func (db *MemoryDB) StoreLocalENR(enrBytes []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	db.localENR = enrBytes
-	return nil
-}
-
-// LoadLocalENR loads the local node's ENR record.
-//
-// Returns nil, nil if no local ENR is stored.
-func (db *MemoryDB) LoadLocalENR() ([]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	return db.localENR, nil
-}
-
-// FindClosestNodes finds the k nodes closest to the target ID.
-//
-// The results are sorted by distance (closest first).
-// If the database contains fewer than k nodes, all nodes are returned.
-//
-// Example:
-//
-//	// Find 16 closest nodes to target
-//	closest := db.FindClosestNodes(targetID, 16)
-func (db *MemoryDB) FindClosestNodes(target node.ID, k int) []*node.Node {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	if len(db.nodes) == 0 {
+func (ndb *NodeDB) List() []*node.Node {
+	dbNodes, err := ndb.db.GetNodes()
+	if err != nil {
+		ndb.logger.WithError(err).Error("failed to list nodes")
 		return nil
 	}
 
-	// Collect all node IDs
-	ids := make([]node.ID, 0, len(db.nodes))
-	for id := range db.nodes {
-		ids = append(ids, id)
-	}
-
-	// Find k closest IDs
-	closestIDs := node.FindClosest(target, ids, k)
-
-	// Convert to nodes
-	result := make([]*node.Node, 0, len(closestIDs))
-	for _, id := range closestIDs {
-		if n, exists := db.nodes[id]; exists {
-			result = append(result, n)
+	nodes := make([]*node.Node, 0, len(dbNodes))
+	for _, dbNode := range dbNodes {
+		n, err := ndb.buildNodeFromDB(dbNode)
+		if err != nil {
+			ndb.logger.WithError(err).Error("failed to build node from DB")
+			continue
 		}
+		nodes = append(nodes, n)
 	}
-
-	return result
+	return nodes
 }
 
-// FindByDistance finds nodes at a specific logarithmic distance (bucket).
-//
-// This is useful for random walks in the routing table.
-//
-// Example:
-//
-//	// Find nodes at distance 128 from local node
-//	nodes := db.FindByDistance(localID, 128)
-func (db *MemoryDB) FindByDistance(target node.ID, logDist int) []*node.Node {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	var result []*node.Node
-
-	for id, n := range db.nodes {
-		if node.LogDistance(target, id) == logDist {
-			result = append(result, n)
-		}
+// Count returns the total number of nodes.
+func (ndb *NodeDB) Count() int {
+	count, err := ndb.db.CountNodes()
+	if err != nil {
+		ndb.logger.WithError(err).Error("failed to count nodes")
+		return 0
 	}
-
-	return result
+	return count
 }
 
-// StoreRejection stores a rejection entry to prevent log spam.
-//
-// If an entry already exists, the flags are OR-ed together.
-func (db *MemoryDB) StoreRejection(id node.ID, reason uint8, timestamp time.Time) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if entry, exists := db.rejections[id]; exists {
-		// Update existing entry
-		entry.Flags |= reason
-		entry.Timestamp = timestamp
-	} else {
-		// Create new entry
-		db.rejections[id] = &RejectionEntry{
-			Flags:     reason,
-			Timestamp: timestamp,
-		}
+// LoadRandomNodes loads up to N random nodes from the database.
+func (ndb *NodeDB) LoadRandomNodes(n int) []*node.Node {
+	dbNodes, err := ndb.db.GetRandomNodes(n)
+	if err != nil {
+		ndb.logger.WithError(err).Error("failed to load random nodes")
+		return nil
 	}
 
+	nodes := make([]*node.Node, 0, len(dbNodes))
+	for _, dbNode := range dbNodes {
+		n, err := ndb.buildNodeFromDB(dbNode)
+		if err != nil {
+			ndb.logger.WithError(err).Error("failed to build node from DB")
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+	return nodes
+}
+
+// LoadInactiveNodes loads up to N inactive nodes from the database.
+// Returns nodes ordered by oldest last_active time (NULL first).
+func (ndb *NodeDB) LoadInactiveNodes(n int) []*node.Node {
+	dbNodes, err := ndb.db.GetInactiveNodes(n)
+	if err != nil {
+		ndb.logger.WithError(err).Error("failed to load inactive nodes")
+		return nil
+	}
+
+	nodes := make([]*node.Node, 0, len(dbNodes))
+	for _, dbNode := range dbNodes {
+		n, err := ndb.buildNodeFromDB(dbNode)
+		if err != nil {
+			ndb.logger.WithError(err).Error("failed to build node from DB")
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+	return nodes
+}
+
+// StoreLocalENR stores the local node's ENR.
+func (ndb *NodeDB) StoreLocalENR(enrBytes []byte) error {
+	return ndb.db.SetState(nil, "local_enr", enrBytes)
+}
+
+// LoadLocalENR retrieves the local node's ENR.
+func (ndb *NodeDB) LoadLocalENR() ([]byte, error) {
+	return ndb.db.GetState("local_enr")
+}
+
+// Close waits for pending updates to complete.
+// The context cancellation signals shutdown.
+func (ndb *NodeDB) Close() error {
+	// Wait for update queue to finish
+	ndb.wg.Wait()
+
+	// Database is closed by the application, not here
 	return nil
-}
-
-// LoadRejection retrieves a rejection entry.
-//
-// Returns found=false if no entry exists.
-func (db *MemoryDB) LoadRejection(id node.ID) (flags uint8, timestamp time.Time, found bool, err error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	entry, exists := db.rejections[id]
-	if !exists {
-		return 0, time.Time{}, false, nil
-	}
-
-	return entry.Flags, entry.Timestamp, true, nil
-}
-
-// DeleteRejection removes a rejection entry.
-func (db *MemoryDB) DeleteRejection(id node.ID) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	delete(db.rejections, id)
-	return nil
-}
-
-// ExpireRejections removes rejection entries older than the given duration.
-//
-// Returns the number of entries removed.
-func (db *MemoryDB) ExpireRejections(ttl time.Duration) (int, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	now := time.Now()
-	removed := 0
-
-	for id, entry := range db.rejections {
-		if now.Sub(entry.Timestamp) > ttl {
-			delete(db.rejections, id)
-			removed++
-		}
-	}
-
-	return removed, nil
 }

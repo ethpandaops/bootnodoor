@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	bootnode "github.com/pk910/bootoor/beacon-bootnode"
 	"github.com/pk910/bootoor/beacon-bootnode/config"
+	"github.com/pk910/bootoor/beacon-bootnode/db"
 	"github.com/pk910/bootoor/beacon-bootnode/nodedb"
 	"github.com/pk910/bootoor/discv5/enr"
 	"github.com/pk910/bootoor/discv5/node"
@@ -124,6 +126,10 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	}
 	logger.SetLevel(level)
 
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Parse private key
 	privKey, err := parsePrivateKey(privateKeyHex)
 	if err != nil {
@@ -178,19 +184,34 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		}).Infof("  %s: %s (epoch %d)%s", info.Digest.String(), info.Name, info.Epoch, bpoInfo)
 	}
 
-	// Create node database
-	var db nodedb.DB
-	if nodeDBPath != "" {
-		logger.WithField("path", nodeDBPath).Info("using persistent node database")
-		db, err = nodedb.NewLevelDB(nodeDBPath, logger)
-		if err != nil {
-			return fmt.Errorf("failed to create node database: %w", err)
-		}
-		defer db.Close()
+	// Create SQLite database
+	dbPath := nodeDBPath
+	if dbPath == "" {
+		dbPath = ":memory:"
+		logger.Info("using in-memory SQLite database")
 	} else {
-		logger.Info("using in-memory node database")
-		db = nodedb.NewMemoryDB(logger)
+		logger.WithField("path", dbPath).Info("using persistent SQLite database")
 	}
+
+	sqliteDB := db.NewDatabase(&db.SqliteDatabaseConfig{
+		File:         dbPath,
+		MaxOpenConns: 50,
+		MaxIdleConns: 10,
+	}, logger)
+
+	if err := sqliteDB.Init(); err != nil {
+		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+	defer sqliteDB.Close()
+
+	// Apply database schema migrations
+	if err := sqliteDB.ApplyEmbeddedDbSchema(-2); err != nil {
+		return fmt.Errorf("failed to apply database schema: %w", err)
+	}
+
+	// Create node database wrapper
+	ndb := nodedb.NewNodeDB(ctx, sqliteDB, logger)
+	defer ndb.Close()
 
 	// Parse bind address
 	bindIP := net.ParseIP(bindAddr)
@@ -274,7 +295,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.ENRPort = enrUDPPort
 	config.CLConfig = clCfg
 	config.GracePeriod = gracePeriod
-	config.NodeDB = db
+	config.NodeDB = ndb
 	config.MaxNodesPerIP = maxNodesPerIP
 	config.BootNodes = bootNodes
 	config.Logger = logger
@@ -291,11 +312,9 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		enrIPStr = enrIPv4.String()
 	}
 	logger.WithFields(logrus.Fields{
-		"peerID":        localNode.PeerID(),
-		"bindAddress":   fmt.Sprintf("%s:%d", bindAddr, bindPort),
-		"enrAddress":    fmt.Sprintf("%s:%d", enrIPStr, enrUDPPort),
-		"privateKey":    privateKeyHex[:16],
-		"maxNodesPerIP": maxNodesPerIP,
+		"peerID":      localNode.PeerID(),
+		"bindAddress": fmt.Sprintf("%s:%d", bindAddr, bindPort),
+		"enrAddress":  fmt.Sprintf("%s:%d", enrIPStr, enrUDPPort),
 	}).Info("bootnode information")
 
 	// Start bootnode service (handles fork digest updates internally)
@@ -314,6 +333,9 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 
 	<-sigCh
 	logger.Info("Shutting down")
+
+	// Cancel context to signal shutdown to all components
+	cancel()
 
 	// Stop service
 	if err := service.Stop(); err != nil {

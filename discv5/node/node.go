@@ -403,3 +403,116 @@ func (n *Node) GetStats() Stats {
 		ENRSeq:       n.record.Seq(),
 	}
 }
+
+// ForkScoringInfo contains fork digest information for node scoring.
+type ForkScoringInfo struct {
+	// CurrentForkDigest is the current expected fork digest
+	CurrentForkDigest [4]byte
+
+	// PreviousForkDigest is the previous fork digest (current - 1)
+	PreviousForkDigest [4]byte
+
+	// GenesisForkDigest is the genesis fork digest
+	GenesisForkDigest [4]byte
+
+	// GracePeriodEnd is when the grace period for the previous fork ends
+	// If zero, there is no grace period active
+	GracePeriodEnd time.Time
+}
+
+// CalculateScore computes a quality score including fork digest compatibility.
+//
+// The score considers:
+//   - RTT (lower is better): 30% weight
+//   - Success rate: 25% weight
+//   - Uptime (time since first seen): 15% weight
+//   - Recency (time since last seen): 10% weight
+//   - Fork digest compatibility: 20% weight
+//
+// Fork digest scoring:
+//   - Current fork digest: 1.0 multiplier
+//   - Previous fork (in grace period): 0.8 multiplier
+//   - Genesis fork (syncing clients): 0.5 multiplier
+//   - Previous fork (expired grace): 0.2 multiplier (outdated clients)
+//   - Unknown/no fork data: 0.3 multiplier
+//
+// Returns a score between 0.0 (worst) and 1.0 (best).
+func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
+	now := time.Now()
+
+	// RTT score (30% weight, adjusted from 40%)
+	// Assume 0ms = 1.0, 500ms = 0.0
+	rttScore := 0.0
+	if n.avgRTT > 0 {
+		rttMs := float64(n.avgRTT.Milliseconds())
+		rttScore = 1.0 - (rttMs / 500.0)
+		if rttScore < 0 {
+			rttScore = 0
+		}
+	}
+
+	// Success rate score (25% weight, adjusted from 30%)
+	successRate := 0.0
+	totalAttempts := n.successCount + n.failureCount
+	if totalAttempts > 0 {
+		successRate = float64(n.successCount) / float64(totalAttempts)
+	}
+
+	// Uptime score (15% weight, adjusted from 20%)
+	// Nodes seen longer get higher scores (up to 24 hours)
+	uptimeScore := 0.0
+	if !n.firstSeen.IsZero() {
+		uptimeHours := now.Sub(n.firstSeen).Hours()
+		uptimeScore = uptimeHours / 24.0
+		if uptimeScore > 1.0 {
+			uptimeScore = 1.0
+		}
+	}
+
+	// Recency score (10% weight)
+	// Recently seen nodes get higher scores
+	recencyScore := 0.0
+	if !n.lastSeen.IsZero() {
+		hoursSinceLastSeen := now.Sub(n.lastSeen).Hours()
+		recencyScore = 1.0 - (hoursSinceLastSeen / 24.0)
+		if recencyScore < 0 {
+			recencyScore = 0
+		}
+	}
+
+	// Fork digest score (20% weight)
+	forkScore := 1.0 // Default to 1.0 if no fork info provided
+	if forkInfo != nil {
+		nodeDigest := n.Digest()
+
+		// Check if node has fork data
+		if nodeDigest == [4]byte{} {
+			// No fork data - heavily penalize
+			forkScore = 0.3
+		} else if nodeDigest == forkInfo.CurrentForkDigest {
+			// Current fork digest - perfect score
+			forkScore = 1.0
+		} else if nodeDigest == forkInfo.PreviousForkDigest && !forkInfo.GracePeriodEnd.IsZero() {
+			// Previous fork digest - check grace period
+			if now.Before(forkInfo.GracePeriodEnd) {
+				// Within grace period
+				forkScore = 0.8
+			} else {
+				// Grace period expired - outdated client
+				forkScore = 0.2
+			}
+		} else if nodeDigest == forkInfo.GenesisForkDigest {
+			// Genesis fork digest - syncing client
+			forkScore = 0.5
+		} else {
+			// Unknown or very old fork digest
+			forkScore = 0.2
+		}
+	}
+
+	// Weighted total
+	// When fork info is provided: RTT(30%) + Success(25%) + Uptime(15%) + Recency(10%) + Fork(20%)
+	// When fork info is nil: Fork multiplier is 1.0, so effectively the old weights
+	score := (rttScore * 0.3) + (successRate * 0.25) + (uptimeScore * 0.15) + (recencyScore * 0.1) + (forkScore * 0.2)
+	return score
+}

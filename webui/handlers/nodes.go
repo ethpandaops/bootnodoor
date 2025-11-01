@@ -1,26 +1,25 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
+	"sort"
 	"time"
 
+	"github.com/pk910/bootoor/discv5/node"
 	"github.com/pk910/bootoor/webui/server"
 )
 
 // NodesPageData contains data for the nodes page
 type NodesPageData struct {
 	TotalNodes        int
+	ActiveNodes       int
+	InactiveNodes     int
 	CurrentForkDigest string
-	Buckets           []BucketInfo
+	Nodes             []NodeInfo
 }
 
-type BucketInfo struct {
-	Index     int
-	Distance  string
-	NodeCount int
-	Nodes     []NodeInfo
-}
-
+// NodeInfo contains node information for display
 type NodeInfo struct {
 	PeerID        string
 	IP            string
@@ -30,12 +29,13 @@ type NodeInfo struct {
 	SuccessCount  int
 	FailureCount  int
 	IsAlive       bool
-	Score         int
+	Score         float64
 	ForkDigest    string
 	HasForkData   bool
 	IsCurrentFork bool
 	ENRSeq        uint64
 	ENR           string
+	AvgRTT        time.Duration
 }
 
 // Nodes renders the nodes page
@@ -60,7 +60,7 @@ func (fh *FrontendHandler) Nodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (fh *FrontendHandler) getNodesPageData() (*NodesPageData, error) {
-	buckets := fh.bootnodeService.GetBuckets()
+	nodes := fh.bootnodeService.GetActiveNodes()
 	stats := fh.bootnodeService.GetStats()
 
 	// Get current fork digest if available
@@ -71,52 +71,65 @@ func (fh *FrontendHandler) getNodesPageData() (*NodesPageData, error) {
 
 	pageData := &NodesPageData{
 		CurrentForkDigest: currentForkDigest,
-		Buckets:           make([]BucketInfo, 0, len(buckets)),
+		ActiveNodes:       stats.ActiveNodes,
+		InactiveNodes:     stats.InactiveNodes,
+		Nodes:             make([]NodeInfo, 0, len(nodes)),
 	}
 
-	totalNodes := 0
-	for _, bucket := range buckets {
-		if len(bucket.Nodes) == 0 {
-			continue
+	// Use the default maxNodeAge and maxFailures for IsAlive check
+	// These match the bootnode config defaults
+	maxNodeAge := 24 * time.Hour
+	maxFailures := 3
+
+	// Get fork scoring info for accurate node scoring
+	var forkScoringInfo *node.ForkScoringInfo
+	if forkFilter := fh.bootnodeService.ForkFilter(); forkFilter != nil {
+		filterInfo := forkFilter.GetForkScoringInfo()
+		// Convert to node.ForkScoringInfo
+		forkScoringInfo = &node.ForkScoringInfo{
+			CurrentForkDigest:  [4]byte(filterInfo.CurrentForkDigest),
+			PreviousForkDigest: [4]byte(filterInfo.PreviousForkDigest),
+			GenesisForkDigest:  [4]byte(filterInfo.GenesisForkDigest),
+			GracePeriodEnd:     filterInfo.GracePeriodEnd,
 		}
-
-		bucketInfo := BucketInfo{
-			Index:     bucket.Index,
-			Distance:  bucket.Distance,
-			NodeCount: len(bucket.Nodes),
-			Nodes:     make([]NodeInfo, 0, len(bucket.Nodes)),
-		}
-
-		for _, node := range bucket.Nodes {
-			nodeInfo := NodeInfo{
-				PeerID:       node.PeerID,
-				IP:           node.IP,
-				Port:         node.Port,
-				FirstSeen:    node.FirstSeen,
-				LastSeen:     node.LastSeen,
-				SuccessCount: node.SuccessCount,
-				FailureCount: node.FailureCount,
-				IsAlive:      node.IsAlive,
-				Score:        node.Score,
-				ForkDigest:   node.ForkDigest,
-				HasForkData:  node.HasForkData,
-				ENRSeq:       node.ENRSeq,
-				ENR:          node.ENR,
-			}
-
-			// Check if this node is on the current fork
-			if node.HasForkData && currentForkDigest != "" {
-				nodeInfo.IsCurrentFork = (node.ForkDigest == currentForkDigest)
-			}
-
-			bucketInfo.Nodes = append(bucketInfo.Nodes, nodeInfo)
-			totalNodes++
-		}
-
-		pageData.Buckets = append(pageData.Buckets, bucketInfo)
 	}
 
-	pageData.TotalNodes = totalNodes
+	for _, n := range nodes {
+		nodeInfo := NodeInfo{
+			PeerID:       n.PeerID(),
+			IP:           n.IP().String(),
+			Port:         int(n.UDPPort()),
+			FirstSeen:    n.FirstSeen(),
+			LastSeen:     n.LastSeen(),
+			SuccessCount: n.SuccessCount(),
+			FailureCount: n.FailureCount(),
+			IsAlive:      n.IsAlive(maxNodeAge, maxFailures),
+			Score:        n.CalculateScore(forkScoringInfo),
+			ENRSeq:       n.Record().Seq(),
+			AvgRTT:       n.AvgRTT(),
+		}
+
+		// Extract eth2 fork digest if available
+		if eth2Data, ok := n.Record().Eth2(); ok {
+			nodeInfo.ForkDigest = fmt.Sprintf("%x", eth2Data.ForkDigest)
+			nodeInfo.HasForkData = true
+			nodeInfo.IsCurrentFork = (nodeInfo.ForkDigest == currentForkDigest)
+		}
+
+		// Get ENR string
+		if enrStr, err := n.Record().EncodeBase64(); err == nil {
+			nodeInfo.ENR = enrStr
+		}
+
+		pageData.Nodes = append(pageData.Nodes, nodeInfo)
+	}
+
+	// Sort nodes by PeerID for consistent ordering
+	sort.Slice(pageData.Nodes, func(i, j int) bool {
+		return pageData.Nodes[i].PeerID < pageData.Nodes[j].PeerID
+	})
+
+	pageData.TotalNodes = len(nodes)
 
 	return pageData, nil
 }

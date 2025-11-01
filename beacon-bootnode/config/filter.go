@@ -126,88 +126,86 @@ func (f *ForkDigestFilter) SetLogger(logger Logger) {
 //	    AdmissionFilter: filter.Filter(),
 //	    ResponseFilter: filter.ResponseFilter(),
 //	})
-func (f *ForkDigestFilter) Filter() enr.ENRFilter {
-	return func(record *enr.Record) bool {
-		f.mu.Lock()
-		f.totalChecks++
-		f.mu.Unlock()
+func (f *ForkDigestFilter) Filter(record *enr.Record) bool {
+	f.mu.Lock()
+	f.totalChecks++
+	f.mu.Unlock()
 
-		// Get eth2 field from ENR
-		var eth2Data []byte
-		if err := record.Get("eth2", &eth2Data); err != nil {
-			// No eth2 field, reject
-			f.mu.Lock()
-			f.rejectedInvalid++
-			if f.logger != nil {
-				f.logger.Debugf("Rejected node: no eth2 field in ENR")
-			}
-			f.mu.Unlock()
-			return false
-		}
-
-		// Parse fork digest (first 4 bytes only)
-		forkDigest, err := ParseETH2Field(eth2Data)
-		if err != nil {
-			// Invalid eth2 field, reject
-			f.mu.Lock()
-			f.rejectedInvalid++
-			if f.logger != nil {
-				f.logger.Debugf("Rejected node: invalid eth2 field - %v", err)
-			}
-			f.mu.Unlock()
-			return false
-		}
-
-		f.mu.RLock()
-		currentDigest := f.currentForkDigest
-		oldDigests := f.oldForkDigests
-		gracePeriod := f.gracePeriod
-		historicalDigests := f.historicalDigests
-		f.mu.RUnlock()
-
-		// Check if matches current fork digest
-		if forkDigest == currentDigest {
-			f.mu.Lock()
-			f.acceptedCurrent++
-			f.mu.Unlock()
-			return true
-		}
-
-		// Check if matches old fork digest within grace period
-		if activationTime, exists := oldDigests[forkDigest]; exists {
-			age := time.Since(activationTime)
-			if age <= gracePeriod {
-				f.mu.Lock()
-				f.acceptedOld++
-				f.mu.Unlock()
-				return true
-			}
-			// Grace period expired but still historically valid - fall through
-		}
-
-		// Check if it's any historically valid fork digest
-		// These nodes will be added to the table and pinged (triggering ENR updates)
-		// but may be excluded from FINDNODE responses via ResponseFilter
-		if historicalDigests[forkDigest] {
-			f.mu.Lock()
-			f.acceptedHistorical++
-			if f.logger != nil {
-				f.logger.Debugf("Accepted node with historical fork digest: %s (current: %s)", forkDigest.String(), currentDigest.String())
-			}
-			f.mu.Unlock()
-			return true
-		}
-
-		// Unknown fork digest, reject
+	// Get eth2 field from ENR
+	var eth2Data []byte
+	if err := record.Get("eth2", &eth2Data); err != nil {
+		// No eth2 field, reject
 		f.mu.Lock()
 		f.rejectedInvalid++
 		if f.logger != nil {
-			f.logger.Debugf("Rejected node: unknown fork digest %s (current: %s, %d historical digests known)",
-				forkDigest.String(), currentDigest.String(), len(historicalDigests))
+			f.logger.Debugf("Rejected node: no eth2 field in ENR")
 		}
 		f.mu.Unlock()
 		return false
 	}
+
+	// Parse fork digest (first 4 bytes only)
+	forkDigest, err := ParseETH2Field(eth2Data)
+	if err != nil {
+		// Invalid eth2 field, reject
+		f.mu.Lock()
+		f.rejectedInvalid++
+		if f.logger != nil {
+			f.logger.Debugf("Rejected node: invalid eth2 field - %v", err)
+		}
+		f.mu.Unlock()
+		return false
+	}
+
+	f.mu.RLock()
+	currentDigest := f.currentForkDigest
+	oldDigests := f.oldForkDigests
+	gracePeriod := f.gracePeriod
+	historicalDigests := f.historicalDigests
+	f.mu.RUnlock()
+
+	// Check if matches current fork digest
+	if forkDigest == currentDigest {
+		f.mu.Lock()
+		f.acceptedCurrent++
+		f.mu.Unlock()
+		return true
+	}
+
+	// Check if matches old fork digest within grace period
+	if activationTime, exists := oldDigests[forkDigest]; exists {
+		age := time.Since(activationTime)
+		if age <= gracePeriod {
+			f.mu.Lock()
+			f.acceptedOld++
+			f.mu.Unlock()
+			return true
+		}
+		// Grace period expired but still historically valid - fall through
+	}
+
+	// Check if it's any historically valid fork digest
+	// These nodes will be added to the table and pinged (triggering ENR updates)
+	// but may be excluded from FINDNODE responses via ResponseFilter
+	if historicalDigests[forkDigest] {
+		f.mu.Lock()
+		f.acceptedHistorical++
+		if f.logger != nil {
+			f.logger.Debugf("Accepted node with historical fork digest: %s (current: %s)", forkDigest.String(), currentDigest.String())
+		}
+		f.mu.Unlock()
+		return true
+	}
+
+	// Unknown fork digest, reject
+	f.mu.Lock()
+	f.rejectedInvalid++
+	if f.logger != nil {
+		f.logger.Debugf("Rejected node: unknown fork digest %s (current: %s, %d historical digests known)",
+			forkDigest.String(), currentDigest.String(), len(historicalDigests))
+	}
+	f.mu.Unlock()
+	return false
 }
 
 // Update updates the fork digest based on the current epoch.
@@ -457,6 +455,38 @@ func (f *ForkDigestFilter) GetNetworkName() string {
 	defer f.mu.RUnlock()
 
 	return f.config.ConfigName
+}
+
+// GetForkScoringInfo returns fork digest information for node scoring.
+// This includes current, previous, and genesis fork digests with grace period info.
+func (f *ForkDigestFilter) GetForkScoringInfo() *ForkScoringInfo {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	info := &ForkScoringInfo{
+		CurrentForkDigest: f.currentForkDigest,
+		GenesisForkDigest: f.config.GetGenesisForkDigest(),
+	}
+
+	// Find the most recent previous fork digest (if any)
+	var mostRecentTime time.Time
+	for digest, activationTime := range f.oldForkDigests {
+		if activationTime.After(mostRecentTime) {
+			info.PreviousForkDigest = digest
+			mostRecentTime = activationTime
+			info.GracePeriodEnd = activationTime.Add(f.gracePeriod)
+		}
+	}
+
+	return info
+}
+
+// ForkScoringInfo contains fork digest information for node scoring.
+type ForkScoringInfo struct {
+	CurrentForkDigest  ForkDigest
+	PreviousForkDigest ForkDigest
+	GenesisForkDigest  ForkDigest
+	GracePeriodEnd     time.Time
 }
 
 // GetOldDigests returns old fork digests with remaining grace time.

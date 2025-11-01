@@ -36,9 +36,10 @@ func GetTemplateFuncs() template.FuncMap {
 		"percent":        func(i float64) float64 { return i * 100 },
 		"contains":       strings.Contains,
 		"formatTimeDiff": FormatTimeDiff,
-		"now":            func() int64 { return time.Now().Unix() },
-		"toInt64":        func(f float64) int64 { return int64(f) },
-		"toFloat64":      func(i int) float64 { return float64(i) },
+		"now":        func() int64 { return time.Now().Unix() },
+		"toInt64":    func(f float64) int64 { return int64(f) },
+		"toFloat64":  func(i int) float64 { return float64(i) },
+		"divDuration": func(d time.Duration, divisor int64) float64 { return float64(d) / float64(divisor) },
 	}
 }
 

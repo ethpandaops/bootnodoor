@@ -24,7 +24,9 @@ type OverviewPageData struct {
 
 	// Routing table stats
 	TableSize       int
-	BucketsFilled   int
+	BucketsFilled   int // Deprecated for flat table
+	ActiveNodes     int
+	InactiveNodes   int
 
 	// Discovery stats
 	LookupsStarted   int
@@ -131,6 +133,8 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		LocalENRSeq:       localNode.Record().Seq(),
 		TableSize:         stats.TableSize,
 		BucketsFilled:     stats.BucketsFilled,
+		ActiveNodes:       stats.ActiveNodes,
+		InactiveNodes:     stats.InactiveNodes,
 		LookupsStarted:    stats.LookupStats.LookupsStarted,
 		LookupsCompleted:  stats.LookupStats.LookupsCompleted,
 		LookupsFailed:     stats.LookupStats.LookupsFailed,

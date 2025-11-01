@@ -94,7 +94,7 @@
                 </tr>
                 <tr>
                   <td class="text-muted">
-                    Buckets Filled
+                    Active Nodes
                     <i class="fa fa-info-circle text-muted"
                        style="font-size: 0.8em;"
                        role="button"
@@ -102,10 +102,25 @@
                        data-bs-trigger="hover focus"
                        data-bs-placement="right"
                        data-bs-html="true"
-                       data-bs-title="Routing Table Buckets"
-                       data-bs-content="The routing table has 256 buckets (0-255), each representing a distance range from this node. A bucket is 'filled' when it contains at least one node. More filled buckets means better network coverage and discovery capability."></i>
+                       data-bs-title="Active Nodes"
+                       data-bs-content="Nodes actively monitored and shared with clients (max 500). These nodes are pinged regularly and rotated periodically based on performance scores."></i>
                   </td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-info fs-6" data-stat="buckets-filled">{{ .BucketsFilled }} / 256</span></td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-success fs-6" data-stat="active-nodes">{{ .ActiveNodes }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">
+                    Inactive Nodes
+                    <i class="fa fa-info-circle text-muted"
+                       style="font-size: 0.8em;"
+                       role="button"
+                       data-bs-toggle="popover"
+                       data-bs-trigger="hover focus"
+                       data-bs-placement="right"
+                       data-bs-html="true"
+                       data-bs-title="Inactive Nodes"
+                       data-bs-content="Nodes stored in the database but not actively monitored. These nodes are periodically rotated into the active pool based on performance scores."></i>
+                  </td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary fs-6" data-stat="inactive-nodes">{{ .InactiveNodes }}</span></td>
                 </tr>
               </tbody>
             </table>
@@ -457,7 +472,8 @@
 
         // Routing table
         updateValue('[data-stat="table-size"]', data.TableSize);
-        updateValue('[data-stat="buckets-filled"]', data.BucketsFilled + ' / 256');
+        updateValue('[data-stat="active-nodes"]', data.ActiveNodes);
+        updateValue('[data-stat="inactive-nodes"]', data.InactiveNodes);
 
         // Discovery stats
         updateValue('[data-stat="lookups-started"]', data.LookupsStarted);

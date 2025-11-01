@@ -47,9 +47,8 @@ type Config struct {
 	// BootNodes are the initial nodes to connect to
 	BootNodes []*node.Node
 
-	// NodeDB is the database for storing discovered nodes
-	// If nil, an in-memory database is used
-	NodeDB nodedb.DB
+	// NodeDB is the database for storing discovered nodes (required)
+	NodeDB *nodedb.NodeDB
 
 	// MaxNodesPerIP is the maximum nodes allowed per IP address (default 100)
 	MaxNodesPerIP int

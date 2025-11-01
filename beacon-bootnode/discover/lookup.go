@@ -12,13 +12,14 @@ import (
 	"crypto/rand"
 	"fmt"
 	mathrand "math/rand"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/pk910/bootoor/beacon-bootnode/table"
 	"github.com/pk910/bootoor/discv5/enr"
 	"github.com/pk910/bootoor/discv5/node"
 	"github.com/pk910/bootoor/discv5/protocol"
-	"github.com/pk910/bootoor/beacon-bootnode/table"
 	"github.com/sirupsen/logrus"
 )
 
@@ -30,26 +31,15 @@ const DefaultLookupTimeout = 30 * time.Second
 
 // LookupService manages node discovery operations.
 type LookupService struct {
-	// localNode is our node information
-	localNode *node.Node
+	// config contains all lookup configuration
+	config Config
 
-	// table is the routing table
-	table *table.Table
-
-	// handler is the protocol handler for sending messages
-	handler *protocol.Handler
-
-	// alpha is the concurrency factor for lookups
-	alpha int
-
-	// lookupTimeout is the timeout for lookup operations
-	lookupTimeout time.Duration
-
-	// logger for debug messages
-	logger logrus.FieldLogger
-
-	// mu protects lookup state
+	// mu protects lookup state and stats
 	mu sync.RWMutex
+
+	// queryHistory tracks when we last queried each node
+	// This helps avoid re-querying the same nodes and promotes diversity
+	queryHistory map[node.ID]time.Time
 
 	// Stats
 	lookupsStarted   int
@@ -64,7 +54,7 @@ type Config struct {
 	LocalNode *node.Node
 
 	// Table is the routing table
-	Table *table.Table
+	Table *table.FlatTable
 
 	// Handler is the protocol handler
 	Handler *protocol.Handler
@@ -74,6 +64,10 @@ type Config struct {
 
 	// LookupTimeout is the timeout for lookup operations
 	LookupTimeout time.Duration
+
+	// OnNodeFound is called when a new node is discovered during lookup
+	// The callback should handle admission checks and add the node if valid
+	OnNodeFound func(*node.Node) bool
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
@@ -90,26 +84,24 @@ func NewLookupService(cfg Config) *LookupService {
 	}
 
 	return &LookupService{
-		localNode:     cfg.LocalNode,
-		table:         cfg.Table,
-		handler:       cfg.Handler,
-		alpha:         cfg.Alpha,
-		lookupTimeout: cfg.LookupTimeout,
-		logger:        cfg.Logger,
+		config:       cfg,
+		queryHistory: make(map[node.ID]time.Time),
 	}
 }
 
-// Lookup performs an iterative node lookup for the target ID.
+// Lookup performs a node lookup by querying random nodes from the table.
 //
-// The lookup finds the k closest nodes to the target using the
-// Kademlia algorithm with alpha concurrency.
+// Since we use a flat table without buckets, we simply:
+//   - Select 3 semi-random nodes (preferring alive ones)
+//   - Query them concurrently for nodes near the target
+//   - Add discovered nodes via callback
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout
 //   - target: The target node ID to find
 //   - k: The number of closest nodes to return
 //
-// Returns the k closest nodes found.
+// Returns discovered nodes that were added to the table.
 func (ls *LookupService) Lookup(ctx context.Context, target node.ID, k int) ([]*node.Node, error) {
 	return ls.lookupInternal(ctx, target, k, false)
 }
@@ -120,220 +112,367 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 	ls.lookupsStarted++
 	ls.mu.Unlock()
 
-	ls.logger.WithField("target", target).WithField("k", k).Debug("starting lookup")
+	ls.config.Logger.WithField("target", target).WithField("k", k).Debug("starting lookup")
 
 	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(ctx, ls.lookupTimeout)
+	ctx, cancel := context.WithTimeout(ctx, ls.config.LookupTimeout)
 	defer cancel()
 
-	// Track nodes we've seen and queried
-	seen := make(map[node.ID]bool)
-	queried := make(map[node.ID]bool)
-
-	// Start with nodes from our routing table
-	var closest []*node.Node
-	if isRandomWalk {
-		// For random walks, start with ALL nodes to explore diverse areas
-		// This prevents getting stuck querying the same cluster repeatedly
-		allNodes := ls.table.FindClosestNodes(target, ls.table.Size())
-		mathrand.Shuffle(len(allNodes), func(i, j int) {
-			allNodes[i], allNodes[j] = allNodes[j], allNodes[i]
-		})
-		closest = allNodes
-		if len(closest) > k*2 {
-			// Limit to avoid excessive queries, but use more than k
-			closest = closest[:k*2]
-		}
-	} else {
-		// For targeted lookups, use standard closest k nodes
-		closest = ls.table.FindClosestNodes(target, k)
+	// Get all active nodes from table
+	allNodes := ls.config.Table.GetActiveNodes()
+	if len(allNodes) == 0 {
+		ls.mu.Lock()
+		ls.lookupsFailed++
+		ls.mu.Unlock()
+		return nil, fmt.Errorf("no nodes in table to query")
 	}
 
-	for _, n := range closest {
+	// Track all discovered nodes and which ones we've queried
+	seen := make(map[node.ID]bool)
+	queried := make(map[node.ID]bool)
+	var allDiscovered []*node.Node
+	var mu sync.Mutex
+
+	// Add existing table nodes to the candidate pool
+	for _, n := range allNodes {
 		seen[n.ID()] = true
 	}
 
-	totalAdded := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			ls.mu.Lock()
-			ls.lookupsFailed++
-			ls.mu.Unlock()
-			return closest, ctx.Err()
-		default:
+	// For iterative lookup, we need a list of candidates sorted by distance to target
+	// Start with closest nodes from our table
+	var candidates []*node.Node
+	if isRandomWalk {
+		// For random walks, start with random selection for diversity
+		candidates = ls.selectRandomNodes(allNodes, ls.config.Alpha*2)
+	} else {
+		// For regular lookups, start with closest nodes to target
+		candidates = ls.config.Table.FindClosestNodes(target, k*2)
+		if len(candidates) == 0 {
+			// Fallback to random if no closest nodes
+			candidates = ls.selectRandomNodes(allNodes, ls.config.Alpha*2)
 		}
+	}
 
-		// Find nodes to query (up to alpha nodes)
-		var toQuery []*node.Node
-		for _, n := range closest {
-			if !queried[n.ID()] {
-				toQuery = append(toQuery, n)
-				if len(toQuery) >= ls.alpha {
-					break
-				}
-			}
-		}
-
-		// If no more nodes to query, we're done
+	// Perform iterative lookup rounds
+	maxRounds := 4 // Maximum number of query rounds
+	for round := 0; round < maxRounds; round++ {
+		// Select nodes to query this round
+		// Pick closest unqueried nodes, considering query history
+		toQuery := ls.selectNodesToQuery(candidates, queried, target, ls.config.Alpha, isRandomWalk)
 		if len(toQuery) == 0 {
+			ls.config.Logger.WithField("round", round).Debug("no more nodes to query, lookup converged")
 			break
 		}
 
-		// Query nodes in parallel
+		ls.config.Logger.WithFields(logrus.Fields{
+			"round":      round,
+			"target":     target,
+			"queryNodes": len(toQuery),
+			"isRandWalk": isRandomWalk,
+		}).Debug("lookup round")
+
+		// Query nodes in parallel for this round
 		var wg sync.WaitGroup
-		var mu sync.Mutex
-		var newNodes []*node.Node
+		roundDiscovered := make([]*node.Node, 0)
+		var roundMu sync.Mutex
 
 		for _, n := range toQuery {
-			queried[n.ID()] = true
-
 			wg.Add(1)
 			go func(n *node.Node) {
 				defer wg.Done()
 
+				// Mark as queried
+				mu.Lock()
+				queried[n.ID()] = true
+				ls.queryHistory[n.ID()] = time.Now()
+				mu.Unlock()
+
 				// Calculate distances
 				var distances []uint
 				if isRandomWalk {
-					// For random walks, request a wide range of distances
-					// Focus on high distances where nodes statistically exist (exponential distribution)
-					// but also include some lower ones to explore diverse keyspace
-					distances = []uint{240, 245, 250, 252, 254, 255}
+					// For random walks, request high distances to explore diverse keyspace
+					distances = []uint{250, 251, 252, 253, 254, 255}
 				} else {
-					// For regular lookups, use Geth algorithm to converge on target
+					// For regular lookups, use wider range for diversity
 					distances = ls.lookupDistances(target, n.ID())
 				}
 
-				ls.logger.WithFields(logrus.Fields{
+				ls.config.Logger.WithFields(logrus.Fields{
+					"round":     round,
 					"peerID":    n.PeerID(),
 					"addr":      n.Addr(),
 					"target":    target,
 					"distances": distances,
-				}).Trace("discover: sending FINDNODE")
+				}).Trace("sending FINDNODE")
 
 				// Send FINDNODE request
-				respChan, err := ls.handler.SendFindNode(n, distances)
+				respChan, err := ls.config.Handler.SendFindNode(n, distances)
 				if err != nil {
-					ls.logger.WithFields(logrus.Fields{
+					ls.config.Logger.WithFields(logrus.Fields{
 						"peerID": n.PeerID(),
 						"addr":   n.Addr(),
 						"error":  err,
-					}).Debug("discover: failed to send FINDNODE")
+					}).Debug("failed to send FINDNODE")
 					return
 				}
 
-				// Wait for response with context cancellation
+				// Wait for response
 				var resp *protocol.Response
 				select {
 				case resp = <-respChan:
 					// Response received
 				case <-ctx.Done():
-					// Context cancelled or deadline exceeded
-					ls.logger.WithFields(logrus.Fields{
-						"peerID": n.PeerID(),
-						"addr":   n.Addr(),
-					}).Debug("discover: lookup cancelled")
+					ls.config.Logger.WithField("peerID", n.PeerID()).Debug("lookup cancelled")
 					return
 				}
 
 				if resp.Error != nil {
-					ls.logger.WithFields(logrus.Fields{
+					ls.config.Logger.WithFields(logrus.Fields{
 						"peerID": n.PeerID(),
-						"addr":   n.Addr(),
 						"error":  resp.Error,
-					}).Debug("discover: FINDNODE timeout or error")
+					}).Debug("FINDNODE timeout or error")
 					return
 				}
 
 				// Extract nodes from response
 				if nodesMsg, ok := resp.Message.(*protocol.Nodes); ok {
-					ls.logger.WithFields(logrus.Fields{
+					ls.config.Logger.WithFields(logrus.Fields{
+						"round":       round,
 						"peerID":      n.PeerID(),
-						"addr":        n.Addr(),
 						"nodesInResp": len(nodesMsg.Records),
-					}).Trace("discover: received NODES response")
+					}).Trace("received NODES response")
 
-					mu.Lock()
+					roundMu.Lock()
 					for _, record := range nodesMsg.Records {
 						newNode, err := node.New(record)
 						if err != nil {
-							ls.logger.WithError(err).Debug("discover: invalid node in NODES response")
+							ls.config.Logger.WithError(err).Debug("invalid node in NODES response")
 							continue
 						}
 
 						// Skip if already seen
-						if seen[newNode.ID()] {
-							ls.logger.WithFields(logrus.Fields{
-								"peerID": newNode.PeerID(),
-								"addr":   newNode.Addr(),
-							}).Trace("discover: node already seen, skipping")
+						mu.Lock()
+						alreadySeen := seen[newNode.ID()]
+						if !alreadySeen {
+							seen[newNode.ID()] = true
+						}
+						mu.Unlock()
+
+						if alreadySeen {
 							continue
 						}
 
-						ls.logger.WithFields(logrus.Fields{
-							"peerID": newNode.PeerID(),
-							"addr":   newNode.Addr(),
-						}).Debug("discover: discovered new node")
-
-						seen[newNode.ID()] = true
-						newNodes = append(newNodes, newNode)
+						roundDiscovered = append(roundDiscovered, newNode)
 					}
-					mu.Unlock()
+					roundMu.Unlock()
 				}
 			}(n)
 		}
 
 		wg.Wait()
 
-		ls.logger.WithFields(logrus.Fields{
-			"target":       target,
-			"queried":      len(toQuery),
-			"newDiscovery": len(newNodes),
-		}).Debug("discover: lookup iteration complete")
+		ls.config.Logger.WithFields(logrus.Fields{
+			"round":      round,
+			"discovered": len(roundDiscovered),
+		}).Debug("lookup round complete")
 
-		// Add new nodes to routing table and track which were successfully added
-		acceptedCount := 0
-		var addedNodes []*node.Node
-		for _, n := range newNodes {
-			if ls.table.Add(n) {
-				acceptedCount++
-				addedNodes = append(addedNodes, n)
-			}
+		// Add this round's discoveries to the total
+		mu.Lock()
+		allDiscovered = append(allDiscovered, roundDiscovered...)
+		mu.Unlock()
+
+		// Check context before next round
+		select {
+		case <-ctx.Done():
+			ls.config.Logger.WithField("round", round).Debug("lookup timeout")
+			return nil, ctx.Err()
+		default:
 		}
 
-		// Note: acceptedCount includes nodes that were already in table and just refreshed
-		// The actual growth is measured by totalAdded at the end
-		totalAdded += acceptedCount
+		// Add newly discovered nodes to candidates for next round
+		// Sort by distance to target to prioritize closer nodes
+		if !isRandomWalk {
+			candidates = ls.sortNodesByDistance(roundDiscovered, target)
+			if len(candidates) == 0 {
+				ls.config.Logger.WithField("round", round).Debug("no new candidates, lookup complete")
+				break
+			}
+		} else {
+			// For random walks, just add to candidates
+			candidates = append(candidates, roundDiscovered...)
+		}
+	}
 
-		ls.logger.WithFields(logrus.Fields{
-			"target":     target,
-			"discovered": len(newNodes),
-			"accepted":   acceptedCount,
-			"rejected":   len(newNodes) - acceptedCount,
-		}).Debug("discover: added new nodes to routing table")
+	ls.config.Logger.WithFields(logrus.Fields{
+		"target":     target,
+		"queried":    len(queried),
+		"discovered": len(allDiscovered),
+	}).Debug("lookup queries complete")
 
-		// Update closest list - ONLY include nodes that were added to routing table
-		// This prevents querying nodes outside our network (wrong fork, rejected by filters)
-		allNodes := append(closest, addedNodes...)
-		closest = findKClosest(target, allNodes, k)
-
-		ls.mu.Lock()
-		ls.nodesDiscovered += len(newNodes)
-		ls.mu.Unlock()
+	// Add discovered nodes via callback (handles admission checks)
+	var addedNodes []*node.Node
+	for _, n := range allDiscovered {
+		if ls.config.OnNodeFound != nil && ls.config.OnNodeFound(n) {
+			addedNodes = append(addedNodes, n)
+		}
 	}
 
 	ls.mu.Lock()
+	ls.nodesDiscovered += len(allDiscovered)
 	ls.lookupsCompleted++
 	ls.mu.Unlock()
 
-	ls.logger.WithFields(logrus.Fields{
+	ls.config.Logger.WithFields(logrus.Fields{
 		"target":     target,
-		"discovered": len(closest),
-		"accepted":   totalAdded,
-	}).Info("node discovery lookup complete")
+		"discovered": len(allDiscovered),
+		"accepted":   len(addedNodes),
+		"rejected":   len(allDiscovered) - len(addedNodes),
+	}).Info("lookup complete")
 
-	return closest, nil
+	return addedNodes, nil
+}
+
+// selectRandomNodes selects up to count semi-random nodes, preferring alive ones.
+func (ls *LookupService) selectRandomNodes(nodes []*node.Node, count int) []*node.Node {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	// Separate into alive and dead nodes
+	var aliveNodes []*node.Node
+	var deadNodes []*node.Node
+
+	// Use default values for alive check (24h, 3 failures)
+	maxNodeAge := 24 * time.Hour
+	maxFailures := 3
+
+	for _, n := range nodes {
+		if n.IsAlive(maxNodeAge, maxFailures) {
+			aliveNodes = append(aliveNodes, n)
+		} else {
+			deadNodes = append(deadNodes, n)
+		}
+	}
+
+	// Shuffle both lists
+	mathrand.Shuffle(len(aliveNodes), func(i, j int) {
+		aliveNodes[i], aliveNodes[j] = aliveNodes[j], aliveNodes[i]
+	})
+	mathrand.Shuffle(len(deadNodes), func(i, j int) {
+		deadNodes[i], deadNodes[j] = deadNodes[j], deadNodes[i]
+	})
+
+	// Select nodes, preferring alive ones
+	var selected []*node.Node
+
+	// Take alive nodes first
+	for i := 0; i < len(aliveNodes) && len(selected) < count; i++ {
+		selected = append(selected, aliveNodes[i])
+	}
+
+	// Fill remaining slots with dead nodes if needed
+	for i := 0; i < len(deadNodes) && len(selected) < count; i++ {
+		selected = append(selected, deadNodes[i])
+	}
+
+	return selected
+}
+
+// selectNodesToQuery selects up to count nodes to query from candidates.
+// It prefers nodes that:
+// 1. Haven't been queried yet in this lookup
+// 2. Haven't been queried recently (considering query history)
+// 3. Are closest to the target (for non-random-walk lookups)
+func (ls *LookupService) selectNodesToQuery(candidates []*node.Node, queried map[node.ID]bool, target node.ID, count int, isRandomWalk bool) []*node.Node {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	// Filter out already queried nodes
+	var unqueried []*node.Node
+	for _, n := range candidates {
+		if !queried[n.ID()] {
+			unqueried = append(unqueried, n)
+		}
+	}
+
+	if len(unqueried) == 0 {
+		return nil
+	}
+
+	// Score nodes based on:
+	// - Distance to target (for non-random walks)
+	// - Time since last query (prefer nodes not queried recently)
+	type scoredNode struct {
+		node  *node.Node
+		score float64
+	}
+
+	ls.mu.RLock()
+	scored := make([]scoredNode, 0, len(unqueried))
+	now := time.Now()
+	queryHistoryWeight := 5 * time.Minute // Prefer nodes not queried in last 5 minutes
+
+	for _, n := range unqueried {
+		score := 0.0
+
+		// Distance score (lower distance = higher score)
+		if !isRandomWalk {
+			dist := node.LogDistance(target, n.ID())
+			// Invert distance so closer nodes get higher scores
+			score += float64(256 - dist)
+		}
+
+		// Query history score (prefer nodes not queried recently)
+		if lastQuery, exists := ls.queryHistory[n.ID()]; exists {
+			timeSinceQuery := now.Sub(lastQuery)
+			if timeSinceQuery < queryHistoryWeight {
+				// Penalize recently queried nodes
+				penalty := float64(queryHistoryWeight-timeSinceQuery) / float64(queryHistoryWeight)
+				score -= penalty * 100 // Heavy penalty
+			}
+		} else {
+			// Never queried - bonus
+			score += 50
+		}
+
+		scored = append(scored, scoredNode{node: n, score: score})
+	}
+	ls.mu.RUnlock()
+
+	// Sort by score (highest first)
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+
+	// Take top count nodes
+	result := make([]*node.Node, 0, count)
+	for i := 0; i < len(scored) && i < count; i++ {
+		result = append(result, scored[i].node)
+	}
+
+	return result
+}
+
+// sortNodesByDistance sorts nodes by their distance to the target.
+// Returns nodes sorted from closest to farthest.
+func (ls *LookupService) sortNodesByDistance(nodes []*node.Node, target node.ID) []*node.Node {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	// Create a copy to avoid modifying the input
+	sorted := make([]*node.Node, len(nodes))
+	copy(sorted, nodes)
+
+	// Sort by distance to target
+	sort.Slice(sorted, func(i, j int) bool {
+		distI := node.LogDistance(target, sorted[i].ID())
+		distJ := node.LogDistance(target, sorted[j].ID())
+		return distI < distJ
+	})
+
+	return sorted
 }
 
 // LookupWithFilter performs a lookup with an ENR filter.
@@ -364,45 +503,17 @@ func (ls *LookupService) LookupWithFilter(ctx context.Context, target node.ID, k
 //
 // This is used for routing table maintenance and exploring the network.
 func (ls *LookupService) RandomWalk(ctx context.Context) ([]*node.Node, error) {
-	// Generate a completely random 256-bit target ID (Geth approach)
-	// This ensures the target can be at any distance from any node in the network,
-	// which allows us to explore diverse regions of the keyspace
+	// Generate a completely random 256-bit target ID
+	// This ensures we explore diverse regions of the keyspace
 	var target node.ID
 	if _, err := rand.Read(target[:]); err != nil {
 		return nil, fmt.Errorf("failed to generate random target: %w", err)
 	}
 
-	ls.logger.WithFields(logrus.Fields{
-		"target": target,
-	}).Debug("discover: starting random walk")
+	ls.config.Logger.WithField("target", target).Debug("starting random walk")
 
-	// Perform lookup for random target using ALL nodes to break out of clusters
+	// Perform lookup for random target
 	return ls.lookupInternal(ctx, target, 32, true)
-}
-
-// findKClosest finds the k closest nodes to target from a list.
-func findKClosest(target node.ID, nodes []*node.Node, k int) []*node.Node {
-	// Convert to IDs
-	ids := make([]node.ID, len(nodes))
-	nodeMap := make(map[node.ID]*node.Node)
-
-	for i, n := range nodes {
-		ids[i] = n.ID()
-		nodeMap[n.ID()] = n
-	}
-
-	// Find k closest IDs
-	closestIDs := node.FindClosest(target, ids, k)
-
-	// Convert back to nodes
-	result := make([]*node.Node, 0, len(closestIDs))
-	for _, id := range closestIDs {
-		if n, exists := nodeMap[id]; exists {
-			result = append(result, n)
-		}
-	}
-
-	return result
 }
 
 // GetStats returns statistics about discovery operations.
@@ -426,15 +537,45 @@ func (ls *LookupService) GetStats() LookupStats {
 	}
 }
 
+// CleanupQueryHistory removes stale entries from the query history.
+// This should be called periodically to prevent unbounded growth.
+// Entries older than the given duration are removed.
+func (ls *LookupService) CleanupQueryHistory(maxAge time.Duration) int {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+
+	now := time.Now()
+	removed := 0
+
+	for nodeID, lastQuery := range ls.queryHistory {
+		if now.Sub(lastQuery) > maxAge {
+			delete(ls.queryHistory, nodeID)
+			removed++
+		}
+	}
+
+	if removed > 0 {
+		ls.config.Logger.WithField("removed", removed).Debug("cleaned up query history")
+	}
+
+	return removed
+}
+
 // lookupDistances calculates the distance parameters for a FINDNODE request.
 //
-// This implements the Ethereum/Geth algorithm: request distances centered around
-// the target-to-destination distance. This ensures we get nodes progressively
-// closer to the target.
+// This implements an improved algorithm that requests a wider range of distances
+// for better diversity. Instead of just 3 distances centered around the target,
+// we request 5 distances covering a broader range of the keyspace.
 //
-// For example, if target-to-dest distance is 150, we request [150, 151, 149].
+// The strategy is:
+// 1. Request the exact target distance
+// 2. Request nearby distances (±1, ±2)
+// 3. Include a wider diversity distance to explore more of the keyspace
+//
+// For example, if target-to-dest distance is 150, we might request:
+// [150, 151, 149, 152, 148] for nearby exploration
 func (ls *LookupService) lookupDistances(target, dest node.ID) []uint {
-	const lookupRequestLimit = 3
+	const lookupRequestLimit = 5 // Increased from 3 to 5 for better diversity
 
 	td := node.LogDistance(target, dest)
 	if td < 0 {
@@ -443,12 +584,37 @@ func (ls *LookupService) lookupDistances(target, dest node.ID) []uint {
 	}
 
 	dists := []uint{uint(td)}
+
+	// Add nearby distances in alternating pattern: +1, -1, +2, -2, +3, -3, etc.
 	for i := 1; len(dists) < lookupRequestLimit; i++ {
+		// Try adding higher distance first
 		if td+i <= 256 {
 			dists = append(dists, uint(td+i))
+			if len(dists) >= lookupRequestLimit {
+				break
+			}
 		}
+		// Then try lower distance
 		if td-i > 0 {
 			dists = append(dists, uint(td-i))
+		}
+	}
+
+	// For additional diversity, occasionally include a wider distance
+	// This helps discover nodes in different regions of the keyspace
+	if len(dists) < lookupRequestLimit && td < 250 {
+		// Add a distance in the higher range for diversity
+		wideDistance := uint(mathrand.Intn(6) + 250) // Random distance 250-255
+		// Only add if not already in the list
+		found := false
+		for _, d := range dists {
+			if d == wideDistance {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dists = append(dists, wideDistance)
 		}
 	}
 

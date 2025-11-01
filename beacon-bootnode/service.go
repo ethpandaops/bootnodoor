@@ -35,10 +35,10 @@ type Service struct {
 	forkFilter *config.ForkDigestFilter
 
 	// nodeDB stores discovered nodes
-	nodeDB nodedb.DB
+	nodeDB *nodedb.NodeDB
 
 	// table is the routing table
-	table *table.Table
+	table *table.FlatTable
 
 	// lookup performs node discovery
 	lookup *discover.LookupService
@@ -80,7 +80,7 @@ func New(cfg *Config) (*Service, error) {
 	}
 
 	if cfg.NodeDB == nil {
-		cfg.NodeDB = nodedb.NewMemoryDB(cfg.Logger)
+		return nil, fmt.Errorf("NodeDB is required")
 	}
 
 	if cfg.GracePeriod <= 0 {
@@ -97,28 +97,39 @@ func New(cfg *Config) (*Service, error) {
 	localPubKey := &cfg.PrivateKey.PublicKey
 	localID := node.PubkeyToID(localPubKey)
 
-	tableConfig := table.Config{
-		LocalID:         localID,
-		MaxNodesPerIP:   cfg.MaxNodesPerIP,
-		AdmissionFilter: forkFilter.Filter(), // Fork digest filtering at admission
-		PingInterval:    cfg.PingInterval,
-		MaxNodeAge:      cfg.MaxNodeAge,
-		MaxFailures:     cfg.MaxFailures,
-		DB:              cfg.NodeDB,
-		Logger:          cfg.Logger,
-		NodeChangedCallback: func(n *node.Node) {
-			// Persist node to database in background
-			go func() {
-				if err := cfg.NodeDB.Store(n); err != nil {
-					cfg.Logger.WithError(err).WithField("peerID", n.PeerID()).Warn("failed to persist node to database")
-				}
-			}()
-		},
+	flatTableConfig := table.FlatTableConfig{
+		LocalID:             localID,
+		DB:                  cfg.NodeDB,
+		MaxActiveNodes:      500, // Cap at 500 active nodes (1000 hard limit)
+		MaxNodesPerIP:       cfg.MaxNodesPerIP,
+		PingInterval:        cfg.PingInterval,
+		PingRate:            200, // pings per minute
+		MaxNodeAge:          cfg.MaxNodeAge,
+		MaxFailures:         cfg.MaxFailures,
+		SweepInterval:       10 * time.Minute, // Rotate nodes every 10 minutes
+		SweepPercent:        10,               // Rotate 10% of active nodes
+		NodeChangedCallback: nil,              // DB updates are queued automatically
+		Logger:              cfg.Logger,
 	}
-	routingTable := table.NewTable(tableConfig)
+	routingTable, err := table.NewFlatTable(flatTableConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create flat table: %w", err)
+	}
+
+	// Create service
+	s := &Service{
+		config:     cfg,
+		forkFilter: forkFilter,
+		nodeDB:     cfg.NodeDB,
+		table:      routingTable,
+	}
+
+	// Create context for graceful shutdown
+	s.ctx, s.cancelCtx = context.WithCancel(context.Background())
 
 	// Create discv5 service configuration with callbacks
 	discv5Config := discv5.DefaultConfig()
+	discv5Config.Context = s.ctx
 	discv5Config.PrivateKey = cfg.PrivateKey
 	discv5Config.BindIP = cfg.BindIP
 	discv5Config.BindPort = cfg.BindPort
@@ -130,7 +141,7 @@ func New(cfg *Config) (*Service, error) {
 	discv5Config.MaxSessions = cfg.MaxSessions
 	discv5Config.Logger = cfg.Logger
 
-	// Set response filter (admission filter is applied at table level)
+	// Set response filter
 	discv5Config.ResponseFilter = protocol.ChainResponseFilters(
 		protocol.LANAwareResponseFilter(),
 		forkFilter.ResponseFilter(),
@@ -138,23 +149,24 @@ func New(cfg *Config) (*Service, error) {
 
 	// Set callbacks for protocol events
 	discv5Config.OnHandshakeComplete = func(n *node.Node, incoming bool) {
-		// Add node to routing table after handshake
-		routingTable.Add(n)
+		// Check and add node through service (handles all admission checks)
+		s.CheckAndAddNode(n)
 	}
 
 	discv5Config.OnNodeUpdate = func(n *node.Node) {
-		// Update node in routing table when ENR is updated
-		routingTable.Add(n)
+		// Check and add/update node through service (handles all checks)
+		s.CheckAndAddNode(n)
 	}
 
 	discv5Config.OnFindNode = func(msg *protocol.FindNode) []*node.Node {
 		// Serve FINDNODE requests from routing table
 		if len(msg.Distances) == 1 && msg.Distances[0] == 256 {
-			// Special case: return all nodes
+			// Special case: return closest nodes (or random for flat table)
 			return routingTable.FindClosestNodes(localID, 16)
 		}
 
-		// Find nodes at requested distances
+		// Try to get bucket nodes (for backward compatibility with bucket-based table)
+		// This will return nil for FlatTable
 		var collectedNodes []*node.Node
 		for _, distance := range msg.Distances {
 			// Validate distance is in valid range (0-255)
@@ -172,40 +184,39 @@ func New(cfg *Config) (*Service, error) {
 				break
 			}
 		}
+
+		// If we got no bucket nodes (e.g., using FlatTable), return random closest nodes
+		if len(collectedNodes) == 0 {
+			collectedNodes = routingTable.FindClosestNodes(localID, 16)
+		}
+
 		return collectedNodes
 	}
 
 	// OnTalkReq can be nil for now (no TALKREQ support)
 	discv5Config.OnTalkReq = nil
 
-	// Create the discv5 service (minimal, no table/nodedb)
-	discv5Service, err := discv5.New(discv5Config)
+	// Create the discv5 service
+	s.discv5Service, err = discv5.New(discv5Config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create discv5 service: %w", err)
 	}
 
-	s := &Service{
-		config:        cfg,
-		discv5Service: discv5Service,
-		forkFilter:    forkFilter,
-		nodeDB:        cfg.NodeDB,
-		table:         routingTable,
-	}
-
-	// Create context for graceful shutdown
-	s.ctx, s.cancelCtx = context.WithCancel(context.Background())
-
 	// Create lookup service
 	lookupConfig := discover.Config{
-		LocalNode: discv5Service.LocalNode(),
+		LocalNode: s.discv5Service.LocalNode(),
 		Table:     routingTable,
-		Handler:   discv5Service.Handler(),
-		Logger:    cfg.Logger,
+		Handler:   s.discv5Service.Handler(),
+		OnNodeFound: func(n *node.Node) bool {
+			// Use CheckAndAddNode to handle all admission checks
+			return s.CheckAndAddNode(n)
+		},
+		Logger: cfg.Logger,
 	}
 	s.lookup = discover.NewLookupService(lookupConfig)
 
 	// Create ping service
-	s.ping = discover.NewPingService(discv5Service.Handler(), cfg.Logger)
+	s.ping = discover.NewPingService(s.discv5Service.Handler(), cfg.Logger)
 
 	return s, nil
 }
@@ -227,8 +238,10 @@ func (s *Service) Start() error {
 	// Record start time
 	s.startTime = time.Now()
 
-	// Restore nodes from database
-	s.restoreNodesFromDB()
+	// Load initial nodes from DB
+	if err := s.table.LoadInitialNodesFromDB(); err != nil {
+		return fmt.Errorf("failed to load initial nodes from DB: %w", err)
+	}
 
 	// Start discv5 service
 	if err := s.discv5Service.Start(); err != nil {
@@ -264,16 +277,16 @@ func (s *Service) Stop() error {
 	s.running = false
 	s.mu.Unlock()
 
+	// Stop discv5 service
+	if err := s.discv5Service.Stop(); err != nil {
+		s.config.Logger.WithError(err).Error("failed to stop discv5 service")
+	}
+
 	// Signal stop to background tasks via context cancellation
 	s.cancelCtx()
 
 	// Give goroutines a brief moment to exit gracefully
 	time.Sleep(100 * time.Millisecond)
-
-	// Stop discv5 service
-	if err := s.discv5Service.Stop(); err != nil {
-		s.config.Logger.WithError(err).Error("failed to stop discv5 service")
-	}
 
 	// Close node database
 	if err := s.nodeDB.Close(); err != nil {
@@ -313,17 +326,8 @@ func (s *Service) maintenanceLoop() {
 
 // performTableMaintenance performs routing table maintenance.
 func (s *Service) performTableMaintenance() {
-	// Remove stale nodes
-	removed := s.table.RemoveStaleNodes()
-	if removed > 0 {
-		s.config.Logger.WithField("count", removed).Info("removed stale nodes")
-	}
-
-	// Cleanup expired rejection log entries
-	rejectionCleaned := s.table.CleanupRejectionLog()
-	if rejectionCleaned > 0 {
-		s.config.Logger.WithField("count", rejectionCleaned).Debug("cleaned up rejection log entries")
-	}
+	// Perform active/inactive node sweep
+	s.table.PerformSweep()
 }
 
 // performAlivenessCheck checks node aliveness with PINGs.
@@ -338,7 +342,7 @@ func (s *Service) performAlivenessCheck() {
 	// Ping nodes in parallel
 	results := s.ping.PingMultiple(nodes)
 
-	// Update node statistics
+	// Update node statistics and queue DB updates
 	for nodeID, success := range results {
 		n := s.table.Get(nodeID)
 		if n == nil {
@@ -350,6 +354,11 @@ func (s *Service) performAlivenessCheck() {
 			n.ResetFailureCount()
 		} else {
 			n.IncrementFailureCount()
+		}
+
+		// Queue full node update to persist stats changes
+		if err := s.nodeDB.UpdateNodeFull(n); err != nil {
+			s.config.Logger.WithError(err).WithField("nodeID", nodeID).Warn("failed to queue node update after ping")
 		}
 	}
 }
@@ -374,30 +383,6 @@ func (s *Service) performRandomWalk() {
 	if err != nil {
 		s.config.Logger.WithError(err).Debug("random walk failed")
 	}
-}
-
-// restoreNodesFromDB restores nodes from the database to the routing table.
-func (s *Service) restoreNodesFromDB() {
-	nodes := s.nodeDB.List()
-	if len(nodes) == 0 {
-		s.config.Logger.Info("no nodes to restore from database")
-		return
-	}
-
-	s.config.Logger.WithField("count", len(nodes)).Info("restoring nodes from database")
-
-	restored := 0
-	for _, n := range nodes {
-		// Add to routing table (will trigger admission filter and IP limits)
-		if s.table.Add(n) {
-			restored++
-		}
-	}
-
-	s.config.Logger.WithFields(logrus.Fields{
-		"total":    len(nodes),
-		"restored": restored,
-	}).Info("finished restoring nodes from database")
 }
 
 // connectBootNodes connects to boot nodes on startup.
@@ -437,6 +422,10 @@ func (s *Service) connectBootNodes() {
 			continue
 		}
 
+		// Update node stats and add to active pool
+		bootNode.SetLastSeen(time.Now())
+		bootNode.ResetFailureCount()
+
 		// Perform lookup using boot node
 		_, err = s.lookup.Lookup(s.ctx, bootNode.ID(), 16)
 		if err != nil {
@@ -450,14 +439,35 @@ func (s *Service) forkDigestUpdateLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
+	// Update immediately on start
+	s.updateForkScoringInfo()
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
 			s.forkFilter.Update()
+			s.updateForkScoringInfo()
 		}
 	}
+}
+
+// updateForkScoringInfo updates the table's fork scoring information.
+func (s *Service) updateForkScoringInfo() {
+	// Get fork scoring info from filter
+	filterInfo := s.forkFilter.GetForkScoringInfo()
+
+	// Convert to node.ForkScoringInfo
+	nodeInfo := &node.ForkScoringInfo{
+		CurrentForkDigest:  [4]byte(filterInfo.CurrentForkDigest),
+		PreviousForkDigest: [4]byte(filterInfo.PreviousForkDigest),
+		GenesisForkDigest:  [4]byte(filterInfo.GenesisForkDigest),
+		GracePeriodEnd:     filterInfo.GracePeriodEnd,
+	}
+
+	// Update table
+	s.table.SetForkScoringInfo(nodeInfo)
 }
 
 // LocalNode returns the local node information.
@@ -466,12 +476,12 @@ func (s *Service) LocalNode() *node.Node {
 }
 
 // Table returns the routing table.
-func (s *Service) Table() *table.Table {
+func (s *Service) Table() *table.FlatTable {
 	return s.table
 }
 
 // NodeDB returns the node database.
-func (s *Service) NodeDB() nodedb.DB {
+func (s *Service) NodeDB() *nodedb.NodeDB {
 	return s.nodeDB
 }
 
@@ -510,78 +520,77 @@ func (s *Service) PingMultiple(nodes []*node.Node) map[node.ID]bool {
 	return s.ping.PingMultiple(nodes)
 }
 
-// BucketInfo contains information about a routing table bucket.
-type BucketInfo struct {
-	Index    int
-	Distance string
-	Nodes    []BucketNodeInfo
-}
-
-// BucketNodeInfo contains node information for display.
-type BucketNodeInfo struct {
-	PeerID       string
-	IP           string
-	Port         int
-	FirstSeen    time.Time
-	LastSeen     time.Time
-	SuccessCount int
-	FailureCount int
-	IsAlive      bool
-	Score        int
-	ForkDigest   string
-	HasForkData  bool
-	ENRSeq       uint64
-	ENR          string
-}
-
-// GetBuckets returns information about all routing table buckets.
-func (s *Service) GetBuckets() []BucketInfo {
-	buckets := make([]BucketInfo, 0, 256)
-
-	for i := 0; i < 256; i++ {
-		nodes := s.table.GetBucketNodes(i)
-		if len(nodes) == 0 {
-			continue
-		}
-
-		bucketInfo := BucketInfo{
-			Index:    i,
-			Distance: fmt.Sprintf("2^%d", i),
-			Nodes:    make([]BucketNodeInfo, 0, len(nodes)),
-		}
-
-		for _, n := range nodes {
-			nodeInfo := BucketNodeInfo{
-				PeerID:       n.PeerID(),
-				IP:           n.IP().String(),
-				Port:         int(n.UDPPort()),
-				FirstSeen:    n.FirstSeen(),
-				LastSeen:     n.LastSeen(),
-				SuccessCount: n.SuccessCount(),
-				FailureCount: n.FailureCount(),
-				IsAlive:      n.FailureCount() < 3,
-				Score:        n.SuccessCount() - n.FailureCount(),
-				ENRSeq:       n.Record().Seq(),
-			}
-
-			// Extract eth2 fork digest if available
-			if eth2Data, ok := n.Record().Eth2(); ok {
-				nodeInfo.ForkDigest = fmt.Sprintf("%x", eth2Data.ForkDigest)
-				nodeInfo.HasForkData = true
-			}
-
-			// Get ENR string
-			if enrStr, err := n.Record().EncodeBase64(); err == nil {
-				nodeInfo.ENR = enrStr
-			}
-
-			bucketInfo.Nodes = append(bucketInfo.Nodes, nodeInfo)
-		}
-
-		buckets = append(buckets, bucketInfo)
+// CheckAndAddNode performs all admission checks and adds node to table if it passes.
+//
+// This method handles:
+//   - Admission filter validation (fork digest)
+//   - DB existence check for updates
+//   - IP limit validation
+//   - Ping-before-add for new nodes when pool is full
+//   - Adding to routing table if all checks pass
+func (s *Service) CheckAndAddNode(n *node.Node) bool {
+	if n == nil {
+		return false
 	}
 
-	return buckets
+	// Check admission filter
+	if s.forkFilter != nil && !s.forkFilter.Filter(n.Record()) {
+		s.config.Logger.WithField("peerID", n.PeerID()).Debug("rejected node due to admission filter")
+		return false
+	}
+
+	nodeID := n.ID()
+
+	// Check if node exists in DB
+	exists, seq := s.nodeDB.NodeExists(nodeID)
+	if exists {
+		// Existing node - just update if newer seq
+		if n.Record().Seq() > seq {
+			return s.table.Add(n)
+		}
+		return true
+	}
+
+	// New node - check IP limits globally
+	if !s.table.CanAddNodeByIP(n) {
+		s.config.Logger.WithField("peerID", n.PeerID()).WithField("ip", n.IP()).Debug("rejected node due to IP limit")
+		return false
+	}
+
+	// Initialize stats for new node
+	n.SetFirstSeen(time.Now())
+
+	// Check if pool has space (max 500 active nodes)
+	poolFull := s.table.ActiveSize() >= 500
+
+	if poolFull {
+		// Pool is full - ping node first
+		s.config.Logger.WithField("peerID", n.PeerID()).WithField("addr", n.Addr()).Debug("active pool full, pinging new node before adding")
+
+		success, rtt, err := s.ping.Ping(n)
+		if err != nil || !success {
+			s.config.Logger.WithField("peerID", n.PeerID()).WithError(err).Debug("ping failed, adding as inactive")
+			// Ping failed - add as inactive only
+			return s.nodeDB.UpdateNodeENR(n) == nil
+		}
+
+		// Ping successful - update stats and add to table
+		s.config.Logger.WithField("peerID", n.PeerID()).WithField("rtt", rtt).Info("ping successful, adding new node")
+		n.SetLastSeen(time.Now())
+		n.ResetFailureCount() // This also increments success count
+
+		// Add to table (will go to active even if over capacity, sweep handles cleanup)
+		return s.table.Add(n)
+	}
+
+	// Pool has space - add directly
+	return s.table.Add(n)
+}
+
+// GetActiveNodes returns the active nodes from the routing table.
+// Only active nodes are returned (inactive nodes in DB are not shown).
+func (s *Service) GetActiveNodes() []*node.Node {
+	return s.table.GetActiveNodes()
 }
 
 // GetStats returns service statistics for display.
@@ -594,12 +603,19 @@ func (s *Service) GetStats() ServiceStats {
 	handlerStats := s.discv5Service.Handler().GetStats()
 	sessionStats := s.discv5Service.Sessions().GetStats()
 
+	// Get active/inactive node counts
+	activeNodes := s.table.ActiveSize()
+	totalNodes := s.nodeDB.Count()
+	inactiveNodes := totalNodes - activeNodes
+
 	return ServiceStats{
 		PeerID:        s.LocalNode().PeerID(),
 		BindAddress:   fmt.Sprintf("%s:%d", s.config.BindIP, s.config.BindPort),
 		Uptime:        uptime,
 		TableSize:     s.table.Size(),
 		BucketsFilled: s.table.NumBucketsFilled(),
+		ActiveNodes:   activeNodes,
+		InactiveNodes: inactiveNodes,
 		TableStats:    s.table.GetStats(),
 		LookupStats:   s.lookup.GetStats(),
 		PingStats:     s.ping.GetStats(),
@@ -656,7 +672,9 @@ type ServiceStats struct {
 	BindAddress   string
 	Uptime        time.Duration
 	TableSize     int
-	BucketsFilled int
+	BucketsFilled int // Deprecated for FlatTable
+	ActiveNodes   int
+	InactiveNodes int
 	TableStats    table.TableStats
 	LookupStats   discover.LookupStats
 	PingStats     discover.PingStats
