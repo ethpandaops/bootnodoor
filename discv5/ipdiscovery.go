@@ -1,6 +1,7 @@
 package discv5
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -20,40 +21,55 @@ const DefaultReportExpiry = 30 * time.Minute
 // DefaultRecentWindow is the time window to consider reports "recent" for IP change detection
 const DefaultRecentWindow = 5 * time.Minute
 
-// IPDiscovery tracks external IP addresses reported by peers via PONG messages.
+// IPDiscovery tracks external IP addresses and ports reported by peers via PONG messages.
 //
-// It implements a consensus mechanism to detect the node's public IP address:
-//   - Collects IPs from PONG responses (IP field shows our address as seen by remote peer)
-//   - Requires minimum number of reports before considering an IP valid
+// It implements a consensus mechanism to detect the node's public IP address and port:
+//   - Collects IP:Port from PONG responses (shows our address as seen by remote peer)
+//   - Tracks IPv4 and IPv6 independently (separate consensus for each)
+//   - Requires minimum number of reports before considering an address valid
 //   - Requires majority threshold (e.g., 75%) for consensus
-//   - Expires old reports to handle IP changes
+//   - Expires old reports to handle IP/port changes
 type IPDiscovery struct {
 	// mu protects the internal state
 	mu sync.RWMutex
 
-	// reports maps IP address to report info
-	reports map[string]*ipReport
+	// ipv4Reports maps "IP:Port" string to report info for IPv4
+	ipv4Reports map[string]*ipReport
 
-	// currentConsensusIP is the IP that reached consensus
-	currentConsensusIP net.IP
+	// ipv6Reports maps "IP:Port" string to report info for IPv6
+	ipv6Reports map[string]*ipReport
+
+	// currentConsensusIPv4 is the IPv4 address that reached consensus
+	currentConsensusIPv4 net.IP
+
+	// currentConsensusIPv4Port is the IPv4 port that reached consensus
+	currentConsensusIPv4Port uint16
+
+	// currentConsensusIPv6 is the IPv6 address that reached consensus
+	currentConsensusIPv6 net.IP
+
+	// currentConsensusIPv6Port is the IPv6 port that reached consensus
+	currentConsensusIPv6Port uint16
 
 	// config
-	minReports         int           // Minimum reports needed
-	majorityThreshold  float64       // Threshold for majority (0.0-1.0)
-	reportExpiry       time.Duration // How long to keep reports
-	recentWindow       time.Duration // Time window for recent reports
-	onConsensusReached func(net.IP)  // Callback when consensus is reached
+	minReports         int                             // Minimum reports needed
+	majorityThreshold  float64                         // Threshold for majority (0.0-1.0)
+	reportExpiry       time.Duration                   // How long to keep reports
+	recentWindow       time.Duration                   // Time window for recent reports
+	onConsensusReached func(ip net.IP, port uint16, isIPv6 bool) // Callback when consensus is reached
 	logger             logrus.FieldLogger
 
 	// stats
-	totalReports     int
-	uniqueIPs        int
-	consensusReached bool
+	totalReportsIPv4     int
+	totalReportsIPv6     int
+	consensusReachedIPv4 bool
+	consensusReachedIPv6 bool
 }
 
-// ipReport tracks reports for a specific IP
+// ipReport tracks reports for a specific IP:Port combination
 type ipReport struct {
 	ip          net.IP
+	port        uint16
 	count       int
 	firstSeen   time.Time
 	lastSeen    time.Time
@@ -75,8 +91,9 @@ type IPDiscoveryConfig struct {
 	// Used for detecting IP changes - recent reports get priority
 	RecentWindow time.Duration
 
-	// OnConsensusReached is called when IP consensus is reached or changes
-	OnConsensusReached func(net.IP)
+	// OnConsensusReached is called when IP:Port consensus is reached or changes
+	// isIPv6 indicates whether this is an IPv6 address (true) or IPv4 (false)
+	OnConsensusReached func(ip net.IP, port uint16, isIPv6 bool)
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
@@ -101,7 +118,8 @@ func NewIPDiscovery(cfg IPDiscoveryConfig) *IPDiscovery {
 	}
 
 	return &IPDiscovery{
-		reports:            make(map[string]*ipReport),
+		ipv4Reports:        make(map[string]*ipReport),
+		ipv6Reports:        make(map[string]*ipReport),
 		minReports:         cfg.MinReports,
 		majorityThreshold:  cfg.MajorityThreshold,
 		reportExpiry:       cfg.ReportExpiry,
@@ -111,16 +129,25 @@ func NewIPDiscovery(cfg IPDiscoveryConfig) *IPDiscovery {
 	}
 }
 
-// ReportIP records an IP address from a PONG response.
+// ReportIP records an IP address and port from a PONG response.
 //
 // Parameters:
 //   - ip: The IP address as reported by the remote peer
+//   - port: The port as reported by the remote peer
 //   - reporterID: The node ID of the peer that sent the PONG (for tracking)
-func (ipd *IPDiscovery) ReportIP(ip net.IP, reporterID string) {
+func (ipd *IPDiscovery) ReportIP(ip net.IP, port uint16, reporterID string) {
 	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
 		// Ignore invalid IPs
 		return
 	}
+
+	if port == 0 {
+		// Ignore invalid ports
+		return
+	}
+
+	// Determine if IPv4 or IPv6
+	isIPv6 := ip.To4() == nil
 
 	ipd.mu.Lock()
 	defer ipd.mu.Unlock()
@@ -128,130 +155,176 @@ func (ipd *IPDiscovery) ReportIP(ip net.IP, reporterID string) {
 	// Clean up expired reports first
 	ipd.cleanupExpiredLocked()
 
-	ipStr := ip.String()
+	// Use "IP:Port" as the key
+	addrKey := fmt.Sprintf("%s:%d", ip.String(), port)
 	now := time.Now()
 
-	// Get or create report for this IP
-	report, exists := ipd.reports[ipStr]
+	// Select appropriate reports map
+	var reports map[string]*ipReport
+	var totalReports *int
+	if isIPv6 {
+		reports = ipd.ipv6Reports
+		totalReports = &ipd.totalReportsIPv6
+	} else {
+		reports = ipd.ipv4Reports
+		totalReports = &ipd.totalReportsIPv4
+	}
+
+	// Get or create report for this IP:Port
+	report, exists := reports[addrKey]
 	if !exists {
 		report = &ipReport{
 			ip:          ip,
+			port:        port,
 			firstSeen:   now,
 			reporterIDs: make([]string, 0),
 		}
-		ipd.reports[ipStr] = report
-		ipd.uniqueIPs++
+		reports[addrKey] = report
 	}
 
 	// Update report
 	report.count++
 	report.lastSeen = now
 	report.reporterIDs = append(report.reporterIDs, reporterID)
-	ipd.totalReports++
+	*totalReports++
 
 	ipd.logger.WithFields(logrus.Fields{
-		"ip":           ipStr,
+		"addr":         addrKey,
+		"ipv6":         isIPv6,
 		"count":        report.count,
 		"reporter":     reporterID[:16],
-		"totalReports": ipd.totalReports,
-	}).Debug("IP discovery: received IP report")
+		"totalReports": *totalReports,
+	}).Debug("IP discovery: received address report")
 
-	// Check for consensus
+	// Check for consensus (check both IPv4 and IPv6)
 	ipd.checkConsensusLocked()
 }
 
-// checkConsensusLocked checks if an IP has reached consensus.
+// checkConsensusLocked checks if an IP:Port has reached consensus for both IPv4 and IPv6.
 // Must be called with lock held.
 //
-// This function handles both initial consensus and IP changes:
+// This function handles both initial consensus and address changes:
 // - For initial consensus: requires minimum reports and majority threshold
-// - For IP changes: prioritizes recent reports to detect when IP has changed
+// - For address changes: prioritizes recent reports to detect when IP or port has changed
 func (ipd *IPDiscovery) checkConsensusLocked() {
+	// Check IPv4 consensus
+	ipd.checkConsensusForFamilyLocked(false)
+
+	// Check IPv6 consensus
+	ipd.checkConsensusForFamilyLocked(true)
+}
+
+// checkConsensusForFamilyLocked checks consensus for a specific address family (IPv4 or IPv6).
+// Must be called with lock held.
+func (ipd *IPDiscovery) checkConsensusForFamilyLocked(isIPv6 bool) {
 	now := time.Now()
+
+	// Select appropriate maps and state
+	var reports map[string]*ipReport
+	var currentConsensusIP *net.IP
+	var currentConsensusPort *uint16
+	var consensusReached *bool
+	var totalReports *int
+	familyName := "IPv4"
+
+	if isIPv6 {
+		reports = ipd.ipv6Reports
+		currentConsensusIP = &ipd.currentConsensusIPv6
+		currentConsensusPort = &ipd.currentConsensusIPv6Port
+		consensusReached = &ipd.consensusReachedIPv6
+		totalReports = &ipd.totalReportsIPv6
+		familyName = "IPv6"
+	} else {
+		reports = ipd.ipv4Reports
+		currentConsensusIP = &ipd.currentConsensusIPv4
+		currentConsensusPort = &ipd.currentConsensusIPv4Port
+		consensusReached = &ipd.consensusReachedIPv4
+		totalReports = &ipd.totalReportsIPv4
+	}
 
 	// Separate recent reports from all reports
 	recentReports := make(map[string]int)
 	allReports := make(map[string]int)
 
-	for ipStr, report := range ipd.reports {
-		allReports[ipStr] = report.count
+	for addrKey, report := range reports {
+		allReports[addrKey] = report.count
 
 		// Count reports within the recent window
 		if now.Sub(report.lastSeen) <= ipd.recentWindow {
-			recentReports[ipStr] = report.count
+			recentReports[addrKey] = report.count
 		}
 	}
 
 	// Calculate totals
-	totalReports := 0
+	totalCount := 0
 	for _, count := range allReports {
-		totalReports += count
+		totalCount += count
 	}
 
-	totalRecentReports := 0
+	totalRecentCount := 0
 	for _, count := range recentReports {
-		totalRecentReports += count
+		totalRecentCount += count
 	}
 
 	// Need minimum reports before considering consensus
-	if totalReports < ipd.minReports {
-		ipd.logger.WithFields(logrus.Fields{
-			"totalReports": totalReports,
-			"minReports":   ipd.minReports,
-		}).Debug("IP discovery: not enough reports for consensus")
+	if totalCount < ipd.minReports {
 		return
 	}
 
-	// If we already have consensus, check recent reports for IP changes
-	if ipd.consensusReached && totalRecentReports >= ipd.minReports {
-		// Find IP with most recent reports
-		var maxRecentIP string
+	// Current consensus address key
+	currentAddrKey := ""
+	if *currentConsensusIP != nil && *currentConsensusPort != 0 {
+		currentAddrKey = fmt.Sprintf("%s:%d", (*currentConsensusIP).String(), *currentConsensusPort)
+	}
+
+	// If we already have consensus, check recent reports for address changes
+	if *consensusReached && totalRecentCount >= ipd.minReports {
+		// Find address with most recent reports
+		var maxRecentAddr string
 		maxRecentCount := 0
-		for ipStr, count := range recentReports {
+		for addrKey, count := range recentReports {
 			if count > maxRecentCount {
 				maxRecentCount = count
-				maxRecentIP = ipStr
+				maxRecentAddr = addrKey
 			}
 		}
 
-		// Check if recent reports show consensus on a DIFFERENT IP
-		if maxRecentIP != "" && maxRecentIP != ipd.currentConsensusIP.String() {
-			recentMajority := float64(maxRecentCount) / float64(totalRecentReports)
+		// Check if recent reports show consensus on a DIFFERENT address
+		if maxRecentAddr != "" && maxRecentAddr != currentAddrKey {
+			recentMajority := float64(maxRecentCount) / float64(totalRecentCount)
 
 			if recentMajority >= ipd.majorityThreshold {
-				// IP change detected!
-				newIP := net.ParseIP(maxRecentIP)
+				// Address change detected!
+				newReport := reports[maxRecentAddr]
 
 				ipd.logger.WithFields(logrus.Fields{
-					"oldIP":          ipd.currentConsensusIP.String(),
-					"newIP":          newIP.String(),
+					"family":         familyName,
+					"oldAddr":        currentAddrKey,
+					"newAddr":        maxRecentAddr,
 					"recentCount":    maxRecentCount,
-					"recentTotal":    totalRecentReports,
+					"recentTotal":    totalRecentCount,
 					"recentMajority": recentMajority,
-				}).Warn("IP discovery: IP change detected")
-
-				// Save the new IP report before clearing
-				var newIPReport *ipReport
-				if report, exists := ipd.reports[maxRecentIP]; exists {
-					newIPReport = report
-				}
+				}).Warn("IP discovery: address change detected")
 
 				// Clear old reports to prevent flip-flopping
-				ipd.reports = make(map[string]*ipReport)
-
-				// Re-add only the report for the new IP
-				if newIPReport != nil {
-					ipd.reports[maxRecentIP] = newIPReport
+				for k := range reports {
+					delete(reports, k)
 				}
 
-				ipd.currentConsensusIP = newIP
-				ipd.totalReports = maxRecentCount
-				ipd.uniqueIPs = 1
+				// Re-add only the report for the new address
+				if newReport != nil {
+					reports[maxRecentAddr] = newReport
+				}
 
-				// Call callback for IP change
+				*currentConsensusIP = newReport.ip
+				*currentConsensusPort = newReport.port
+				*totalReports = maxRecentCount
+
+				// Call callback for address change
 				if ipd.onConsensusReached != nil {
-					ip := newIP
-					go ipd.onConsensusReached(ip)
+					ip := newReport.ip
+					port := newReport.port
+					go ipd.onConsensusReached(ip, port, isIPv6)
 				}
 				return
 			}
@@ -261,7 +334,7 @@ func (ipd *IPDiscovery) checkConsensusLocked() {
 	// Check for initial consensus or stable consensus on all reports
 	var maxReport *ipReport
 	maxCount := 0
-	for _, report := range ipd.reports {
+	for _, report := range reports {
 		if report.count > maxCount {
 			maxCount = report.count
 			maxReport = report
@@ -273,36 +346,36 @@ func (ipd *IPDiscovery) checkConsensusLocked() {
 	}
 
 	// Check if it meets majority threshold
-	majority := float64(maxReport.count) / float64(totalReports)
+	majority := float64(maxReport.count) / float64(totalCount)
 	if majority >= ipd.majorityThreshold {
 		// Consensus reached!
-		if !ipd.consensusReached || !maxReport.ip.Equal(ipd.currentConsensusIP) {
+		addrChanged := !*consensusReached ||
+			*currentConsensusIP == nil ||
+			!maxReport.ip.Equal(*currentConsensusIP) ||
+			maxReport.port != *currentConsensusPort
+
+		if addrChanged {
 			ipd.logger.WithFields(logrus.Fields{
-				"ip":        maxReport.ip.String(),
+				"family":    familyName,
+				"addr":      fmt.Sprintf("%s:%d", maxReport.ip.String(), maxReport.port),
 				"count":     maxReport.count,
-				"total":     totalReports,
+				"total":     totalCount,
 				"majority":  majority,
 				"threshold": ipd.majorityThreshold,
 			}).Info("IP discovery: consensus reached")
 
-			ipd.currentConsensusIP = maxReport.ip
-			ipd.consensusReached = true
+			*currentConsensusIP = maxReport.ip
+			*currentConsensusPort = maxReport.port
+			*consensusReached = true
 
 			// Call callback if provided
 			if ipd.onConsensusReached != nil {
 				// Call in goroutine to avoid blocking
 				ip := maxReport.ip
-				go ipd.onConsensusReached(ip)
+				port := maxReport.port
+				go ipd.onConsensusReached(ip, port, isIPv6)
 			}
 		}
-	} else {
-		ipd.logger.WithFields(logrus.Fields{
-			"topIP":     maxReport.ip.String(),
-			"count":     maxReport.count,
-			"total":     totalReports,
-			"majority":  majority,
-			"threshold": ipd.majorityThreshold,
-		}).Debug("IP discovery: no consensus yet")
 	}
 }
 
@@ -310,28 +383,44 @@ func (ipd *IPDiscovery) checkConsensusLocked() {
 // Must be called with lock held.
 func (ipd *IPDiscovery) cleanupExpiredLocked() {
 	now := time.Now()
-	for ipStr, report := range ipd.reports {
+
+	// Clean up IPv4 reports
+	for addrKey, report := range ipd.ipv4Reports {
 		if now.Sub(report.lastSeen) > ipd.reportExpiry {
-			delete(ipd.reports, ipStr)
-			ipd.logger.WithField("ip", ipStr).Debug("IP discovery: expired old report")
+			delete(ipd.ipv4Reports, addrKey)
+			ipd.logger.WithField("addr", addrKey).Debug("IP discovery: expired old IPv4 report")
+		}
+	}
+
+	// Clean up IPv6 reports
+	for addrKey, report := range ipd.ipv6Reports {
+		if now.Sub(report.lastSeen) > ipd.reportExpiry {
+			delete(ipd.ipv6Reports, addrKey)
+			ipd.logger.WithField("addr", addrKey).Debug("IP discovery: expired old IPv6 report")
 		}
 	}
 }
 
-// GetConsensusIP returns the current consensus IP, or nil if no consensus.
+// GetConsensusIP returns the current consensus IPv4 address, or nil if no consensus.
+// For IPv6, this returns nil. Use GetStats() for complete information.
 func (ipd *IPDiscovery) GetConsensusIP() net.IP {
 	ipd.mu.RLock()
 	defer ipd.mu.RUnlock()
-	return ipd.currentConsensusIP
+	return ipd.currentConsensusIPv4
 }
 
 // GetStats returns statistics about IP discovery.
 type IPDiscoveryStats struct {
-	TotalReports     int
-	UniqueIPs        int
-	ConsensusReached bool
-	ConsensusIP      string
-	Reports          map[string]int // IP -> count
+	TotalReportsIPv4     int
+	TotalReportsIPv6     int
+	UniqueIPv4Addrs      int
+	UniqueIPv6Addrs      int
+	ConsensusReachedIPv4 bool
+	ConsensusReachedIPv6 bool
+	ConsensusIPv4Addr    string            // "IP:Port" format
+	ConsensusIPv6Addr    string            // "IP:Port" format
+	IPv4Reports          map[string]int    // "IP:Port" -> count
+	IPv6Reports          map[string]int    // "IP:Port" -> count
 }
 
 // GetStats returns current statistics.
@@ -340,18 +429,30 @@ func (ipd *IPDiscovery) GetStats() IPDiscoveryStats {
 	defer ipd.mu.RUnlock()
 
 	stats := IPDiscoveryStats{
-		TotalReports:     ipd.totalReports,
-		UniqueIPs:        len(ipd.reports),
-		ConsensusReached: ipd.consensusReached,
-		Reports:          make(map[string]int),
+		TotalReportsIPv4:     ipd.totalReportsIPv4,
+		TotalReportsIPv6:     ipd.totalReportsIPv6,
+		UniqueIPv4Addrs:      len(ipd.ipv4Reports),
+		UniqueIPv6Addrs:      len(ipd.ipv6Reports),
+		ConsensusReachedIPv4: ipd.consensusReachedIPv4,
+		ConsensusReachedIPv6: ipd.consensusReachedIPv6,
+		IPv4Reports:          make(map[string]int),
+		IPv6Reports:          make(map[string]int),
 	}
 
-	if ipd.currentConsensusIP != nil {
-		stats.ConsensusIP = ipd.currentConsensusIP.String()
+	if ipd.currentConsensusIPv4 != nil && ipd.currentConsensusIPv4Port > 0 {
+		stats.ConsensusIPv4Addr = fmt.Sprintf("%s:%d", ipd.currentConsensusIPv4.String(), ipd.currentConsensusIPv4Port)
 	}
 
-	for ipStr, report := range ipd.reports {
-		stats.Reports[ipStr] = report.count
+	if ipd.currentConsensusIPv6 != nil && ipd.currentConsensusIPv6Port > 0 {
+		stats.ConsensusIPv6Addr = fmt.Sprintf("%s:%d", ipd.currentConsensusIPv6.String(), ipd.currentConsensusIPv6Port)
+	}
+
+	for addrKey, report := range ipd.ipv4Reports {
+		stats.IPv4Reports[addrKey] = report.count
+	}
+
+	for addrKey, report := range ipd.ipv6Reports {
+		stats.IPv6Reports[addrKey] = report.count
 	}
 
 	return stats
@@ -363,11 +464,16 @@ func (ipd *IPDiscovery) Reset() {
 	ipd.mu.Lock()
 	defer ipd.mu.Unlock()
 
-	ipd.reports = make(map[string]*ipReport)
-	ipd.currentConsensusIP = nil
-	ipd.consensusReached = false
-	ipd.totalReports = 0
-	ipd.uniqueIPs = 0
+	ipd.ipv4Reports = make(map[string]*ipReport)
+	ipd.ipv6Reports = make(map[string]*ipReport)
+	ipd.currentConsensusIPv4 = nil
+	ipd.currentConsensusIPv4Port = 0
+	ipd.currentConsensusIPv6 = nil
+	ipd.currentConsensusIPv6Port = 0
+	ipd.consensusReachedIPv4 = false
+	ipd.consensusReachedIPv6 = false
+	ipd.totalReportsIPv4 = 0
+	ipd.totalReportsIPv6 = 0
 
 	ipd.logger.Info("IP discovery: reset all reports")
 }

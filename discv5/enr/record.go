@@ -99,6 +99,32 @@ func (r *Record) SetSeq(seq uint64) {
 	r.raw = nil // Invalidate cached encoding
 }
 
+// Clone creates a deep copy of the record by marshaling and unmarshaling.
+//
+// This is useful when you need to modify a record without affecting the original.
+// The cloned record will have the same sequence number and all fields.
+//
+// Example:
+//
+//	clone := record.Clone()
+//	clone.SetSeq(record.Seq() + 1)
+//	clone.Set("ip", newIP)
+func (r *Record) Clone() (*Record, error) {
+	// Encode the current record to RLP bytes
+	data, err := r.EncodeRLP()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode record for cloning: %w", err)
+	}
+
+	// Create a new record and decode the bytes into it
+	clone := New()
+	if err := clone.DecodeRLPBytes(data); err != nil {
+		return nil, fmt.Errorf("failed to decode record for cloning: %w", err)
+	}
+
+	return clone, nil
+}
+
 // Set stores a key-value pair in the record.
 //
 // The key must be a string and the value must be RLP-encodable.

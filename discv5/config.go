@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/pk910/bootoor/discv5/enr"
 	"github.com/pk910/bootoor/discv5/protocol"
 	"github.com/sirupsen/logrus"
 )
@@ -36,6 +37,11 @@ type Config struct {
 	// ETH2Data is the eth2 field to include in the ENR (optional)
 	// This should be the 16-byte encoded eth2 field containing fork digest and next fork info
 	ETH2Data []byte
+
+	// LocalENR is an already-initialized ENR to use for this node (optional)
+	// If provided, this ENR will be used instead of creating a new one.
+	// The higher-level service is responsible for loading, creating, and persisting this ENR.
+	LocalENR *enr.Record
 
 	// Callbacks (all optional, can be nil)
 

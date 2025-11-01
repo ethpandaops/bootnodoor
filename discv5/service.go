@@ -77,7 +77,7 @@ func New(cfg *Config) (*Service, error) {
 		cfg.Logger = logrus.New()
 	}
 
-	// Create local ENR
+	// Create local ENR (using provided ENR as baseline if available)
 	localENR, err := createLocalENR(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local ENR: %w", err)
@@ -89,7 +89,16 @@ func New(cfg *Config) (*Service, error) {
 		return nil, fmt.Errorf("failed to create local node: %w", err)
 	}
 
-	cfg.Logger.WithField("peerID", localNode.PeerID()).WithField("ip", cfg.BindIP).WithField("port", cfg.BindPort).Info("created local node")
+	cfg.Logger.WithFields(logrus.Fields{
+		"peerID": localNode.PeerID(),
+		"ip":     cfg.BindIP,
+		"port":   cfg.BindPort,
+	}).Info("created local node")
+
+	enrStr, err := localENR.EncodeBase64()
+	if err == nil {
+		cfg.Logger.Infof("local ENR: %s", enrStr)
+	}
 
 	// Create context for graceful shutdown
 	ctx := cfg.Context
@@ -345,26 +354,103 @@ func (s *Service) TalkReq(n *node.Node, protocolName string, request []byte) ([]
 	}
 }
 
-// createLocalENR creates the local node's ENR record.
+// createLocalENR creates a local node's ENR record.
+// If cfg.LocalENR is provided and nothing changed, it returns the stored ENR as-is.
+// Only increments sequence number if there are actual changes.
 func createLocalENR(cfg *Config) (*enr.Record, error) {
-	// Create ENR with IP and port
+	// If we have a stored ENR, check if we need to update it
+	if cfg.LocalENR != nil {
+		needsUpdate := false
+
+		// Check if any config overrides the stored ENR
+		if cfg.ENRIP != nil {
+			storedIP := cfg.LocalENR.IP()
+			if storedIP == nil || !storedIP.Equal(cfg.ENRIP) {
+				needsUpdate = true
+				cfg.Logger.WithFields(logrus.Fields{
+					"old": storedIP,
+					"new": cfg.ENRIP,
+				}).Debug("IPv4 changed")
+			}
+		}
+
+		if cfg.ENRIP6 != nil {
+			storedIP6 := cfg.LocalENR.IP6()
+			if storedIP6 == nil || !storedIP6.Equal(cfg.ENRIP6) {
+				needsUpdate = true
+				cfg.Logger.WithFields(logrus.Fields{
+					"old": storedIP6,
+					"new": cfg.ENRIP6,
+				}).Debug("IPv6 changed")
+			}
+		}
+
+		if cfg.ENRPort != 0 {
+			storedPort := cfg.LocalENR.UDP()
+			if storedPort != uint16(cfg.ENRPort) {
+				needsUpdate = true
+				cfg.Logger.WithFields(logrus.Fields{
+					"old": storedPort,
+					"new": cfg.ENRPort,
+				}).Debug("port changed")
+			}
+		}
+
+		// Check if eth2 field changed
+		if len(cfg.ETH2Data) >= 4 {
+			var storedEth2 []byte
+			cfg.LocalENR.Get("eth2", &storedEth2)
+			if len(storedEth2) != len(cfg.ETH2Data) || string(storedEth2) != string(cfg.ETH2Data) {
+				needsUpdate = true
+				cfg.Logger.Debug("eth2 field changed")
+			}
+		}
+
+		// If nothing changed, reuse stored ENR
+		if !needsUpdate {
+			cfg.Logger.WithField("seq", cfg.LocalENR.Seq()).Info("reusing stored ENR (no changes)")
+			return cfg.LocalENR, nil
+		}
+	}
+
+	// Create new ENR record (either fresh or updating stored)
 	record := enr.New()
 
-	// Set sequence number (start at 1)
-	record.SetSeq(1)
+	// Set sequence number (increment from stored ENR, or start at 1)
+	var baseSeq uint64 = 0
+	if cfg.LocalENR != nil {
+		baseSeq = cfg.LocalENR.Seq()
+	}
+	record.SetSeq(baseSeq + 1)
 
-	// Determine which IP to use for ENR
-	enrIPv4 := cfg.ENRIP
-	if enrIPv4 == nil {
+	// Determine which IP addresses to use
+	var enrIPv4 net.IP
+	var enrIPv6 net.IP
+
+	// IPv4: priority is ENRIP > stored ENR > BindIP
+	if cfg.ENRIP != nil {
+		enrIPv4 = cfg.ENRIP
+	} else if cfg.LocalENR != nil && cfg.LocalENR.IP() != nil {
+		enrIPv4 = cfg.LocalENR.IP()
+	} else {
 		enrIPv4 = cfg.BindIP
 	}
 
-	enrIPv6 := cfg.ENRIP6
+	// IPv6: priority is ENRIP6 > stored ENR
+	if cfg.ENRIP6 != nil {
+		enrIPv6 = cfg.ENRIP6
+	} else if cfg.LocalENR != nil && cfg.LocalENR.IP6() != nil {
+		enrIPv6 = cfg.LocalENR.IP6()
+	}
 
-	// Determine which port to use for ENR
-	enrPort := cfg.ENRPort
-	if enrPort == 0 {
-		enrPort = cfg.BindPort
+	// Determine which port to use
+	var enrPort uint16
+	if cfg.ENRPort != 0 {
+		enrPort = uint16(cfg.ENRPort)
+	} else if cfg.LocalENR != nil && cfg.LocalENR.UDP() != 0 {
+		enrPort = cfg.LocalENR.UDP()
+	} else {
+		enrPort = uint16(cfg.BindPort)
 	}
 
 	// Add IPv4 address
@@ -378,7 +464,12 @@ func createLocalENR(cfg *Config) (*enr.Record, error) {
 	}
 
 	// Add UDP port
-	record.Set("udp", uint16(enrPort))
+	record.Set("udp", enrPort)
+
+	// Add TCP port if present in stored ENR
+	if cfg.LocalENR != nil && cfg.LocalENR.TCP() != 0 {
+		record.Set("tcp", cfg.LocalENR.TCP())
+	}
 
 	// Add secp256k1 public key
 	pubKey := cfg.PrivateKey.PublicKey
@@ -388,7 +479,6 @@ func createLocalENR(cfg *Config) (*enr.Record, error) {
 	// Add eth2 field if provided
 	if len(cfg.ETH2Data) >= 4 {
 		record.Set("eth2", cfg.ETH2Data)
-		cfg.Logger.WithField("forkDigest", fmt.Sprintf("%x", cfg.ETH2Data[:4])).Info("added eth2 field to ENR")
 	}
 
 	// Sign the record with private key

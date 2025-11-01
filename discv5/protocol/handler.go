@@ -53,8 +53,8 @@ type OnFindNodeCallback func(msg *FindNode, requester *net.UDPAddr) []*node.Node
 type OnTalkReqCallback func(msg *TalkReq) []byte
 
 // OnPongReceivedCallback is called when a PONG response is received.
-// Parameters: remoteNodeID, reportedIP (our IP as seen by the remote peer)
-type OnPongReceivedCallback func(remoteNodeID node.ID, reportedIP net.IP)
+// Parameters: remoteNodeID, reportedIP (our IP as seen by the remote peer), reportedPort (our port as seen by the remote peer)
+type OnPongReceivedCallback func(remoteNodeID node.ID, reportedIP net.IP, reportedPort uint16)
 
 // Handler handles incoming and outgoing protocol messages.
 //
@@ -856,11 +856,11 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, rem
 	// Match with pending request
 	h.requests.MatchResponse(msg.RequestID, remoteID, msg)
 
-	// Call OnPongReceived callback with the IP reported in the PONG
-	// The IP field in PONG contains our IP address as seen by the remote peer
-	if h.config.OnPongReceived != nil && len(msg.IP) > 0 {
+	// Call OnPongReceived callback with the IP and port reported in the PONG
+	// The IP and Port fields in PONG contain our address as seen by the remote peer
+	if h.config.OnPongReceived != nil && len(msg.IP) > 0 && msg.Port > 0 {
 		reportedIP := net.IP(msg.IP)
-		h.config.OnPongReceived(remoteID, reportedIP)
+		h.config.OnPongReceived(remoteID, reportedIP, msg.Port)
 	}
 
 	// Update node's last seen time

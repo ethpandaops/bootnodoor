@@ -131,8 +131,12 @@ func New(cfg *Config) (*Service, error) {
 	// Create context for graceful shutdown
 	s.ctx, s.cancelCtx = context.WithCancel(context.Background())
 
+	// Load stored ENR if available (discv5 will create new one if nil)
+	storedENR := s.loadStoredENR()
+
 	// Create discv5 service configuration with callbacks
 	discv5Config := discv5.DefaultConfig()
+	discv5Config.LocalENR = storedENR
 	discv5Config.Context = s.ctx
 	discv5Config.PrivateKey = cfg.PrivateKey
 	discv5Config.BindIP = cfg.BindIP
@@ -175,27 +179,33 @@ func New(cfg *Config) (*Service, error) {
 			MajorityThreshold: 0.75,
 			ReportExpiry:      30 * time.Minute,
 			RecentWindow:      5 * time.Minute,
-			OnConsensusReached: func(ip net.IP) {
-				s.handleIPConsensus(ip)
+			OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
+				s.handleIPConsensus(ip, port, isIPv6)
 			},
 			Logger: cfg.Logger,
 		}
 		s.ipDiscovery = discv5.NewIPDiscovery(ipDiscoveryConfig)
 
-		// Wire up OnPongReceived callback to feed IPs to discovery service
-		discv5Config.OnPongReceived = func(remoteNodeID node.ID, reportedIP net.IP) {
+		// Wire up OnPongReceived callback to feed IP:Port to discovery service
+		discv5Config.OnPongReceived = func(remoteNodeID node.ID, reportedIP net.IP, reportedPort uint16) {
 			if s.ipDiscovery != nil {
-				s.ipDiscovery.ReportIP(reportedIP, remoteNodeID.String())
+				s.ipDiscovery.ReportIP(reportedIP, reportedPort, remoteNodeID.String())
 			}
 		}
 
-		cfg.Logger.Info("IP discovery enabled - will detect public IP from PONG responses")
+		cfg.Logger.Info("IP discovery enabled - will detect public IP:Port from PONG responses")
 	}
 
 	// Create the discv5 service
 	s.discv5Service, err = discv5.New(discv5Config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create discv5 service: %w", err)
+	}
+
+	// Store the ENR (either newly created or updated from stored)
+	localENR := s.discv5Service.LocalNode().Record()
+	if err := s.storeENR(localENR); err != nil {
+		cfg.Logger.WithError(err).Warn("failed to store initial ENR")
 	}
 
 	// Create lookup service
@@ -753,62 +763,107 @@ func (s *Service) filterNodesForRequester(nodes []*node.Node, requester *net.UDP
 	return filtered
 }
 
-// handleIPConsensus is called when IP discovery reaches consensus on a public IP.
-// It updates the local node's ENR with the discovered IP address.
-func (s *Service) handleIPConsensus(ip net.IP) {
+// loadStoredENR loads the stored ENR from the database.
+// Returns nil if no ENR is stored or if loading fails.
+func (s *Service) loadStoredENR() *enr.Record {
+	data, err := s.nodeDB.LoadLocalENR()
+	if err != nil {
+		s.config.Logger.Debug("no stored ENR found (this is normal on first run)")
+		return nil
+	}
+
+	storedENR, err := enr.Load(data)
+	if err != nil {
+		s.config.Logger.WithError(err).Warn("failed to decode stored ENR, starting fresh")
+		return nil
+	}
+
+	s.config.Logger.WithFields(logrus.Fields{
+		"seq": storedENR.Seq(),
+		"enr": storedENR.String(),
+	}).Debug("loaded stored ENR from database")
+
+	return storedENR
+}
+
+// storeENR stores the ENR in the database for persistence across restarts.
+func (s *Service) storeENR(record *enr.Record) error {
+	data, err := record.EncodeRLP()
+	if err != nil {
+		return fmt.Errorf("failed to encode ENR: %w", err)
+	}
+
+	if err := s.nodeDB.StoreLocalENR(data); err != nil {
+		return fmt.Errorf("failed to store ENR: %w", err)
+	}
+
+	s.config.Logger.WithField("seq", record.Seq()).Debug("stored ENR to database")
+	return nil
+}
+
+// handleIPConsensus is called when IP discovery reaches consensus on a public IP:Port.
+// It updates the local node's ENR with the discovered IP address and port.
+func (s *Service) handleIPConsensus(ip net.IP, port uint16, isIPv6 bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.config.Logger.WithField("panic", r).Error("panic in handleIPConsensus")
+		}
+	}()
+
+	familyName := "IPv4"
+	if isIPv6 {
+		familyName = "IPv6"
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	localNode := s.discv5Service.LocalNode()
 	currentRecord := localNode.Record()
 
-	s.config.Logger.WithFields(logrus.Fields{
-		"ip":     ip.String(),
-		"oldSeq": currentRecord.Seq(),
-	}).Info("IP discovery consensus reached - updating ENR")
+	// Check if IP and port have actually changed (avoid unnecessary updates)
+	var currentIP net.IP
+	if isIPv6 {
+		currentIP = currentRecord.IP6()
+	} else {
+		currentIP = currentRecord.IP()
+	}
+	currentPort := currentRecord.UDP()
 
-	// Create new ENR with updated IP
-	newRecord := enr.New()
+	// Check if address actually changed
+	if currentIP != nil && currentIP.Equal(ip) && currentPort == port {
+		return
+	}
+
+	s.config.Logger.WithFields(logrus.Fields{
+		"family":      familyName,
+		"newAddr":     fmt.Sprintf("%s:%d", ip.String(), port),
+		"currentIP":   currentIP,
+		"currentPort": currentPort,
+		"oldSeq":      currentRecord.Seq(),
+	}).Info("local ip:port updated, updating ENR")
+
+	// Clone the current ENR to preserve all fields
+	newRecord, err := currentRecord.Clone()
+	if err != nil {
+		s.config.Logger.WithError(err).Error("failed to clone ENR")
+		return
+	}
+
+	// Update the IP field with discovered value
+	if isIPv6 {
+		newRecord.Set("ip6", ip)
+	} else {
+		newRecord.Set("ip", ip.To4())
+	}
+
+	// Update the UDP port with discovered value
+	newRecord.Set("udp", port)
 
 	// Increment sequence number
 	newRecord.SetSeq(currentRecord.Seq() + 1)
 
-	// Set IPv4 address
-	if ip.To4() != nil {
-		newRecord.Set("ip", ip.To4())
-	} else {
-		// IPv6 (shouldn't happen as we only track IPv4 in IP discovery)
-		newRecord.Set("ip6", ip)
-	}
-
-	// Copy UDP port from current record
-	if udpPort := currentRecord.UDP(); udpPort != 0 {
-		newRecord.Set("udp", udpPort)
-	}
-
-	// Copy TCP port if present
-	if tcpPort := currentRecord.TCP(); tcpPort != 0 {
-		newRecord.Set("tcp", tcpPort)
-	}
-
-	// Copy secp256k1 public key from current record
-	var pubKey []byte
-	if err := currentRecord.Get("secp256k1", &pubKey); err == nil {
-		newRecord.Set("secp256k1", pubKey)
-	}
-
-	// Copy eth2 field if present
-	var eth2 []byte
-	if err := currentRecord.Get("eth2", &eth2); err == nil {
-		newRecord.Set("eth2", eth2)
-	}
-
-	// Copy IPv6 address if present in old record
-	if ip6 := currentRecord.IP6(); ip6 != nil {
-		newRecord.Set("ip6", ip6)
-	}
-
-	// Sign the new record
+	// Re-sign the record
 	if err := newRecord.Sign(s.config.PrivateKey); err != nil {
 		s.config.Logger.WithError(err).Error("failed to sign updated ENR")
 		return
@@ -816,11 +871,10 @@ func (s *Service) handleIPConsensus(ip net.IP) {
 
 	// Update local node's ENR
 	if updated := localNode.UpdateENR(newRecord); updated {
-		s.config.Logger.WithFields(logrus.Fields{
-			"ip":     ip.String(),
-			"newSeq": newRecord.Seq(),
-			"enr":    newRecord.String(),
-		}).Info("successfully updated local ENR with discovered IP")
+		// Store the updated ENR for persistence
+		if err := s.storeENR(newRecord); err != nil {
+			s.config.Logger.WithError(err).Warn("failed to store updated ENR")
+		}
 	} else {
 		s.config.Logger.Warn("failed to update local ENR (sequence number issue)")
 	}
