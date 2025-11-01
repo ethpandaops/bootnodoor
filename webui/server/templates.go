@@ -30,10 +30,10 @@ func GetTemplate(files ...string) *template.Template {
 		templateFiles := make([]string, len(files))
 		copy(templateFiles, files)
 		for i := range files {
-			if strings.HasPrefix(files[i], "frontend/templates") {
+			if strings.HasPrefix(files[i], "webui/templates") {
 				templateFiles[i] = files[i]
 			} else {
-				templateFiles[i] = "frontend/templates/" + files[i]
+				templateFiles[i] = "webui/templates/" + files[i]
 			}
 		}
 		return template.Must(template.New(name).Funcs(template.FuncMap(templateFuncs)).ParseFiles(templateFiles...))

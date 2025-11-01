@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -42,6 +43,12 @@ type NodeInfo struct {
 
 // Nodes renders the nodes page
 func (fh *FrontendHandler) Nodes(w http.ResponseWriter, r *http.Request) {
+	// Check if this is an AJAX request
+	if r.URL.Query().Get("ajax") == "1" {
+		fh.nodesAJAX(w, r)
+		return
+	}
+
 	templateFiles := server.LayoutTemplateFiles
 	templateFiles = append(templateFiles, "nodes/nodes.html")
 	pageTemplate := server.GetTemplate(templateFiles...)
@@ -59,6 +66,18 @@ func (fh *FrontendHandler) Nodes(w http.ResponseWriter, r *http.Request) {
 	if server.HandleTemplateError(w, r, "nodes.go", "Nodes", "", pageTemplate.ExecuteTemplate(w, "layout", data)) != nil {
 		return
 	}
+}
+
+// nodesAJAX returns nodes data as JSON
+func (fh *FrontendHandler) nodesAJAX(w http.ResponseWriter, r *http.Request) {
+	pageData, err := fh.getNodesPageData()
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(pageData)
 }
 
 func (fh *FrontendHandler) getNodesPageData() (*NodesPageData, error) {

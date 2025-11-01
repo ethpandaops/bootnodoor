@@ -361,20 +361,27 @@ func (f *ForkDigestFilter) ComputeEth2Field() []byte {
 
 // GetCurrentFork returns the name of the current fork.
 func (f *ForkDigestFilter) GetCurrentFork() string {
-	f.mu.RLock()
-	currentDigest := f.currentForkDigest
-	f.mu.RUnlock()
-
-	// Match the current fork digest to determine the fork name
-	digestInfos := f.config.GetAllForkDigestInfos()
-	for _, info := range digestInfos {
-		if info.Digest == currentDigest {
-			return info.Name
-		}
+	// Get genesis time
+	genesisTime := f.config.GetGenesisTime()
+	if genesisTime == 0 {
+		// No genesis time, fallback to "Unknown"
+		return "Unknown"
 	}
 
-	// Fallback to Phase0 if not found
-	return "Phase0"
+	// Calculate current epoch
+	currentTime := uint64(time.Now().Unix())
+	slotsPerEpoch := uint64(32)
+	if f.config.PresetBase == "minimal" {
+		slotsPerEpoch = 8
+	}
+	secondsPerSlot := f.config.SecondsPerSlot
+	if secondsPerSlot == 0 {
+		secondsPerSlot = 12
+	}
+	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
+
+	// Get fork name for current epoch
+	return f.config.GetForkNameForEpoch(currentEpoch)
 }
 
 // GetCurrentDigest returns the current fork digest as a hex string.
@@ -485,6 +492,21 @@ func (f *ForkDigestFilter) GetTotalChecks() int {
 	return f.totalChecks
 }
 
+// GetPreviousForkDigest returns the previous fork digest as a hex string.
+func (f *ForkDigestFilter) GetPreviousForkDigest() string {
+	return f.config.GetPreviousForkDigest().String()
+}
+
+// GetPreviousForkName returns the name of the previous fork.
+func (f *ForkDigestFilter) GetPreviousForkName() string {
+	return f.config.GetPreviousForkName()
+}
+
+// GetGenesisForkDigest returns the genesis fork digest as a hex string.
+func (f *ForkDigestFilter) GetGenesisForkDigest() string {
+	return f.config.GetGenesisForkDigest().String()
+}
+
 // CompatibilityMode creates a filter that accepts multiple fork digests.
 //
 // This is useful for networks during fork transitions where you want to
@@ -527,14 +549,17 @@ func uint64ToBytes(v uint64) []byte {
 
 // ForkFilterStats contains statistics about fork digest filtering.
 type ForkFilterStats struct {
-	NetworkName     string
-	CurrentFork     string
-	CurrentDigest   string
-	GracePeriod     string
-	OldDigests      map[string]time.Duration
-	AcceptedCurrent int
-	AcceptedOld     int
-	RejectedInvalid int
-	RejectedExpired int
-	TotalChecks     int
+	NetworkName         string
+	CurrentFork         string
+	CurrentDigest       string
+	PreviousFork        string
+	PreviousDigest      string
+	GenesisDigest       string
+	GracePeriod         string
+	OldDigests          map[string]time.Duration
+	AcceptedCurrent     int
+	AcceptedOld         int
+	RejectedInvalid     int
+	RejectedExpired     int
+	TotalChecks         int
 }

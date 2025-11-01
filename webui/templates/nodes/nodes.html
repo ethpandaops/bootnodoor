@@ -1,5 +1,5 @@
 {{ define "page" }}
-  <div class="container mt-2">
+  <div class="container mt-2" id="nodes-container">
     <h3 class="py-2">
       Routing Table Nodes
       <i class="fa fa-info-circle text-muted"
@@ -19,24 +19,30 @@
         <div class="row align-items-center">
           <div class="col-auto">
             <strong>Total Nodes:</strong>
-            <span class="badge rounded-pill text-bg-primary fs-6 ms-1">{{ .TotalNodes }}</span>
+            <span class="badge rounded-pill text-bg-primary fs-6 ms-1" data-bind="text: nodesData().TotalNodes">{{ .TotalNodes }}</span>
           </div>
           <div class="col-auto">
             <strong>Active Pool:</strong>
-            <span class="badge rounded-pill text-bg-info fs-6 ms-1">{{ .ActiveNodes }}</span>
+            <span class="badge rounded-pill text-bg-info fs-6 ms-1" data-bind="text: nodesData().ActiveNodes">{{ .ActiveNodes }}</span>
           </div>
           <div class="col-auto">
             <strong>Alive:</strong>
-            <span class="badge rounded-pill text-bg-success fs-6 ms-1">{{ .AliveNodes }}</span>
+            <span class="badge rounded-pill text-bg-success fs-6 ms-1" data-bind="text: nodesData().AliveNodes">{{ .AliveNodes }}</span>
           </div>
           <div class="col-auto">
             <strong>Dead:</strong>
-            <span class="badge rounded-pill text-bg-secondary fs-6 ms-1">{{ .DeadNodes }}</span>
+            <span class="badge rounded-pill text-bg-secondary fs-6 ms-1" data-bind="text: nodesData().DeadNodes">{{ .DeadNodes }}</span>
           </div>
           <div class="col-auto">
             <strong>Reserve Pool (DB):</strong>
-            <span class="badge rounded-pill text-bg-secondary fs-6 ms-1">{{ .InactiveNodes }}</span>
+            <span class="badge rounded-pill text-bg-secondary fs-6 ms-1" data-bind="text: nodesData().InactiveNodes">{{ .InactiveNodes }}</span>
           </div>
+          {{ html "<!-- ko if: nodesData().CurrentForkDigest -->" }}
+          <div class="col-auto">
+            <strong>Current Fork Digest:</strong>
+            <code class="ms-1" data-bind="text: nodesData().CurrentForkDigest"></code>
+          </div>
+          {{ html "<!-- /ko -->" }}
           {{ if .CurrentForkDigest }}
           <div class="col-auto">
             <strong>Current Fork Digest:</strong>
@@ -47,15 +53,15 @@
       </div>
     </div>
 
-    {{ if .Nodes }}
+    {{ html "<!-- ko if: nodesData().Nodes.length > 0 -->" }}
     <div class="card mt-3">
       <div class="card-body p-0">
         <div class="table-responsive">
           <table class="table table-sm table-hover mb-0">
             <thead class="sticky-top">
               <tr>
-                <th>Peer ID</th>
-                <th style="width: 140px;">IP:Port</th>
+                <th style="min-width: 300px;">Peer ID</th>
+                <th style="min-width: 160px;">IP:Port</th>
                 <th style="width: 100px;">Fork</th>
                 <th style="width: 70px;">ENR Seq</th>
                 <th style="width: 50px;">ENR</th>
@@ -63,12 +69,73 @@
                 <th style="width: 100px;">Last Seen</th>
                 <th style="width: 70px;">Success</th>
                 <th style="width: 70px;">Failures</th>
-                <th style="width: 70px;">Avg RTT</th>
+                <th style="width: 80px;">Avg RTT</th>
                 <th style="width: 70px;">Score</th>
                 <th style="width: 70px;">Alive</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody class="template-tbody">
+              {{ html "<!-- ko foreach: nodesData().Nodes -->" }}
+              <tr class="template-row">
+                <td class="node-id-cell">
+                  <code class="peer-id-code" data-bind="text: PeerID"></code>
+                  <i class="fa fa-copy text-muted ms-1" role="button" data-bs-toggle="tooltip" title="Copy Peer ID" data-bind="attr: { 'data-clipboard-text': PeerID }"></i>
+                </td>
+                <td>
+                  <code><span data-bind="text: IP"></span>:<span data-bind="text: Port"></span></code>
+                </td>
+                <td>
+                  {{ html "<!-- ko if: HasForkData -->" }}
+                    {{ html "<!-- ko if: IsCurrentFork -->" }}
+                      <code class="text-success" data-bs-toggle="tooltip" title="Current fork" data-bind="text: ForkDigest"></code>
+                    {{ html "<!-- /ko -->" }}
+                    {{ html "<!-- ko ifnot: IsCurrentFork -->" }}
+                      <code class="text-warning" data-bs-toggle="tooltip" title="Old fork" data-bind="text: ForkDigest"></code>
+                    {{ html "<!-- /ko -->" }}
+                  {{ html "<!-- /ko -->" }}
+                  {{ html "<!-- ko ifnot: HasForkData -->" }}
+                    <span class="text-muted">-</span>
+                  {{ html "<!-- /ko -->" }}
+                </td>
+                <td class="text-center">
+                  <small class="text-muted" data-bind="text: ENRSeq"></small>
+                </td>
+                <td class="text-center">
+                  {{ html "<!-- ko if: ENR -->" }}
+                    <i class="fa fa-copy enr-copy-btn" role="button" data-bs-toggle="tooltip" title="Copy ENR" data-bind="attr: { 'data-clipboard-text': ENR }"></i>
+                  {{ html "<!-- /ko -->" }}
+                  {{ html "<!-- ko ifnot: ENR -->" }}
+                    <span class="text-muted">-</span>
+                  {{ html "<!-- /ko -->" }}
+                </td>
+                <td>
+                  <small data-bind="html: FirstSeenFormatted, attr: { 'data-timer': FirstSeenTimestamp }"></small>
+                </td>
+                <td>
+                  <small data-bind="html: LastSeenFormatted, attr: { 'data-timer': LastSeenTimestamp }"></small>
+                </td>
+                <td class="text-center">
+                  <small class="text-success" data-bind="text: SuccessCount"></small>
+                </td>
+                <td class="text-center">
+                  <small class="text-danger" data-bind="text: FailureCount"></small>
+                </td>
+                <td class="text-center">
+                  <small class="text-muted" data-bind="text: AvgRTTFormatted"></small>
+                </td>
+                <td class="text-center">
+                  <small data-bind="text: ScoreFormatted, css: ScoreClass"></small>
+                </td>
+                <td class="text-center">
+                  {{ html "<!-- ko if: IsAlive -->" }}
+                    <span class="badge badge-sm rounded-pill text-bg-success">Alive</span>
+                  {{ html "<!-- /ko -->" }}
+                  {{ html "<!-- ko ifnot: IsAlive -->" }}
+                    <span class="badge badge-sm rounded-pill text-bg-secondary">Dead</span>
+                  {{ html "<!-- /ko -->" }}
+                </td>
+              </tr>
+              {{ html "<!-- /ko -->" }}
               {{ range $nodeIdx, $node := .Nodes }}
               <tr>
                 <td class="node-id-cell">
@@ -131,8 +198,16 @@
         </div>
       </div>
     </div>
-    {{ else }}
-    <div class="card mt-3">
+    {{ html "<!-- /ko -->" }}
+    {{ html "<!-- ko if: nodesData().Nodes.length === 0 -->" }}
+    <div class="card mt-3 knockout-empty-message" style="display: none;">
+      <div class="card-body text-center py-4">
+        <p class="text-muted mb-0">No nodes in the routing table yet.</p>
+      </div>
+    </div>
+    {{ html "<!-- /ko -->" }}
+    {{ if not .Nodes }}
+    <div class="card mt-3 server-rendered-empty">
       <div class="card-body text-center py-4">
         <p class="text-muted mb-0">No nodes in the routing table yet.</p>
       </div>
@@ -142,98 +217,297 @@
 {{ end }}
 
 {{ define "js" }}
+<script src="/js/knockout.min.js"></script>
 <script>
-  // Initialize Bootstrap popovers and tooltips
-  document.addEventListener('DOMContentLoaded', function() {
-    // Initialize popovers
-    var popoverTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="popover"]'));
-    var popoverList = popoverTriggerList.map(function(popoverTriggerEl) {
-      return new bootstrap.Popover(popoverTriggerEl);
+  /* Format time difference */
+  function formatTimeDiff(timestamp) {
+    if (!timestamp || timestamp === 0) {
+      return '<span class="text-muted">never</span>';
+    }
+
+    var now = Math.floor(Date.now() / 1000);
+    var diff = now - timestamp;
+    var absDiff = Math.abs(diff);
+
+    var timeStr;
+    if (absDiff < 1) {
+      return 'now';
+    } else if (absDiff < 60) {
+      timeStr = Math.floor(absDiff) + ' sec';
+    } else if (absDiff < 3600) {
+      timeStr = Math.floor(absDiff / 60) + ' min';
+    } else if (absDiff < 86400) {
+      timeStr = Math.floor(absDiff / 3600) + ' hr';
+    } else {
+      timeStr = Math.floor(absDiff / 86400) + ' days';
+    }
+
+    if (diff < 0) {
+      /* Future time */
+      return 'in ' + timeStr;
+    } else {
+      /* Past time */
+      return timeStr + ' ago';
+    }
+  }
+
+  /* Node view model */
+  function NodeViewModel(data) {
+    var self = this;
+
+    self.PeerID = data.PeerID;
+    self.IP = data.IP;
+    self.Port = data.Port;
+    self.FirstSeen = data.FirstSeen;
+    self.LastSeen = data.LastSeen;
+    self.SuccessCount = data.SuccessCount;
+    self.FailureCount = data.FailureCount;
+    self.IsAlive = data.IsAlive;
+    self.Score = data.Score;
+    self.ForkDigest = data.ForkDigest || '';
+    self.HasForkData = data.HasForkData || false;
+    self.IsCurrentFork = data.IsCurrentFork || false;
+    self.ENRSeq = data.ENRSeq;
+    self.ENR = data.ENR || '';
+    self.AvgRTT = data.AvgRTT;
+
+    /* Convert timestamps - handle invalid dates */
+    var firstSeenMs = new Date(data.FirstSeen).getTime();
+    var lastSeenMs = data.LastSeen ? new Date(data.LastSeen).getTime() : 0;
+
+    /* Check for invalid dates (NaN or zero year like 0001-01-01) */
+    self.FirstSeenTimestamp = (isNaN(firstSeenMs) || firstSeenMs < 0) ? 0 : Math.floor(firstSeenMs / 1000);
+    self.LastSeenTimestamp = (isNaN(lastSeenMs) || lastSeenMs < 0) ? 0 : Math.floor(lastSeenMs / 1000);
+
+    /* Computed observables */
+    self.FirstSeenFormatted = ko.computed(function() {
+      return formatTimeDiff(self.FirstSeenTimestamp);
     });
 
-    // Initialize tooltips
+    self.LastSeenFormatted = ko.computed(function() {
+      return formatTimeDiff(self.LastSeenTimestamp);
+    });
+
+    self.AvgRTTFormatted = ko.computed(function() {
+      if (self.AvgRTT > 0) {
+        return Math.round(self.AvgRTT / 1000000) + 'ms';
+      }
+      return '-';
+    });
+
+    self.ScoreFormatted = ko.computed(function() {
+      return self.Score.toFixed(2);
+    });
+
+    self.ScoreClass = ko.computed(function() {
+      if (self.Score > 0.5) return 'text-success';
+      if (self.Score > 0.2) return 'text-warning';
+      return 'text-danger';
+    });
+  }
+
+  /* Main page view model */
+  function NodesPageViewModel(initialData) {
+    var self = this;
+
+    self.nodesData = ko.observable({
+      TotalNodes: initialData.TotalNodes || 0,
+      ActiveNodes: initialData.ActiveNodes || 0,
+      InactiveNodes: initialData.InactiveNodes || 0,
+      AliveNodes: initialData.AliveNodes || 0,
+      DeadNodes: initialData.DeadNodes || 0,
+      CurrentForkDigest: initialData.CurrentForkDigest || '',
+      Nodes: (initialData.Nodes || []).map(function(node) {
+        return new NodeViewModel(node);
+      })
+    });
+
+    /* Load data from AJAX */
+    self.loadData = function(data) {
+      self.nodesData({
+        TotalNodes: data.TotalNodes || 0,
+        ActiveNodes: data.ActiveNodes || 0,
+        InactiveNodes: data.InactiveNodes || 0,
+        AliveNodes: data.AliveNodes || 0,
+        DeadNodes: data.DeadNodes || 0,
+        CurrentForkDigest: data.CurrentForkDigest || '',
+        Nodes: (data.Nodes || []).map(function(node) {
+          return new NodeViewModel(node);
+        })
+      });
+    };
+
+    /* AJAX refresh */
+    self.refresh = function() {
+      fetch('/nodes?ajax=1')
+        .then(function(response) {
+          if (!response.ok) throw new Error('Network response was not ok');
+          return response.json();
+        })
+        .then(function(data) {
+          self.loadData(data);
+          /* Reinitialize tooltips after DOM update */
+          setTimeout(function() {
+            initializeTooltips();
+          }, 100);
+        })
+        .catch(function(error) {
+          console.error('Failed to refresh nodes:', error);
+        });
+    };
+
+    /* Start auto-refresh - called after first manual fetch */
+    self.startAutoRefresh = function() {
+      setInterval(function() {
+        self.refresh();
+      }, 20000);
+    };
+  }
+
+  /* Initialize tooltips */
+  function initializeTooltips() {
+    /* Dispose old tooltips */
+    var existingTooltips = document.querySelectorAll('[data-bs-toggle="tooltip"]');
+    existingTooltips.forEach(function(el) {
+      var tooltip = bootstrap.Tooltip.getInstance(el);
+      if (tooltip) {
+        tooltip.dispose();
+      }
+    });
+
+    /* Initialize new tooltips */
     var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
-    var tooltipList = tooltipTriggerList.map(function(tooltipTriggerEl) {
-      return new bootstrap.Tooltip(tooltipTriggerEl);
+    tooltipTriggerList.forEach(function(tooltipTriggerEl) {
+      new bootstrap.Tooltip(tooltipTriggerEl);
     });
+  }
 
-    // Handle clipboard copy for all elements with data-clipboard-text
-    document.querySelectorAll('[data-clipboard-text]').forEach(function(element) {
-      element.addEventListener('click', function(e) {
-        e.preventDefault();
-        var text = this.getAttribute('data-clipboard-text');
+  /* Bind Knockout view */
+  function bindView() {
+    var pageContainer = document.getElementById("nodes-container");
 
-        // Use modern clipboard API
-        if (navigator.clipboard && window.isSecureContext) {
-          navigator.clipboard.writeText(text).then(function() {
-            // Show feedback
-            var originalTitle = element.getAttribute('data-bs-original-title') || element.getAttribute('title');
-            var tooltip = bootstrap.Tooltip.getInstance(element);
-            if (tooltip) {
-              tooltip.setContent({ '.tooltip-inner': 'Copied!' });
-              setTimeout(function() {
-                tooltip.setContent({ '.tooltip-inner': originalTitle });
-              }, 1500);
-            }
-          }).catch(function(err) {
-            console.error('Failed to copy:', err);
-          });
+    /* Remove server-side rendered rows, keep template rows */
+    document.querySelectorAll(".template-tbody").forEach(function(tplTBody) {
+      var rows = Array.prototype.slice.call(tplTBody.children);
+      rows.forEach(function(el) {
+        if(el.classList.contains("template-row")) {
+          el.classList.remove("template-row");
         } else {
-          // Fallback for older browsers
-          var textArea = document.createElement('textarea');
-          textArea.value = text;
-          textArea.style.position = 'fixed';
-          textArea.style.opacity = '0';
-          document.body.appendChild(textArea);
-          textArea.select();
-          try {
-            document.execCommand('copy');
-          } catch (err) {
-            console.error('Failed to copy:', err);
-          }
-          document.body.removeChild(textArea);
+          el.parentElement.removeChild(el);
         }
       });
     });
 
-    // Update time displays every second
+    /* Remove server-side "no nodes" message */
+    document.querySelectorAll(".server-rendered-empty").forEach(function(el) {
+      el.parentElement.removeChild(el);
+    });
+
+    /* Unhide Knockout "no nodes" template so Knockout can control it */
+    document.querySelectorAll(".knockout-empty-message").forEach(function(el) {
+      el.style.display = '';
+    });
+
+    ko.applyBindings(viewModel, pageContainer);
+  }
+
+  /* Initialize page */
+  var viewModel;
+  document.addEventListener('DOMContentLoaded', function() {
+    /* Initialize popovers */
+    var popoverTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="popover"]'));
+    popoverTriggerList.forEach(function(popoverTriggerEl) {
+      new bootstrap.Popover(popoverTriggerEl);
+    });
+
+    /* Initialize tooltips */
+    initializeTooltips();
+
+    /* Handle clipboard copy for all elements with data-clipboard-text */
+    document.addEventListener('click', function(e) {
+      var element = e.target.closest('[data-clipboard-text]');
+      if (!element) return;
+
+      e.preventDefault();
+      var text = element.getAttribute('data-clipboard-text');
+
+      /* Use modern clipboard API */
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function() {
+          /* Show feedback */
+          var tooltip = bootstrap.Tooltip.getInstance(element);
+          if (tooltip) {
+            var originalTitle = element.getAttribute('data-bs-original-title') || element.getAttribute('title');
+            tooltip.setContent({ '.tooltip-inner': 'Copied!' });
+            setTimeout(function() {
+              tooltip.setContent({ '.tooltip-inner': originalTitle });
+            }, 1500);
+          }
+        }).catch(function(err) {
+          console.error('Failed to copy:', err);
+        });
+      } else {
+        /* Fallback for older browsers */
+        var textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.select();
+        try {
+          document.execCommand('copy');
+        } catch (err) {
+          console.error('Failed to copy:', err);
+        }
+        document.body.removeChild(textArea);
+      }
+    });
+
+    /* Update time displays every second - smart update to avoid flickering */
     function updateTimers() {
-      var now = Math.floor(Date.now() / 1000);
-      document.querySelectorAll('[data-timer]').forEach(function(element) {
-        var timestamp = parseInt(element.getAttribute('data-timer'));
-        if (timestamp === 0) {
-          element.innerHTML = '<span class="text-muted">never</span>';
-          return;
-        }
+      /* Use requestAnimationFrame for smoother updates */
+      requestAnimationFrame(function() {
+        document.querySelectorAll('[data-timer]').forEach(function(element) {
+          var timestamp = parseInt(element.getAttribute('data-timer'));
+          var newValue = formatTimeDiff(timestamp);
 
-        var diff = now - timestamp;
-        var timeStr;
-
-        if (diff < 1) {
-          timeStr = 'now';
-        } else if (diff < 60) {
-          timeStr = diff + ' sec ago';
-        } else if (diff < 3600) {
-          timeStr = Math.floor(diff / 60) + ' min ago';
-        } else if (diff < 86400) {
-          timeStr = Math.floor(diff / 3600) + ' hr ago';
-        } else {
-          timeStr = Math.floor(diff / 86400) + ' days ago';
-        }
-
-        element.textContent = timeStr;
+          /* Only update if the value actually changed */
+          if (element.innerHTML !== newValue) {
+            element.innerHTML = newValue;
+          }
+        });
       });
     }
 
-    // Update immediately and then every second
+    /* Update immediately and then every second */
     updateTimers();
     setInterval(updateTimers, 1000);
-  });
 
-  // Auto-refresh every 30 seconds
-  setTimeout(function() {
-    window.location.reload();
-  }, 30000);
+    /* Initialize Knockout.js - view will bind after first AJAX refresh */
+    viewModel = new NodesPageViewModel({});
+
+    /* Wait 20 seconds, then fetch and bind view for the first time */
+    setTimeout(function() {
+      fetch('/nodes?ajax=1')
+        .then(function(response) {
+          if (!response.ok) throw new Error('Network response was not ok');
+          return response.json();
+        })
+        .then(function(data) {
+          viewModel.loadData(data);
+          bindView();
+          /* Start auto-refresh after first successful fetch */
+          viewModel.startAutoRefresh();
+          /* Reinitialize tooltips after binding */
+          setTimeout(function() {
+            initializeTooltips();
+          }, 100);
+        })
+        .catch(function(error) {
+          console.error('Failed to load initial data:', error);
+        });
+    }, 20000);
+  });
 </script>
 {{ end }}
 
@@ -268,8 +542,13 @@
 }
 
 .table td {
-    padding: 0.5rem;
+    padding: 0.25rem 0.5rem;
     vertical-align: middle;
+}
+
+/* Hide template rows until Knockout takes over */
+.table .template-row {
+    display: none;
 }
 
 /* Group divider styling - more subtle */
@@ -299,10 +578,6 @@ thead.sticky-top {
 }
 
 /* Node ID cell styling */
-.node-id-cell {
-    /* No max-width constraint for the cell itself */
-}
-
 .peer-id-code {
     font-size: 0.85em;
     word-break: break-all;
@@ -316,13 +591,6 @@ thead.sticky-top {
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-    }
-}
-
-/* On large screens (1400px+), show full peer ID */
-@media (min-width: 1400px) {
-    .peer-id-code {
-        /* Full peer ID visible - no truncation */
     }
 }
 

@@ -19,6 +19,7 @@ type State struct {
 
 // GetState retrieves a state value by key.
 func (d *Database) GetState(key string) ([]byte, error) {
+	d.trackQuery()
 	var value []byte
 	err := d.ReaderDb.Get(&value, "SELECT value FROM state WHERE key = $1", key)
 	if err != nil {

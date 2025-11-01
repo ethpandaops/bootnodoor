@@ -28,11 +28,14 @@ type SqliteDatabaseConfig struct {
 // It provides both reader and writer connections with mutex protection for write operations
 // and embedded schema migration support using goose.
 type Database struct {
-	config      *SqliteDatabaseConfig
-	logger      logrus.FieldLogger
-	ReaderDb    *sqlx.DB   // Database connection for read operations
-	writerDb    *sqlx.DB   // Database connection for write operations
-	writerMutex sync.Mutex // Protects write transactions from concurrent access
+	config          *SqliteDatabaseConfig
+	logger          logrus.FieldLogger
+	ReaderDb        *sqlx.DB   // Database connection for read operations
+	writerDb        *sqlx.DB   // Database connection for write operations
+	writerMutex     sync.Mutex // Protects write transactions from concurrent access
+	transactionCount int64      // Total number of transactions executed
+	queryCount      int64      // Total number of queries executed
+	statsMutex      sync.RWMutex // Protects stats access
 }
 
 // NewDatabase creates a new Database instance with the specified configuration and logger.
@@ -116,6 +119,11 @@ func (d *Database) RunDBTransaction(handler func(tx *sqlx.Tx) error) error {
 	d.writerMutex.Lock()
 	defer d.writerMutex.Unlock()
 
+	// Increment transaction counter
+	d.statsMutex.Lock()
+	d.transactionCount++
+	d.statsMutex.Unlock()
+
 	tx, err := d.writerDb.Beginx()
 	if err != nil {
 		return fmt.Errorf("error starting db transactions: %v", err)
@@ -181,4 +189,46 @@ func (g *gooseLogger) Fatalf(format string, v ...interface{}) {
 // Implements the goose logger interface for migration progress logging.
 func (g *gooseLogger) Printf(format string, v ...interface{}) {
 	g.logger.Infof(format, v...)
+}
+
+// DatabaseStats contains statistics about database operations.
+type DatabaseStats struct {
+	TotalQueries     int64 // Total queries from SQL driver stats
+	Transactions     int64 // Total transactions executed
+	OpenConnections  int   // Current number of open connections
+	InUse            int   // Connections currently in use
+	Idle             int   // Connections currently idle
+	WaitCount        int64 // Total number of times waited for a connection
+	WaitDuration     time.Duration // Total time blocked waiting for connections
+	MaxIdleClosed    int64 // Total connections closed due to SetMaxIdleConns
+	MaxLifetimeClosed int64 // Total connections closed due to SetConnMaxLifetime
+}
+
+// trackQuery increments the query counter.
+func (d *Database) trackQuery() {
+	d.statsMutex.Lock()
+	d.queryCount++
+	d.statsMutex.Unlock()
+}
+
+// GetStats returns database statistics from the SQL driver.
+func (d *Database) GetStats() DatabaseStats {
+	d.statsMutex.RLock()
+	txCount := d.transactionCount
+	qCount := d.queryCount
+	d.statsMutex.RUnlock()
+
+	stats := d.ReaderDb.Stats()
+
+	return DatabaseStats{
+		TotalQueries:      qCount,
+		Transactions:      txCount,
+		OpenConnections:   stats.OpenConnections,
+		InUse:             stats.InUse,
+		Idle:              stats.Idle,
+		WaitCount:         stats.WaitCount,
+		WaitDuration:      stats.WaitDuration,
+		MaxIdleClosed:     stats.MaxIdleClosed,
+		MaxLifetimeClosed: stats.MaxLifetimeClosed,
+	}
 }

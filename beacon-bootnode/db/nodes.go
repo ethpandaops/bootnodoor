@@ -44,6 +44,7 @@ type Node struct {
 
 // GetNode retrieves a single node by ID from the database.
 func (d *Database) GetNode(nodeID []byte) (*Node, error) {
+	d.trackQuery()
 	node := &Node{}
 	err := d.ReaderDb.Get(node, `
 		SELECT nodeid, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active,
@@ -57,6 +58,7 @@ func (d *Database) GetNode(nodeID []byte) (*Node, error) {
 
 // GetNodes retrieves all nodes from the database.
 func (d *Database) GetNodes() ([]*Node, error) {
+	d.trackQuery()
 	nodes := []*Node{}
 	err := d.ReaderDb.Select(&nodes, `
 		SELECT nodeid, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active,
@@ -67,6 +69,7 @@ func (d *Database) GetNodes() ([]*Node, error) {
 
 // GetRandomNodes retrieves N random nodes from the database.
 func (d *Database) GetRandomNodes(n int) ([]*Node, error) {
+	d.trackQuery()
 	nodes := []*Node{}
 	err := d.ReaderDb.Select(&nodes, `
 		SELECT nodeid, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active,
@@ -80,6 +83,7 @@ func (d *Database) GetRandomNodes(n int) ([]*Node, error) {
 // GetInactiveNodes retrieves N nodes ordered by oldest last_active time.
 // Nodes with NULL last_active (never active) are returned first.
 func (d *Database) GetInactiveNodes(n int) ([]*Node, error) {
+	d.trackQuery()
 	nodes := []*Node{}
 	err := d.ReaderDb.Select(&nodes, `
 		SELECT nodeid, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active,
@@ -92,6 +96,7 @@ func (d *Database) GetInactiveNodes(n int) ([]*Node, error) {
 
 // CountNodes returns the total number of nodes.
 func (d *Database) CountNodes() (int, error) {
+	d.trackQuery()
 	var count int
 	err := d.ReaderDb.Get(&count, "SELECT COUNT(*) FROM nodes")
 	return count, err
@@ -99,6 +104,7 @@ func (d *Database) CountNodes() (int, error) {
 
 // NodeExists checks if a node exists in the database.
 func (d *Database) NodeExists(nodeID []byte) (bool, uint64, error) {
+	d.trackQuery()
 	var seq uint64
 	err := d.ReaderDb.Get(&seq, "SELECT seq FROM nodes WHERE nodeid = $1", nodeID)
 	if err != nil {

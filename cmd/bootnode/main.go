@@ -48,6 +48,8 @@ var (
 	webUIHost   string
 	webUIPort   int
 	webUISite   string
+	webUIPprof  bool
+	webUIDebug  bool
 
 	// Bootnode flags
 	bootnodesFlag string
@@ -105,6 +107,7 @@ func init() {
 	rootCmd.Flags().StringVar(&webUIHost, "web-host", "0.0.0.0", "Web UI host")
 	rootCmd.Flags().IntVar(&webUIPort, "web-port", 8080, "Web UI port")
 	rootCmd.Flags().StringVar(&webUISite, "web-sitename", "Bootoor", "Web UI site name")
+	rootCmd.Flags().BoolVar(&webUIPprof, "pprof", false, "Enable pprof endpoints")
 
 	// Bootnodes
 	rootCmd.Flags().StringVar(&bootnodesFlag, "bootnodes", "", "Comma-separated list of bootnode ENRs (e.g., enr:-IS4...,enr:-IS4...)")
@@ -404,9 +407,9 @@ func startWebUI(service *bootnode.Service) {
 		Host:     webUIHost,
 		Port:     webUIPort,
 		SiteName: webUISite,
-		Debug:    false,
-		Pprof:    false,
-		Minify:   false,
+		Debug:    webUIDebug,
+		Pprof:    webUIPprof,
+		Minify:   true,
 	}
 
 	webui.StartHttpServer(config, logger, service)

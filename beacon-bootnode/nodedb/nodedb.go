@@ -45,7 +45,22 @@ type NodeDB struct {
 	updateQueueSet  map[node.ID]*nodeUpdate // Tracks pending updates, can merge
 	updateQueueLock sync.Mutex
 
+	// Stats tracking
+	stats      NodeDBStats
+	statsLock  sync.RWMutex
+
 	wg sync.WaitGroup
+}
+
+// NodeDBStats contains statistics about database operations.
+type NodeDBStats struct {
+	QueueSize         int   // Current number of pending updates in queue
+	ProcessedUpdates  int64 // Total updates processed
+	MergedUpdates     int64 // Total updates merged with existing pending
+	FailedUpdates     int64 // Total updates that failed
+	Transactions      int64 // Total database transactions executed
+	TotalQueries      int64 // Total database queries executed
+	OpenConnections   int   // Current number of open DB connections
 }
 
 // NewNodeDB creates a new node database wrapper.
@@ -150,6 +165,11 @@ func (ndb *NodeDB) queueUpdate(update nodeUpdate) error {
 			}
 		}
 
+		// Track merged update
+		ndb.statsLock.Lock()
+		ndb.stats.MergedUpdates++
+		ndb.statsLock.Unlock()
+
 		return nil
 	}
 
@@ -163,6 +183,12 @@ func (ndb *NodeDB) queueUpdate(update nodeUpdate) error {
 	default:
 		// Queue full, remove from set
 		delete(ndb.updateQueueSet, update.nodeID)
+
+		// Track failed update
+		ndb.statsLock.Lock()
+		ndb.stats.FailedUpdates++
+		ndb.statsLock.Unlock()
+
 		return fmt.Errorf("update queue full")
 	}
 }
@@ -277,6 +303,11 @@ func (ndb *NodeDB) batchUpdate(updates []nodeUpdate) {
 		delete(ndb.updateQueueSet, update.nodeID)
 	}
 	ndb.updateQueueLock.Unlock()
+
+	// Track processed updates
+	ndb.statsLock.Lock()
+	ndb.stats.ProcessedUpdates += int64(len(updates))
+	ndb.statsLock.Unlock()
 }
 
 // updateNodeENRTx updates only ENR info (seq+enr+ip) within a transaction, preserving stats.
@@ -501,6 +532,26 @@ func (ndb *NodeDB) StoreLocalENR(enrBytes []byte) error {
 // LoadLocalENR retrieves the local node's ENR.
 func (ndb *NodeDB) LoadLocalENR() ([]byte, error) {
 	return ndb.db.GetState("local_enr")
+}
+
+// GetStats returns current database statistics.
+func (ndb *NodeDB) GetStats() NodeDBStats {
+	ndb.statsLock.RLock()
+	stats := ndb.stats
+	ndb.statsLock.RUnlock()
+
+	// Get current queue size
+	ndb.updateQueueLock.Lock()
+	stats.QueueSize = len(ndb.updateQueueSet)
+	ndb.updateQueueLock.Unlock()
+
+	// Get database stats
+	dbStats := ndb.db.GetStats()
+	stats.Transactions = dbStats.Transactions
+	stats.TotalQueries = dbStats.TotalQueries
+	stats.OpenConnections = dbStats.OpenConnections
+
+	return stats
 }
 
 // Close waits for pending updates to complete.

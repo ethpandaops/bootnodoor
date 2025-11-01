@@ -355,6 +355,134 @@ func (c *Config) GetGenesisForkDigest() ForkDigest {
 	return c.GetForkDigest(c.genesisForkVersion, nil)
 }
 
+// GetForkNameForEpoch returns the name of the fork active at the given epoch.
+func (c *Config) GetForkNameForEpoch(epoch uint64) string {
+	// Check forks in reverse order (newest to oldest)
+	if c.FuluForkEpoch != nil && epoch >= *c.FuluForkEpoch {
+		return "Fulu"
+	}
+	if c.ElectraForkEpoch != nil && epoch >= *c.ElectraForkEpoch {
+		return "Electra"
+	}
+	if c.DenebForkEpoch != nil && epoch >= *c.DenebForkEpoch {
+		return "Deneb"
+	}
+	if c.CapellaForkEpoch != nil && epoch >= *c.CapellaForkEpoch {
+		return "Capella"
+	}
+	if c.BellatrixForkEpoch != nil && epoch >= *c.BellatrixForkEpoch {
+		return "Bellatrix"
+	}
+	if c.AltairForkEpoch != nil && epoch >= *c.AltairForkEpoch {
+		return "Altair"
+	}
+	return "Phase0"
+}
+
+// GetPreviousForkDigest returns the fork digest for the previous fork before the current one.
+// Returns the genesis fork digest if there is no previous fork.
+func (c *Config) GetPreviousForkDigest() ForkDigest {
+	// Get genesis time
+	genesisTime := c.GetGenesisTime()
+	if genesisTime == 0 {
+		// No genesis time, return genesis fork digest
+		return c.GetGenesisForkDigest()
+	}
+
+	// Calculate current epoch
+	currentTime := uint64(time.Now().Unix())
+	slotsPerEpoch := uint64(32)
+	if c.PresetBase == "minimal" {
+		slotsPerEpoch = 8
+	}
+	secondsPerSlot := c.SecondsPerSlot
+	if secondsPerSlot == 0 {
+		secondsPerSlot = 12
+	}
+	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
+
+	// Find the fork before the current one
+	if c.FuluForkEpoch != nil && currentEpoch >= *c.FuluForkEpoch {
+		// Currently in Fulu, previous is Electra
+		if c.ElectraForkEpoch != nil {
+			return c.GetForkDigest(c.electraForkVersion, nil)
+		}
+	}
+	if c.ElectraForkEpoch != nil && currentEpoch >= *c.ElectraForkEpoch {
+		// Currently in Electra, previous is Deneb
+		if c.DenebForkEpoch != nil {
+			return c.GetForkDigest(c.denebForkVersion, nil)
+		}
+	}
+	if c.DenebForkEpoch != nil && currentEpoch >= *c.DenebForkEpoch {
+		// Currently in Deneb, previous is Capella
+		if c.CapellaForkEpoch != nil {
+			return c.GetForkDigest(c.capellaForkVersion, nil)
+		}
+	}
+	if c.CapellaForkEpoch != nil && currentEpoch >= *c.CapellaForkEpoch {
+		// Currently in Capella, previous is Bellatrix
+		if c.BellatrixForkEpoch != nil {
+			return c.GetForkDigest(c.bellatrixForkVersion, nil)
+		}
+	}
+	if c.BellatrixForkEpoch != nil && currentEpoch >= *c.BellatrixForkEpoch {
+		// Currently in Bellatrix, previous is Altair
+		if c.AltairForkEpoch != nil {
+			return c.GetForkDigest(c.altairForkVersion, nil)
+		}
+	}
+	if c.AltairForkEpoch != nil && currentEpoch >= *c.AltairForkEpoch {
+		// Currently in Altair, previous is Phase0
+		return c.GetGenesisForkDigest()
+	}
+
+	// We're in Phase0, no previous fork
+	return c.GetGenesisForkDigest()
+}
+
+// GetPreviousForkName returns the name of the previous fork before the current one.
+func (c *Config) GetPreviousForkName() string {
+	// Get genesis time
+	genesisTime := c.GetGenesisTime()
+	if genesisTime == 0 {
+		return "Phase0"
+	}
+
+	// Calculate current epoch
+	currentTime := uint64(time.Now().Unix())
+	slotsPerEpoch := uint64(32)
+	if c.PresetBase == "minimal" {
+		slotsPerEpoch = 8
+	}
+	secondsPerSlot := c.SecondsPerSlot
+	if secondsPerSlot == 0 {
+		secondsPerSlot = 12
+	}
+	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
+
+	// Get current fork name
+	currentFork := c.GetForkNameForEpoch(currentEpoch)
+
+	// Return the previous fork name
+	switch currentFork {
+	case "Fulu":
+		return "Electra"
+	case "Electra":
+		return "Deneb"
+	case "Deneb":
+		return "Capella"
+	case "Capella":
+		return "Bellatrix"
+	case "Bellatrix":
+		return "Altair"
+	case "Altair":
+		return "Phase0"
+	default:
+		return "Phase0"
+	}
+}
+
 // getFallbackForkDigest returns the latest fork with a realistic epoch.
 // Used as fallback when genesis time is not available.
 func (c *Config) getFallbackForkDigest() ForkDigest {

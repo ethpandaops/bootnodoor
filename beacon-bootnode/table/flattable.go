@@ -289,9 +289,12 @@ func (t *FlatTable) Add(n *node.Node) bool {
 			"addr":        n.Addr(),
 			"currentSize": currentSize + 1,
 			"maxActive":   t.maxActiveNodes,
-		}).Debug("added node while over capacity (will be cleaned up at next sweep)")
+		}).Infof("added alive node to active pool (over capacity)")
 	} else {
-		t.logger.WithField("peerID", n.PeerID()).WithField("addr", n.Addr()).Info("added node to active pool")
+		t.logger.WithFields(logrus.Fields{
+			"peerID": n.PeerID(),
+			"addr":   n.Addr(),
+		}).Info("added node to active pool")
 	}
 
 	// Queue ENR update to DB and mark as active

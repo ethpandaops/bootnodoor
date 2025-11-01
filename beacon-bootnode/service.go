@@ -593,21 +593,18 @@ func (s *Service) CheckAndAddNode(n *node.Node) bool {
 		}
 
 		// Ping successful - update stats and add to table
-		s.config.Logger.WithField("peerID", n.PeerID()).WithField("rtt", rtt).Info("ping successful, adding new node")
 		now := time.Now()
 		n.SetLastSeen(now)
 		n.ResetFailureCount() // This also increments success count
+		n.UpdateRTT(rtt)
 
 		// Queue last_seen update
 		if err := s.nodeDB.UpdateLastSeen(n.ID(), now); err != nil {
 			s.config.Logger.WithError(err).Warn("failed to queue last_seen update")
 		}
-
-		// Add to table (will go to active even if over capacity, sweep handles cleanup)
-		return s.table.Add(n)
 	}
 
-	// Pool has space - add directly
+	// add to active pool
 	return s.table.Add(n)
 }
 
@@ -661,6 +658,9 @@ func (s *Service) GetStats() ServiceStats {
 			NetworkName:     s.forkFilter.GetNetworkName(),
 			CurrentFork:     s.forkFilter.GetCurrentFork(),
 			CurrentDigest:   s.forkFilter.GetCurrentDigest(),
+			PreviousFork:    s.forkFilter.GetPreviousForkName(),
+			PreviousDigest:  s.forkFilter.GetPreviousForkDigest(),
+			GenesisDigest:   s.forkFilter.GetGenesisForkDigest(),
 			GracePeriod:     s.forkFilter.GetGracePeriod(),
 			OldDigests:      s.forkFilter.GetOldDigests(),
 			AcceptedCurrent: s.forkFilter.GetAcceptedCurrent(),
@@ -669,6 +669,7 @@ func (s *Service) GetStats() ServiceStats {
 			RejectedExpired: s.forkFilter.GetRejectedExpired(),
 			TotalChecks:     s.forkFilter.GetTotalChecks(),
 		},
+		NodeDBStats: s.nodeDB.GetStats(),
 	}
 }
 
@@ -705,6 +706,7 @@ type ServiceStats struct {
 	SessionStats  SessionStats
 	HandlerStats  HandlerStats
 	ForkFilter    *config.ForkFilterStats
+	NodeDBStats   nodedb.NodeDBStats
 }
 
 // ForkFilterStatsProvider interface implementation for webui

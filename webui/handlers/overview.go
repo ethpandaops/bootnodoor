@@ -17,10 +17,13 @@ type OverviewPageData struct {
 	BindAddress   string
 	LocalENR      string
 	LocalENRSeq   uint64
-	CurrentFork   string
-	CurrentDigest string
-	OldDigests    []OldDigestInfo
-	GracePeriod   string
+	CurrentFork     string
+	CurrentDigest   string
+	PreviousFork    string
+	PreviousDigest  string
+	GenesisDigest   string
+	OldDigests      []OldDigestInfo
+	GracePeriod     string
 
 	// Routing table stats
 	TableSize     int
@@ -60,6 +63,15 @@ type OverviewPageData struct {
 	FilterRejectedInvalid int
 	FilterRejectedExpired int
 	FilterTotalChecks     int
+
+	// Database stats
+	DBQueueSize        int
+	DBProcessedUpdates int64
+	DBMergedUpdates    int64
+	DBFailedUpdates    int64
+	DBTransactions     int64
+	DBTotalQueries     int64
+	DBOpenConnections  int
 }
 
 type OldDigestInfo struct {
@@ -151,6 +163,13 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		InvalidPackets:    stats.HandlerStats.InvalidPackets,
 		FilteredResponses: stats.HandlerStats.FilteredResponses,
 		FindNodeReceived:  stats.HandlerStats.FindNodeReceived,
+		DBQueueSize:        stats.NodeDBStats.QueueSize,
+		DBProcessedUpdates: stats.NodeDBStats.ProcessedUpdates,
+		DBMergedUpdates:    stats.NodeDBStats.MergedUpdates,
+		DBFailedUpdates:    stats.NodeDBStats.FailedUpdates,
+		DBTransactions:     stats.NodeDBStats.Transactions,
+		DBTotalQueries:     stats.NodeDBStats.TotalQueries,
+		DBOpenConnections:  stats.NodeDBStats.OpenConnections,
 	}
 
 	// Add fork filter stats if available
@@ -158,6 +177,9 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		pageData.NetworkName = stats.ForkFilter.NetworkName
 		pageData.CurrentFork = stats.ForkFilter.CurrentFork
 		pageData.CurrentDigest = stats.ForkFilter.CurrentDigest
+		pageData.PreviousFork = stats.ForkFilter.PreviousFork
+		pageData.PreviousDigest = stats.ForkFilter.PreviousDigest
+		pageData.GenesisDigest = stats.ForkFilter.GenesisDigest
 		pageData.GracePeriod = stats.ForkFilter.GracePeriod
 		pageData.FilterAcceptedCurrent = stats.ForkFilter.AcceptedCurrent
 		pageData.FilterAcceptedOld = stats.ForkFilter.AcceptedOld

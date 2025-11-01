@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"math"
@@ -40,6 +41,7 @@ func GetTemplateFuncs() template.FuncMap {
 		"toInt64":        func(f float64) int64 { return int64(f) },
 		"toFloat64":      func(i int) float64 { return float64(i) },
 		"divDuration":    func(d time.Duration, divisor int64) float64 { return float64(d) / float64(divisor) },
+		"jsonMarshal":    JSONMarshal,
 	}
 }
 
@@ -92,4 +94,14 @@ func FormatTimeDiff(ts time.Time) template.HTML {
 		// Past time
 		return template.HTML(fmt.Sprintf("%v ago", timeStr))
 	}
+}
+
+// JSONMarshal converts a Go value to JSON for use in templates
+func JSONMarshal(v interface{}) template.JS {
+	b, err := json.Marshal(v)
+	if err != nil {
+		logger.Printf("jsonMarshal - error marshaling: %v", err)
+		return template.JS("{}")
+	}
+	return template.JS(b)
 }

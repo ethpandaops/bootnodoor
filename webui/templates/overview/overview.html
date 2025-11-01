@@ -178,16 +178,16 @@
         </div>
       </div>
 
-      <!-- Session Stats Card -->
+      <!-- Sessions & Protocol Card -->
       <div class="col-12 col-md-6 col-lg-4 mb-3">
         <div class="card h-100">
           <div class="card-body">
-            <h6 class="card-title">Sessions</h6>
+            <h6 class="card-title">Sessions & Protocol</h6>
             <table class="table table-sm mb-0">
               <tbody>
                 <tr>
                   <td class="text-muted">
-                    Active
+                    Active Sessions
                     <i class="fa fa-info-circle text-muted"
                        style="font-size: 0.8em;"
                        role="button"
@@ -201,12 +201,12 @@
                   <td class="text-end"><span class="badge rounded-pill text-bg-success fs-6" data-stat="sessions-active">{{ .SessionsActive }}</span></td>
                 </tr>
                 <tr>
-                  <td class="text-muted">Total</td>
+                  <td class="text-muted">Total Sessions</td>
                   <td class="text-end" data-stat="sessions-total">{{ .SessionsTotal }}</td>
                 </tr>
                 <tr>
                   <td class="text-muted">
-                    Expired
+                    Pending Handshakes
                     <i class="fa fa-info-circle text-muted"
                        style="font-size: 0.8em;"
                        role="button"
@@ -214,10 +214,25 @@
                        data-bs-trigger="hover focus"
                        data-bs-placement="right"
                        data-bs-html="true"
-                       data-bs-title="Expired Sessions"
-                       data-bs-content="Sessions that have exceeded their lifetime (default 12 hours). These will be cleaned up and require a new handshake for future communication."></i>
+                       data-bs-title="Pending Handshakes"
+                       data-bs-content="Messages waiting for handshake completion. After receiving a WHOAREYOU challenge, the node performs a handshake to establish session keys before sending the actual message."></i>
                   </td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary" data-stat="sessions-expired">{{ .SessionsExpired }}</span></td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-warning" data-stat="pending-handshakes">{{ .PendingHandshakes }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">
+                    Pending Challenges
+                    <i class="fa fa-info-circle text-muted"
+                       style="font-size: 0.8em;"
+                       role="button"
+                       data-bs-toggle="popover"
+                       data-bs-trigger="hover focus"
+                       data-bs-placement="right"
+                       data-bs-html="true"
+                       data-bs-title="Pending Challenges"
+                       data-bs-content="WHOAREYOU challenges sent to peers waiting for handshake responses. These challenges initiate the cryptographic handshake process to establish encrypted sessions."></i>
+                  </td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info" data-stat="pending-challenges">{{ .PendingChallenges }}</span></td>
                 </tr>
               </tbody>
             </table>
@@ -258,16 +273,16 @@
         </div>
       </div>
 
-      <!-- Protocol Stats Card -->
+      <!-- Database Stats Card -->
       <div class="col-12 col-md-6 col-lg-4 mb-3">
         <div class="card h-100">
           <div class="card-body">
-            <h6 class="card-title">Protocol</h6>
+            <h6 class="card-title">Database & Queue</h6>
             <table class="table table-sm mb-0">
               <tbody>
                 <tr>
                   <td class="text-muted">
-                    Pending Handshakes
+                    Queue Size
                     <i class="fa fa-info-circle text-muted"
                        style="font-size: 0.8em;"
                        role="button"
@@ -275,14 +290,18 @@
                        data-bs-trigger="hover focus"
                        data-bs-placement="right"
                        data-bs-html="true"
-                       data-bs-title="Pending Handshakes"
-                       data-bs-content="Messages waiting for handshake completion. After receiving a WHOAREYOU challenge, the node performs a handshake to establish session keys before sending the actual message."></i>
+                       data-bs-title="Pending Updates"
+                       data-bs-content="Number of pending node updates waiting to be written to the database. Updates are batched for efficiency."></i>
                   </td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-warning" data-stat="pending-handshakes">{{ .PendingHandshakes }}</span></td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info" data-stat="db-queue-size">{{ .DBQueueSize }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">Processed Updates</td>
+                  <td class="text-end" data-stat="db-processed-updates">{{ .DBProcessedUpdates }}</td>
                 </tr>
                 <tr>
                   <td class="text-muted">
-                    Pending Challenges
+                    Merged Updates
                     <i class="fa fa-info-circle text-muted"
                        style="font-size: 0.8em;"
                        role="button"
@@ -290,11 +309,29 @@
                        data-bs-trigger="hover focus"
                        data-bs-placement="right"
                        data-bs-html="true"
-                       data-bs-title="Pending Challenges"
-                       data-bs-content="WHOAREYOU challenges sent to peers waiting for handshake responses. These challenges initiate the cryptographic handshake process to establish encrypted sessions."></i>
+                       data-bs-title="Merged Updates"
+                       data-bs-content="Number of updates that were merged with existing pending updates for the same node to reduce database writes."></i>
                   </td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-info" data-stat="pending-challenges">{{ .PendingChallenges }}</span></td>
+                  <td class="text-end" data-stat="db-merged-updates">{{ .DBMergedUpdates }}</td>
                 </tr>
+                <tr>
+                  <td class="text-muted">Transactions</td>
+                  <td class="text-end" data-stat="db-transactions">{{ .DBTransactions }}</td>
+                </tr>
+                <tr>
+                  <td class="text-muted">Total Queries</td>
+                  <td class="text-end" data-stat="db-total-queries">{{ .DBTotalQueries }}</td>
+                </tr>
+                <tr>
+                  <td class="text-muted">Open Connections</td>
+                  <td class="text-end" data-stat="db-open-connections">{{ .DBOpenConnections }}</td>
+                </tr>
+                {{ if gt .DBFailedUpdates 0 }}
+                <tr>
+                  <td class="text-muted">Failed Updates</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-danger" data-stat="db-failed-updates">{{ .DBFailedUpdates }}</span></td>
+                </tr>
+                {{ end }}
               </tbody>
             </table>
           </div>
@@ -314,12 +351,41 @@
                   <td class="text-end" data-stat="current-fork">{{ .CurrentFork }}</td>
                 </tr>
                 <tr>
-                  <td class="text-muted">Fork Digest</td>
+                  <td class="text-muted">Current Digest</td>
                   <td class="text-end">
                     <code style="font-size: 0.85em;">{{ .CurrentDigest }}</code>
                     <i class="fa fa-copy text-muted ms-1" style="font-size: 0.9em;" role="button" data-bs-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="{{ .CurrentDigest }}"></i>
                   </td>
                 </tr>
+                {{ if .PreviousDigest }}
+                <tr>
+                  <td class="text-muted">
+                    Previous Digest
+                    <i class="fa fa-info-circle text-muted"
+                       style="font-size: 0.8em;"
+                       role="button"
+                       data-bs-toggle="popover"
+                       data-bs-trigger="hover focus"
+                       data-bs-placement="right"
+                       data-bs-html="true"
+                       data-bs-title="Previous Fork"
+                       data-bs-content="Fork: <strong>{{ .PreviousFork }}</strong><br>This was the active fork before the current one."></i>
+                  </td>
+                  <td class="text-end">
+                    <code style="font-size: 0.85em;" data-stat="previous-digest">{{ .PreviousDigest }}</code>
+                    <i class="fa fa-copy text-muted ms-1" style="font-size: 0.9em;" role="button" data-bs-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="{{ .PreviousDigest }}"></i>
+                  </td>
+                </tr>
+                {{ end }}
+                {{ if .GenesisDigest }}
+                <tr>
+                  <td class="text-muted">Genesis Digest</td>
+                  <td class="text-end">
+                    <code style="font-size: 0.85em;" data-stat="genesis-digest">{{ .GenesisDigest }}</code>
+                    <i class="fa fa-copy text-muted ms-1" style="font-size: 0.9em;" role="button" data-bs-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="{{ .GenesisDigest }}"></i>
+                  </td>
+                </tr>
+                {{ end }}
                 <tr>
                   <td class="text-muted">Grace Period</td>
                   <td class="text-end" data-stat="grace-period">{{ .GracePeriod }}</td>
@@ -485,10 +551,22 @@
         updateValue('[data-stat="pongs-received"]', data.PongsReceived);
         updateValue('[data-stat="ping-success-rate"]', data.PingSuccessRate.toFixed(1) + '%');
 
-        // Session stats
+        // Session & Protocol stats
         updateValue('[data-stat="sessions-active"]', data.SessionsActive);
         updateValue('[data-stat="sessions-total"]', data.SessionsTotal);
-        updateValue('[data-stat="sessions-expired"]', data.SessionsExpired);
+        updateValue('[data-stat="pending-handshakes"]', data.PendingHandshakes);
+        updateValue('[data-stat="pending-challenges"]', data.PendingChallenges);
+
+        // Database stats
+        updateValue('[data-stat="db-queue-size"]', data.DBQueueSize);
+        updateValue('[data-stat="db-processed-updates"]', data.DBProcessedUpdates);
+        updateValue('[data-stat="db-merged-updates"]', data.DBMergedUpdates);
+        updateValue('[data-stat="db-transactions"]', data.DBTransactions);
+        updateValue('[data-stat="db-total-queries"]', data.DBTotalQueries);
+        updateValue('[data-stat="db-open-connections"]', data.DBOpenConnections);
+        if (data.DBFailedUpdates > 0) {
+          updateValue('[data-stat="db-failed-updates"]', data.DBFailedUpdates);
+        }
 
         // Packet stats
         updateValue('[data-stat="packets-received"]', data.PacketsReceived);
@@ -496,10 +574,6 @@
         updateValue('[data-stat="findnode-received"]', data.FindNodeReceived);
         updateValue('[data-stat="invalid-packets"]', data.InvalidPackets);
         updateValue('[data-stat="filtered-responses"]', data.FilteredResponses);
-
-        // Protocol stats
-        updateValue('[data-stat="pending-handshakes"]', data.PendingHandshakes);
-        updateValue('[data-stat="pending-challenges"]', data.PendingChallenges);
 
         // Fork info (if present)
         if (data.CurrentFork) updateValue('[data-stat="current-fork"]', data.CurrentFork);
