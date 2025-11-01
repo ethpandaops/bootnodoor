@@ -1,13 +1,13 @@
 package handlers
 
-import "github.com/pk910/bootoor/discv5"
+import bootnode "github.com/pk910/bootoor/beacon-bootnode"
 
 type FrontendHandler struct {
-	discv5Service *discv5.Service
+	bootnodeService *bootnode.Service
 }
 
-func NewFrontendHandler(discv5Service *discv5.Service) *FrontendHandler {
+func NewFrontendHandler(bootnodeService *bootnode.Service) *FrontendHandler {
 	return &FrontendHandler{
-		discv5Service: discv5Service,
+		bootnodeService: bootnodeService,
 	}
 }

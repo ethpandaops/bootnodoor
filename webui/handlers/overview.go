@@ -67,7 +67,7 @@ type OldDigestInfo struct {
 
 // ENR serves the local ENR as plain text
 func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.discv5Service.LocalNode()
+	localNode := fh.bootnodeService.LocalNode()
 	localENR, err := localNode.Record().EncodeBase64()
 	if err != nil {
 		http.Error(w, "Failed to encode ENR", http.StatusInternalServerError)
@@ -113,10 +113,10 @@ func (fh *FrontendHandler) Overview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
-	stats := fh.discv5Service.GetStats()
+	stats := fh.bootnodeService.GetStats()
 
 	// Get local node ENR
-	localNode := fh.discv5Service.LocalNode()
+	localNode := fh.bootnodeService.LocalNode()
 	localENR, err := localNode.Record().EncodeBase64()
 	if err != nil {
 		localENR = "" // Fallback to empty string on error
@@ -150,20 +150,20 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	}
 
 	// Add fork filter stats if available
-	if stats.ForkFilterStats != nil {
-		pageData.NetworkName = stats.ForkFilterStats.NetworkName
-		pageData.CurrentFork = stats.ForkFilterStats.CurrentFork
-		pageData.CurrentDigest = stats.ForkFilterStats.CurrentDigest
-		pageData.GracePeriod = stats.ForkFilterStats.GracePeriod
-		pageData.FilterAcceptedCurrent = stats.ForkFilterStats.AcceptedCurrent
-		pageData.FilterAcceptedOld = stats.ForkFilterStats.AcceptedOld
-		pageData.FilterRejectedInvalid = stats.ForkFilterStats.RejectedInvalid
-		pageData.FilterRejectedExpired = stats.ForkFilterStats.RejectedExpired
-		pageData.FilterTotalChecks = stats.ForkFilterStats.TotalChecks
+	if stats.ForkFilter != nil {
+		pageData.NetworkName = stats.ForkFilter.NetworkName
+		pageData.CurrentFork = stats.ForkFilter.CurrentFork
+		pageData.CurrentDigest = stats.ForkFilter.CurrentDigest
+		pageData.GracePeriod = stats.ForkFilter.GracePeriod
+		pageData.FilterAcceptedCurrent = stats.ForkFilter.AcceptedCurrent
+		pageData.FilterAcceptedOld = stats.ForkFilter.AcceptedOld
+		pageData.FilterRejectedInvalid = stats.ForkFilter.RejectedInvalid
+		pageData.FilterRejectedExpired = stats.ForkFilter.RejectedExpired
+		pageData.FilterTotalChecks = stats.ForkFilter.TotalChecks
 
 		// Convert old digests map
-		pageData.OldDigests = make([]OldDigestInfo, 0, len(stats.ForkFilterStats.OldDigests))
-		for digest, remaining := range stats.ForkFilterStats.OldDigests {
+		pageData.OldDigests = make([]OldDigestInfo, 0, len(stats.ForkFilter.OldDigests))
+		for digest, remaining := range stats.ForkFilter.OldDigests {
 			pageData.OldDigests = append(pageData.OldDigests, OldDigestInfo{
 				Digest:    digest,
 				Remaining: remaining,

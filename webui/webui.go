@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/pk910/bootoor/discv5"
+	bootnode "github.com/pk910/bootoor/beacon-bootnode"
 	"github.com/pk910/bootoor/webui/handlers"
 	"github.com/pk910/bootoor/webui/server"
 	"github.com/pk910/bootoor/webui/types"
@@ -26,7 +26,7 @@ var (
 	templateEmbedFS embed.FS
 )
 
-func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, discv5Service *discv5.Service) {
+func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, bootnodeService *bootnode.Service) {
 	// init router
 	router := mux.NewRouter()
 
@@ -36,7 +36,7 @@ func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, di
 	}
 
 	// register frontend routes
-	frontendHandler := handlers.NewFrontendHandler(discv5Service)
+	frontendHandler := handlers.NewFrontendHandler(bootnodeService)
 	router.HandleFunc("/", frontendHandler.Overview).Methods("GET")
 	router.HandleFunc("/nodes", frontendHandler.Nodes).Methods("GET")
 	router.HandleFunc("/enr", frontendHandler.ENR).Methods("GET")

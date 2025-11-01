@@ -11,6 +11,22 @@ import (
 // DefaultRequestTimeout is the default timeout for requests (5 seconds).
 const DefaultRequestTimeout = 5 * time.Second
 
+// Common errors
+var (
+	ErrTimeout  = &ProtocolError{Code: "timeout", Message: "request timed out"}
+	ErrCanceled = &ProtocolError{Code: "canceled", Message: "request canceled"}
+)
+
+// ProtocolError represents a protocol-level error.
+type ProtocolError struct {
+	Code    string
+	Message string
+}
+
+func (e *ProtocolError) Error() string {
+	return e.Message
+}
+
 // PendingRequest tracks an outgoing request waiting for a response.
 type PendingRequest struct {
 	// RequestID is the unique ID for this request
@@ -18,12 +34,6 @@ type PendingRequest struct {
 
 	// NodeID is the target node
 	NodeID node.ID
-
-	// MessageType is the type of message sent
-	MessageType byte
-
-	// SentAt is when the request was sent
-	SentAt time.Time
 
 	// Timeout is when the request expires
 	Timeout time.Time
@@ -35,8 +45,8 @@ type PendingRequest struct {
 	Retries int
 
 	// For multi-packet NODES responses
-	ExpectedTotal    uint // Total number of NODES packets expected
-	ReceivedCount    uint // Number of NODES packets received so far
+	ExpectedTotal    uint   // Total number of NODES packets expected
+	ReceivedCount    uint   // Number of NODES packets received so far
 	AccumulatedNodes *Nodes // Accumulated NODES message
 }
 
@@ -64,8 +74,8 @@ type RequestTracker struct {
 	mu sync.RWMutex
 
 	// Stats
-	totalRequests   int
-	timedOutRequests int
+	totalRequests      int
+	timedOutRequests   int
 	successfulRequests int
 }
 
@@ -93,8 +103,6 @@ func (rt *RequestTracker) AddRequest(requestID []byte, nodeID node.ID, msgType b
 	req := &PendingRequest{
 		RequestID:    requestID,
 		NodeID:       nodeID,
-		MessageType:  msgType,
-		SentAt:       now,
 		Timeout:      now.Add(rt.timeout),
 		ResponseChan: make(chan *Response, 1),
 		Retries:      0,
@@ -194,9 +202,10 @@ func (rt *RequestTracker) handleTimeout(key string, req *PendingRequest) {
 		NodeID:  req.NodeID,
 		Error:   ErrTimeout,
 	}:
-		rt.timedOutRequests++
 	default:
 	}
+
+	rt.timedOutRequests++
 
 	// Remove from pending
 	delete(rt.requests, key)
@@ -270,20 +279,4 @@ func (rt *RequestTracker) GetStats() RequestStats {
 		SuccessfulRequests: rt.successfulRequests,
 		SuccessRate:        successRate,
 	}
-}
-
-// Common errors
-var (
-	ErrTimeout = &ProtocolError{Code: "timeout", Message: "request timed out"}
-	ErrCanceled = &ProtocolError{Code: "canceled", Message: "request canceled"}
-)
-
-// ProtocolError represents a protocol-level error.
-type ProtocolError struct {
-	Code    string
-	Message string
-}
-
-func (e *ProtocolError) Error() string {
-	return e.Message
 }

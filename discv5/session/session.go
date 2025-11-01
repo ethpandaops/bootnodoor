@@ -15,12 +15,17 @@ import (
 //   - Creation and expiration timestamps
 //   - Role (initiator or recipient)
 //   - Nonce tracking for replay protection
+//   - Node reference for protocol operations
 type Session struct {
 	// RemoteID is the node ID of the remote peer
 	RemoteID node.ID
 
 	// RemoteAddr is the network address of the remote peer
 	RemoteAddr *net.UDPAddr
+
+	// Node is the full node information (ENR, etc.)
+	// This allows protocol operations to access node data without a separate table lookup
+	Node *node.Node
 
 	// Keys contains the encryption keys for this session
 	Keys *SessionKeys
@@ -92,6 +97,26 @@ func (s *Session) Touch() {
 	defer s.mu.Unlock()
 
 	s.LastUsed = time.Now()
+}
+
+// SetNode updates the node reference for this session.
+//
+// This is typically called after a handshake when we receive the remote node's ENR.
+func (s *Session) SetNode(n *node.Node) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.Node = n
+}
+
+// GetNode returns the node reference for this session.
+//
+// Returns nil if no node has been set.
+func (s *Session) GetNode() *node.Node {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.Node
 }
 
 // EncryptionKey returns the key to use for encrypting outgoing messages.

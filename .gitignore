@@ -6,7 +6,6 @@
 *.dylib
 bin/
 dist/
-bootnode
 
 # Test binary, built with `go test -c`
 *.test

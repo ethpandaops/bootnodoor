@@ -60,13 +60,13 @@ func (fh *FrontendHandler) Nodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (fh *FrontendHandler) getNodesPageData() (*NodesPageData, error) {
-	buckets := fh.discv5Service.GetBuckets()
-	stats := fh.discv5Service.GetStats()
+	buckets := fh.bootnodeService.GetBuckets()
+	stats := fh.bootnodeService.GetStats()
 
 	// Get current fork digest if available
 	var currentForkDigest string
-	if stats.ForkFilterStats != nil {
-		currentForkDigest = stats.ForkFilterStats.CurrentDigest
+	if stats.ForkFilter != nil {
+		currentForkDigest = stats.ForkFilter.CurrentDigest
 	}
 
 	pageData := &NodesPageData{

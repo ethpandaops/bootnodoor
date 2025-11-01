@@ -1,12 +1,10 @@
 // Package discv5 implements the Ethereum Discovery v5 protocol.
 //
-// The service ties together all components:
+// This is a generic discv5 implementation providing:
 //   - UDP transport for network communication
-//   - Routing table with IP limits and aliveness monitoring
 //   - Session management for encrypted communication
 //   - Protocol handler for message processing
-//   - Discovery operations for node lookup
-//   - Node database for persistent storage
+//   - ENR (Ethereum Node Record) support
 package discv5
 
 import (
@@ -14,24 +12,20 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
-	"github.com/pk910/bootoor/discv5/discover"
 	"github.com/pk910/bootoor/discv5/enr"
 	"github.com/pk910/bootoor/discv5/node"
-	"github.com/pk910/bootoor/discv5/nodedb"
 	"github.com/pk910/bootoor/discv5/protocol"
 	"github.com/pk910/bootoor/discv5/session"
-	"github.com/pk910/bootoor/discv5/table"
 	"github.com/pk910/bootoor/discv5/transport"
 	"github.com/sirupsen/logrus"
 )
 
 // Service is the main discv5 service.
 //
-// It orchestrates all components and provides a high-level API
-// for node discovery and network operations.
+// It provides a minimal, generic discv5 implementation that can be
+// extended by higher-level services (e.g., beacon bootnode).
 type Service struct {
 	// config is the service configuration
 	config *Config
@@ -42,37 +36,15 @@ type Service struct {
 	// transport is the UDP transport layer
 	transport *transport.UDPTransport
 
-	// table is the routing table
-	table *table.Table
-
 	// sessions manages encrypted sessions
 	sessions *session.Cache
 
 	// handler processes protocol messages
 	handler *protocol.Handler
 
-	// lookup performs node discovery
-	lookup *discover.LookupService
-
-	// ping handles liveness checks
-	ping *discover.PingService
-
-	// nodeDB stores discovered nodes
-	nodeDB nodedb.DB
-
-	// logger for debug messages
-	logger logrus.FieldLogger
-
-	// forkFilterStats stores fork filter statistics provider
-	forkFilterStats ForkFilterStatsProvider
-
-	// startTime records when the service started
-	startTime time.Time
-
 	// Lifecycle management
 	running   bool
 	mu        sync.RWMutex
-	wg        sync.WaitGroup
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 }
@@ -89,7 +61,7 @@ type Service struct {
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	defer service.Close()
+//	defer service.Stop()
 func New(cfg *Config) (*Service, error) {
 	if cfg == nil {
 		cfg = DefaultConfig()
@@ -103,10 +75,6 @@ func New(cfg *Config) (*Service, error) {
 	// Set defaults
 	if cfg.Logger == nil {
 		cfg.Logger = logrus.New()
-	}
-
-	if cfg.NodeDB == nil {
-		cfg.NodeDB = nodedb.NewMemoryDB(cfg.Logger)
 	}
 
 	// Create local ENR
@@ -123,45 +91,30 @@ func New(cfg *Config) (*Service, error) {
 
 	cfg.Logger.WithField("peerID", localNode.PeerID()).WithField("ip", cfg.BindIP).WithField("port", cfg.BindPort).Info("created local node")
 
-	// Create routing table with persistence callback
-	tableConfig := table.Config{
-		LocalID:         localNode.ID(),
-		MaxNodesPerIP:   cfg.MaxNodesPerIP,
-		AdmissionFilter: cfg.AdmissionFilter,
-		PingInterval:    cfg.PingInterval,
-		MaxNodeAge:      cfg.MaxNodeAge,
-		MaxFailures:     cfg.MaxFailures,
-		DB:              cfg.NodeDB, // Use NodeDB for rejection tracking
-		Logger:          cfg.Logger,
-		NodeChangedCallback: func(n *node.Node) {
-			// Persist node to database in background to avoid blocking
-			go func() {
-				if err := cfg.NodeDB.Store(n); err != nil {
-					cfg.Logger.WithError(err).WithField("peerID", n.PeerID()).Warn("failed to persist node to database")
-				}
-			}()
-		},
+	// Create context for graceful shutdown
+	ctx := cfg.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	routingTable := table.NewTable(tableConfig)
+	ctx, cancelCtx := context.WithCancel(ctx)
 
 	// Create session cache
 	sessionCache := session.NewCache(cfg.MaxSessions, cfg.SessionLifetime, cfg.Logger)
 
 	// Create protocol handler (transport will be set later)
-	responseFilter := cfg.ResponseFilter
-	if responseFilter == nil && cfg.EnableLANFiltering {
-		responseFilter = protocol.LANAwareResponseFilter()
-	}
-
+	// Wire up callbacks from our config to the handler
 	handlerConfig := protocol.HandlerConfig{
-		LocalNode:      localNode,
-		Table:          routingTable,
-		Sessions:       sessionCache,
-		PrivateKey:     cfg.PrivateKey,
-		ResponseFilter: responseFilter,
-		Logger:         cfg.Logger,
+		LocalNode:           localNode,
+		Sessions:            sessionCache,
+		PrivateKey:          cfg.PrivateKey,
+		OnHandshakeComplete: cfg.OnHandshakeComplete,
+		OnNodeUpdate:        cfg.OnNodeUpdate,
+		OnFindNode:          cfg.OnFindNode,
+		OnTalkReq:           cfg.OnTalkReq,
+		ResponseFilter:      cfg.ResponseFilter,
+		Logger:              cfg.Logger,
 	}
-	protocolHandler := protocol.NewHandler(handlerConfig)
+	protocolHandler := protocol.NewHandler(ctx, handlerConfig)
 
 	// Create UDP transport
 	listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), cfg.BindPort)
@@ -176,6 +129,7 @@ func New(cfg *Config) (*Service, error) {
 
 	udpTransport, err := transport.NewUDPTransport(transportConfig)
 	if err != nil {
+		cancelCtx() // Clean up context
 		return nil, fmt.Errorf("failed to create UDP transport: %w", err)
 	}
 
@@ -186,64 +140,24 @@ func New(cfg *Config) (*Service, error) {
 		config:    cfg,
 		localNode: localNode,
 		transport: udpTransport,
-		table:     routingTable,
 		sessions:  sessionCache,
 		handler:   protocolHandler,
-		nodeDB:    cfg.NodeDB,
-		logger:    cfg.Logger,
+		ctx:       ctx,
+		cancelCtx: cancelCtx,
 	}
-
-	// Create context for graceful shutdown
-	s.ctx, s.cancelCtx = context.WithCancel(context.Background())
-
-	// Create lookup service
-	lookupConfig := discover.Config{
-		LocalNode: localNode,
-		Table:     routingTable,
-		Handler:   protocolHandler,
-		Logger:    cfg.Logger,
-	}
-	lookupService := discover.NewLookupService(lookupConfig)
-
-	// Create ping service
-	pingService := discover.NewPingService(protocolHandler, cfg.Logger)
-
-	// Set lookup and ping services
-	s.lookup = lookupService
-	s.ping = pingService
 
 	return s, nil
 }
 
 // Start starts the discv5 service.
 //
-// This starts all background tasks:
-//   - UDP packet receiver
-//   - Periodic table maintenance
-//   - Session cleanup
-//   - Aliveness monitoring
+// This starts the UDP packet receiver.
 func (s *Service) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.running {
 		return ErrAlreadyRunning
-	}
-
-	// Record start time
-	s.startTime = time.Now()
-
-	// Restore nodes from database
-	s.restoreNodesFromDB()
-
-	// Start background tasks
-	s.wg.Add(1)
-	go s.maintenanceLoop()
-
-	// Connect to boot nodes
-	if len(s.config.BootNodes) > 0 {
-		s.wg.Add(1)
-		go s.connectBootNodes()
 	}
 
 	s.running = true
@@ -253,8 +167,7 @@ func (s *Service) Start() error {
 
 // Stop stops the discv5 service.
 //
-// This gracefully shuts down all components and waits for
-// background tasks to complete.
+// This gracefully shuts down all components.
 func (s *Service) Stop() error {
 	s.mu.Lock()
 	if !s.running {
@@ -267,210 +180,19 @@ func (s *Service) Stop() error {
 	// Signal stop to background tasks
 	s.cancelCtx()
 
-	// Wait for background tasks
-	s.wg.Wait()
-
 	// Close UDP transport
 	if s.transport != nil {
 		if err := s.transport.Close(); err != nil {
-			s.logger.WithError(err).Error("failed to close UDP transport")
+			s.config.Logger.WithError(err).Error("failed to close UDP transport")
 		}
 	}
 
 	// Close session cache
 	if err := s.sessions.Close(); err != nil {
-		s.logger.WithError(err).Error("failed to close session cache")
-	}
-
-	// Close node database
-	if err := s.nodeDB.Close(); err != nil {
-		s.logger.WithError(err).Error("failed to close node database")
+		s.config.Logger.WithError(err).Error("failed to close session cache")
 	}
 
 	return nil
-}
-
-// maintenanceLoop runs periodic maintenance tasks.
-func (s *Service) maintenanceLoop() {
-	defer s.wg.Done()
-
-	// Tickers for periodic tasks
-	tableMaintenance := time.NewTicker(5 * time.Minute)
-	sessionCleanup := time.NewTicker(10 * time.Minute)
-	alivenessCheck := time.NewTicker(s.config.PingInterval)
-	randomWalk := time.NewTicker(30 * time.Second)
-
-	defer tableMaintenance.Stop()
-	defer sessionCleanup.Stop()
-	defer alivenessCheck.Stop()
-	defer randomWalk.Stop()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-
-		case <-tableMaintenance.C:
-			s.performTableMaintenance()
-
-		case <-sessionCleanup.C:
-			s.performSessionCleanup()
-
-		case <-alivenessCheck.C:
-			s.performAlivenessCheck()
-
-		case <-randomWalk.C:
-			s.performRandomWalk()
-		}
-	}
-}
-
-// performTableMaintenance performs routing table maintenance.
-func (s *Service) performTableMaintenance() {
-	// Remove stale nodes
-	removed := s.table.RemoveStaleNodes()
-	if removed > 0 {
-		s.logger.WithField("count", removed).Info("removed stale nodes")
-	}
-
-	// Cleanup expired rejection log entries
-	rejectionCleaned := s.table.CleanupRejectionLog()
-	if rejectionCleaned > 0 {
-		s.logger.WithField("count", rejectionCleaned).Debug("cleaned up rejection log entries")
-	}
-}
-
-// performSessionCleanup cleans up expired sessions.
-func (s *Service) performSessionCleanup() {
-	removed := s.sessions.CleanupExpired()
-	if removed > 0 {
-		s.logger.WithField("count", removed).Debug("cleaned up expired sessions")
-	}
-}
-
-// performAlivenessCheck checks node aliveness with PINGs.
-func (s *Service) performAlivenessCheck() {
-	nodes := s.table.GetNodesNeedingPing()
-	if len(nodes) == 0 {
-		return
-	}
-
-	s.logger.WithField("count", len(nodes)).Debug("performing aliveness check")
-
-	// Ping nodes in parallel
-	results := s.ping.PingMultiple(nodes)
-
-	// Update node statistics
-	for nodeID, success := range results {
-		n := s.table.Get(nodeID)
-		if n == nil {
-			continue
-		}
-
-		if success {
-			n.SetLastSeen(time.Now())
-			n.ResetFailureCount()
-		} else {
-			n.IncrementFailureCount()
-		}
-	}
-}
-
-// performRandomWalk performs a random walk for network exploration.
-func (s *Service) performRandomWalk() {
-	// Check if we're shutting down
-	select {
-	case <-s.ctx.Done():
-		s.logger.Debug("skipping random walk due to shutdown")
-		return
-	default:
-	}
-
-	// Only perform random walk if table is not full enough
-	if s.table.NumBucketsFilled() >= 100 {
-		return
-	}
-
-	s.logger.Debug("discv5: performing random walk")
-
-	_, err := s.lookup.RandomWalk(s.ctx)
-	if err != nil {
-		s.logger.WithError(err).Debug("random walk failed")
-	}
-}
-
-// restoreNodesFromDB restores nodes from the database to the routing table.
-func (s *Service) restoreNodesFromDB() {
-	nodes := s.nodeDB.List()
-	if len(nodes) == 0 {
-		s.logger.Info("no nodes to restore from database")
-		return
-	}
-
-	s.logger.WithField("count", len(nodes)).Info("restoring nodes from database")
-
-	restored := 0
-	for _, n := range nodes {
-		// Add to routing table (will trigger admission filter and IP limits)
-		if s.table.Add(n) {
-			restored++
-		}
-	}
-
-	s.logger.WithFields(logrus.Fields{
-		"total":    len(nodes),
-		"restored": restored,
-	}).Info("finished restoring nodes from database")
-}
-
-// connectBootNodes connects to boot nodes on startup.
-func (s *Service) connectBootNodes() {
-	defer s.wg.Done()
-
-	s.logger.WithField("count", len(s.config.BootNodes)).Info("connecting to boot nodes")
-
-	for _, bootNode := range s.config.BootNodes {
-		s.logger.WithFields(logrus.Fields{
-			"peerID": bootNode.PeerID(),
-			"addr":   bootNode.Addr(),
-		}).Info("discv5: attempting to connect to boot node")
-
-		// Add to routing table
-		added := s.table.Add(bootNode)
-		s.logger.WithFields(logrus.Fields{
-			"peerID": bootNode.PeerID(),
-			"added":  added,
-		}).Debug("discv5: boot node add to table result")
-
-		// First ping the boot node to establish connectivity
-		s.logger.WithField("peerID", bootNode.PeerID()).Debug("discv5: pinging boot node")
-		success, rtt, err := s.ping.Ping(bootNode)
-		if err != nil {
-			s.logger.WithFields(logrus.Fields{
-				"peerID": bootNode.PeerID(),
-				"error":  err,
-			}).Warn("discv5: failed to ping boot node")
-			continue
-		}
-
-		s.logger.WithFields(logrus.Fields{
-			"peerID":  bootNode.PeerID(),
-			"success": success,
-			"rtt":     rtt,
-		}).Info("discv5: boot node ping result")
-
-		if !success {
-			s.logger.WithField("peerID", bootNode.PeerID()).Warn("discv5: boot node ping unsuccessful")
-			continue
-		}
-
-		// Perform lookup using boot node
-		s.logger.WithField("peerID", bootNode.PeerID()).Debug("discv5: performing lookup via boot node")
-		_, err = s.lookup.Lookup(s.ctx, bootNode.ID(), 16)
-		if err != nil {
-			s.logger.WithField("peerID", bootNode.PeerID()).WithError(err).Debug("boot node lookup failed")
-		}
-	}
 }
 
 // LocalNode returns our local node information.
@@ -478,210 +200,158 @@ func (s *Service) LocalNode() *node.Node {
 	return s.localNode
 }
 
-// Table returns the routing table.
-func (s *Service) Table() *table.Table {
-	return s.table
+// Handler returns the protocol handler.
+//
+// This allows higher-level services to access the handler for
+// sending requests and managing the protocol.
+func (s *Service) Handler() *protocol.Handler {
+	return s.handler
 }
 
-// NodeDB returns the node database.
-func (s *Service) NodeDB() nodedb.DB {
-	return s.nodeDB
+// Sessions returns the session cache.
+func (s *Service) Sessions() *session.Cache {
+	return s.sessions
 }
 
-// Lookup performs a node lookup for the target ID.
-func (s *Service) Lookup(ctx context.Context, target node.ID) ([]*node.Node, error) {
-	return s.lookup.Lookup(ctx, target, 16)
+// Transport returns the UDP transport.
+func (s *Service) Transport() *transport.UDPTransport {
+	return s.transport
 }
 
-// ForkFilterStatsProvider provides fork filter statistics.
-type ForkFilterStatsProvider interface {
-	GetCurrentFork() string
-	GetCurrentDigest() string
-	GetGracePeriod() string
-	GetOldDigests() map[string]time.Duration
-	GetAcceptedCurrent() int
-	GetAcceptedOld() int
-	GetRejectedInvalid() int
-	GetRejectedExpired() int
-	GetTotalChecks() int
-	GetNetworkName() string
-}
-
-// SetForkFilterStats sets the fork filter stats provider.
-func (s *Service) SetForkFilterStats(provider ForkFilterStatsProvider) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.forkFilterStats = provider
-}
-
-// ForkFilterStats contains fork filter statistics for the webui.
-type ForkFilterStats struct {
-	NetworkName     string
-	CurrentFork     string
-	CurrentDigest   string
-	GracePeriod     string
-	OldDigests      map[string]time.Duration
-	AcceptedCurrent int
-	AcceptedOld     int
-	RejectedInvalid int
-	RejectedExpired int
-	TotalChecks     int
-}
-
-// ServiceStats contains statistics about the service.
-type ServiceStats struct {
-	PeerID          string
-	BindAddress     string
-	Uptime          time.Duration
-	TableSize       int
-	BucketsFilled   int
-	TableStats      table.TableStats
-	HandlerStats    protocol.HandlerStats
-	SessionStats    session.Stats
-	LookupStats     discover.LookupStats
-	PingStats       discover.PingStats
-	ForkFilterStats *ForkFilterStats
-}
-
-// GetStats returns service statistics.
-func (s *Service) GetStats() ServiceStats {
-	s.mu.RLock()
-	uptime := time.Since(s.startTime)
-	forkFilterProvider := s.forkFilterStats
-	s.mu.RUnlock()
-
-	stats := ServiceStats{
-		PeerID:        s.localNode.PeerID(),
-		BindAddress:   fmt.Sprintf("%s:%d", s.config.BindIP, s.config.BindPort),
-		Uptime:        uptime,
-		TableSize:     s.table.Size(),
-		BucketsFilled: s.table.NumBucketsFilled(),
-		TableStats:    s.table.GetStats(),
-		HandlerStats:  s.handler.GetStats(),
-		SessionStats:  s.sessions.GetStats(),
-		LookupStats:   s.lookup.GetStats(),
-		PingStats:     s.ping.GetStats(),
+// Ping sends a PING request to a node and waits for a PONG response.
+//
+// Returns an error if the ping fails or times out.
+//
+// Example:
+//
+//	if err := service.Ping(targetNode); err != nil {
+//	    log.Printf("ping failed: %v", err)
+//	}
+func (s *Service) Ping(n *node.Node) error {
+	respChan, err := s.handler.SendPing(n)
+	if err != nil {
+		return fmt.Errorf("failed to send ping: %w", err)
 	}
 
-	// Add fork filter stats if available
-	if forkFilterProvider != nil {
-		stats.ForkFilterStats = &ForkFilterStats{
-			NetworkName:     forkFilterProvider.GetNetworkName(),
-			CurrentFork:     forkFilterProvider.GetCurrentFork(),
-			CurrentDigest:   forkFilterProvider.GetCurrentDigest(),
-			GracePeriod:     forkFilterProvider.GetGracePeriod(),
-			OldDigests:      forkFilterProvider.GetOldDigests(),
-			AcceptedCurrent: forkFilterProvider.GetAcceptedCurrent(),
-			AcceptedOld:     forkFilterProvider.GetAcceptedOld(),
-			RejectedInvalid: forkFilterProvider.GetRejectedInvalid(),
-			RejectedExpired: forkFilterProvider.GetRejectedExpired(),
-			TotalChecks:     forkFilterProvider.GetTotalChecks(),
+	// Wait for response with timeout
+	select {
+	case resp := <-respChan:
+		if resp.Error != nil {
+			return fmt.Errorf("ping error: %w", resp.Error)
 		}
+		return nil
+	case <-s.ctx.Done():
+		return fmt.Errorf("service stopped")
+	}
+}
+
+// FindNode sends a FINDNODE request to a node and returns the discovered nodes.
+//
+// The distances parameter specifies which distance buckets to query (0-255).
+// Use distance 0 to request the node's own ENR.
+//
+// Returns a slice of discovered nodes, or an error if the request fails.
+//
+// Example:
+//
+//	// Find nodes at distance 256 (all nodes)
+//	nodes, err := service.FindNode(targetNode, []uint{256})
+//	if err != nil {
+//	    log.Printf("findnode failed: %v", err)
+//	}
+func (s *Service) FindNode(n *node.Node, distances []uint) ([]*node.Node, error) {
+	respChan, err := s.handler.SendFindNode(n, distances)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send findnode: %w", err)
 	}
 
-	return stats
-}
+	// Collect all NODES responses (may be multiple packets)
+	var allNodes []*node.Node
 
-// BucketInfo contains information about a routing table bucket.
-type BucketInfo struct {
-	Index    int
-	Distance string
-	Nodes    []BucketNodeInfo
-}
-
-// BucketNodeInfo contains node information for display.
-type BucketNodeInfo struct {
-	PeerID       string
-	IP           string
-	Port         int
-	FirstSeen    time.Time
-	LastSeen     time.Time
-	SuccessCount int
-	FailureCount int
-	IsAlive      bool
-	Score        int
-	ForkDigest   string
-	HasForkData  bool
-	ENRSeq       uint64
-	ENR          string
-}
-
-// GetBuckets returns information about all routing table buckets.
-func (s *Service) GetBuckets() []BucketInfo {
-	buckets := make([]BucketInfo, 0, 256)
-
-	for i := 0; i < 256; i++ {
-		nodes := s.table.GetBucketNodes(i)
-		if len(nodes) == 0 {
-			continue
+	// Wait for response with timeout
+	select {
+	case resp := <-respChan:
+		if resp.Error != nil {
+			return nil, fmt.Errorf("findnode error: %w", resp.Error)
 		}
 
-		bucketInfo := BucketInfo{
-			Index:    i,
-			Distance: fmt.Sprintf("2^%d", i),
-			Nodes:    make([]BucketNodeInfo, 0, len(nodes)),
+		// Extract nodes from NODES message
+		if nodesMsg, ok := resp.Message.(*protocol.Nodes); ok {
+			for _, record := range nodesMsg.Records {
+				discoveredNode, err := node.New(record)
+				if err != nil {
+					s.config.Logger.WithError(err).Warn("failed to create node from ENR")
+					continue
+				}
+				allNodes = append(allNodes, discoveredNode)
+			}
 		}
 
-		for _, n := range nodes {
-			nodeInfo := BucketNodeInfo{
-				PeerID:       n.PeerID(),
-				IP:           n.IP().String(),
-				Port:         int(n.UDPPort()),
-				FirstSeen:    n.FirstSeen(),
-				LastSeen:     n.LastSeen(),
-				SuccessCount: n.SuccessCount(),
-				FailureCount: n.FailureCount(),
-				IsAlive:      n.FailureCount() < 3, // Simple heuristic
-				Score:        n.SuccessCount() - n.FailureCount(),
-				ENRSeq:       n.Record().Seq(),
-			}
+		return allNodes, nil
+	case <-s.ctx.Done():
+		return nil, fmt.Errorf("service stopped")
+	}
+}
 
-			// Extract eth2 fork digest if available
-			if eth2Data, ok := n.Record().Eth2(); ok {
-				nodeInfo.ForkDigest = fmt.Sprintf("%x", eth2Data.ForkDigest)
-				nodeInfo.HasForkData = true
-			}
-
-			// Get ENR string
-			if enrStr, err := n.Record().EncodeBase64(); err == nil {
-				nodeInfo.ENR = enrStr
-			}
-
-			bucketInfo.Nodes = append(bucketInfo.Nodes, nodeInfo)
-		}
-
-		buckets = append(buckets, bucketInfo)
+// TalkReq sends a TALKREQ request to a node and returns the response.
+//
+// The protocolName parameter identifies the application protocol.
+// The request parameter contains the application-specific request data.
+//
+// Returns the response data, or an error if the request fails.
+//
+// Example:
+//
+//	resp, err := service.TalkReq(targetNode, "my-protocol", []byte("my-request"))
+//	if err != nil {
+//	    log.Printf("talkreq failed: %v", err)
+//	}
+func (s *Service) TalkReq(n *node.Node, protocolName string, request []byte) ([]byte, error) {
+	// Create TALKREQ message
+	requestID, err := protocol.NewRequestID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate request ID: %w", err)
 	}
 
-	return buckets
+	talkReq := &protocol.TalkReq{
+		RequestID: requestID,
+		Protocol:  []byte(protocolName),
+		Request:   request,
+	}
+
+	// Register pending request and send
+	respChan := s.handler.Requests().AddRequest(requestID, n.ID(), protocol.TalkReqMsg)
+
+	if err := s.handler.SendMessage(talkReq, n.ID(), n.Addr(), n); err != nil {
+		s.handler.Requests().CancelRequest(requestID)
+		return nil, fmt.Errorf("failed to send talkreq: %w", err)
+	}
+
+	// Wait for response with timeout
+	select {
+	case resp := <-respChan:
+		if resp.Error != nil {
+			return nil, fmt.Errorf("talkreq error: %w", resp.Error)
+		}
+
+		// Extract response from TALKRESP message
+		if talkResp, ok := resp.Message.(*protocol.TalkResp); ok {
+			return talkResp.Response, nil
+		}
+
+		return nil, fmt.Errorf("unexpected response type")
+	case <-s.ctx.Done():
+		return nil, fmt.Errorf("service stopped")
+	}
 }
 
 // createLocalENR creates the local node's ENR record.
 func createLocalENR(cfg *Config) (*enr.Record, error) {
-	// Try to load existing ENR from database to maintain sequence number
-	var currentSeq uint64 = 0
-	if cfg.NodeDB != nil {
-		existingENRBytes, err := cfg.NodeDB.LoadLocalENR()
-		if err != nil {
-			cfg.Logger.WithError(err).Warn("failed to load existing local ENR from database")
-		} else if existingENRBytes != nil {
-			existingENR := &enr.Record{}
-			if err := existingENR.DecodeRLPBytes(existingENRBytes); err == nil {
-				currentSeq = existingENR.Seq()
-				cfg.Logger.WithField("seq", currentSeq).Info("loaded existing ENR sequence number")
-			}
-		}
-	}
-
 	// Create ENR with IP and port
 	record := enr.New()
 
-	// Set sequence number (start at 1 if new, increment if existing)
-	if currentSeq == 0 {
-		record.SetSeq(1)
-	} else {
-		record.SetSeq(currentSeq + 1)
-	}
+	// Set sequence number (start at 1)
+	record.SetSeq(1)
 
 	// Determine which IP to use for ENR
 	enrIPv4 := cfg.ENRIP
@@ -724,20 +394,6 @@ func createLocalENR(cfg *Config) (*enr.Record, error) {
 	// Sign the record with private key
 	if err := record.Sign(cfg.PrivateKey); err != nil {
 		return nil, fmt.Errorf("failed to sign ENR: %w", err)
-	}
-
-	// Save the ENR to database for future use
-	if cfg.NodeDB != nil {
-		enrBytes, err := record.EncodeRLP()
-		if err != nil {
-			cfg.Logger.WithError(err).Warn("failed to encode ENR for storage")
-		} else {
-			if err := cfg.NodeDB.StoreLocalENR(enrBytes); err != nil {
-				cfg.Logger.WithError(err).Warn("failed to store local ENR to database")
-			} else {
-				cfg.Logger.WithField("seq", record.Seq()).Info("stored local ENR to database")
-			}
-		}
 	}
 
 	return record, nil

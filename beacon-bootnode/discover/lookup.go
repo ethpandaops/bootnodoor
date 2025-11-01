@@ -18,7 +18,7 @@ import (
 	"github.com/pk910/bootoor/discv5/enr"
 	"github.com/pk910/bootoor/discv5/node"
 	"github.com/pk910/bootoor/discv5/protocol"
-	"github.com/pk910/bootoor/discv5/table"
+	"github.com/pk910/bootoor/beacon-bootnode/table"
 	"github.com/sirupsen/logrus"
 )
 

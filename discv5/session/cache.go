@@ -254,6 +254,20 @@ func (c *Cache) GetStats() Stats {
 	return stats
 }
 
+// GetNodeByID retrieves a node by ID from the session cache.
+//
+// Returns nil if no session exists or if the session has no node reference.
+//
+// This allows the session cache to act as a local node lookup table.
+func (c *Cache) GetNodeByID(nodeID node.ID) *node.Node {
+	session := c.Get(nodeID)
+	if session == nil {
+		return nil
+	}
+
+	return session.GetNode()
+}
+
 // Close cleans up the cache and releases resources.
 func (c *Cache) Close() error {
 	c.mu.Lock()

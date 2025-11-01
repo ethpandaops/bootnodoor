@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"encoding/binary"
 	"fmt"
@@ -13,7 +14,6 @@ import (
 	"github.com/pk910/bootoor/discv5/enr"
 	"github.com/pk910/bootoor/discv5/node"
 	"github.com/pk910/bootoor/discv5/session"
-	"github.com/pk910/bootoor/discv5/table"
 	"github.com/sirupsen/logrus"
 )
 
@@ -25,9 +25,9 @@ type Transport interface {
 // PendingHandshake tracks a message waiting for handshake completion
 type PendingHandshake struct {
 	Message   Message
+	ToNode    *node.Node
 	ToAddr    *net.UDPAddr
 	ToNodeID  node.ID
-	Challenge *WHOAREYOUChallenge
 	CreatedAt time.Time
 }
 
@@ -35,10 +35,21 @@ type PendingHandshake struct {
 type PendingChallenge struct {
 	ToAddr        *net.UDPAddr
 	ToNodeID      node.ID
-	Challenge     *WHOAREYOUChallenge
-	ChallengeData []byte // The raw WHOAREYOU packet bytes for signature verification
+	ChallengeData []byte
 	CreatedAt     time.Time
 }
+
+// OnHandshakeCompleteCallback is called when a handshake completes successfully.
+type OnHandshakeCompleteCallback func(n *node.Node, incoming bool)
+
+// OnNodeUpdateCallback is called when a node's ENR is updated.
+type OnNodeUpdateCallback func(n *node.Node)
+
+// OnFindNodeCallback is called when a FINDNODE request is received.
+type OnFindNodeCallback func(msg *FindNode) []*node.Node
+
+// OnTalkReqCallback is called when a TALKREQ request is received.
+type OnTalkReqCallback func(msg *TalkReq) []byte
 
 // Handler handles incoming and outgoing protocol messages.
 //
@@ -48,14 +59,11 @@ type PendingChallenge struct {
 //   - Managing request/response matching
 //   - Applying response filters (LAN/WAN awareness)
 type Handler struct {
-	// localNode is our node information
-	localNode *node.Node
+	// config holds the handler configuration
+	config HandlerConfig
 
-	// table is the routing table
-	table *table.Table
-
-	// sessions manages encrypted sessions with peers
-	sessions *session.Cache
+	// ctx is the context for cancellation
+	ctx context.Context
 
 	// requests tracks pending requests
 	requests *RequestTracker
@@ -66,30 +74,25 @@ type Handler struct {
 	// pendingChallenges tracks WHOAREYOU challenges we've sent (key: nodeID+addr)
 	pendingChallenges map[string]*PendingChallenge
 
-	// responseFilter is applied when serving FINDNODE responses (Stage 2)
-	responseFilter ResponseFilter
+	// pendingPerIP tracks the number of pending entries per IP address
+	pendingPerIP map[string]int
 
 	// transport is used to send UDP packets
 	transport Transport
 
-	// logger for debug messages
-	logger logrus.FieldLogger
-
-	// privateKey is our node's private key (needed for handshake signatures)
-	privateKey *ecdsa.PrivateKey
-
 	// mu protects handler state
 	mu sync.RWMutex
 
-	// stopChan signals the cleanup routine to stop
-	stopChan chan struct{}
-
 	// Stats
-	packetsReceived   int
-	packetsSent       int
-	invalidPackets    int
-	filteredResponses int
-	findNodeReceived  int
+	packetsReceived      int
+	packetsSent          int
+	invalidPackets       int
+	filteredResponses    int
+	findNodeReceived     int
+	rejectedHandshakes   int
+	rejectedChallenges   int
+	evictedHandshakes    int
+	evictedChallenges    int
 }
 
 const (
@@ -101,6 +104,15 @@ const (
 
 	// cleanupInterval is how often we run the cleanup routine
 	cleanupInterval = 10 * time.Second
+
+	// defaultMaxPendingHandshakes is the default maximum number of pending outgoing handshakes
+	defaultMaxPendingHandshakes = 2000
+
+	// defaultMaxPendingChallenges is the default maximum number of pending incoming challenges
+	defaultMaxPendingChallenges = 500
+
+	// defaultMaxPendingPerIP is the default maximum number of pending entries per IP
+	defaultMaxPendingPerIP = 10
 )
 
 // HandlerConfig contains configuration for the protocol handler.
@@ -108,20 +120,32 @@ type HandlerConfig struct {
 	// LocalNode is our node information
 	LocalNode *node.Node
 
-	// Table is the routing table
-	Table *table.Table
-
 	// Sessions is the session cache
 	Sessions *session.Cache
 
 	// PrivateKey is the node's private key (for handshake signatures)
 	PrivateKey *ecdsa.PrivateKey
 
+	// Callbacks (all optional, can be nil)
+	OnHandshakeComplete OnHandshakeCompleteCallback
+	OnNodeUpdate        OnNodeUpdateCallback
+	OnFindNode          OnFindNodeCallback
+	OnTalkReq           OnTalkReqCallback
+
 	// ResponseFilter is applied when serving FINDNODE responses (Stage 2)
 	ResponseFilter ResponseFilter
 
 	// RequestTimeout is the timeout for requests
 	RequestTimeout time.Duration
+
+	// MaxPendingHandshakes is the maximum number of pending outgoing handshakes (0 = 2000)
+	MaxPendingHandshakes int
+
+	// MaxPendingChallenges is the maximum number of pending incoming challenges (0 = 500)
+	MaxPendingChallenges int
+
+	// MaxPendingPerIP is the maximum number of pending entries per IP address (0 = 10)
+	MaxPendingPerIP int
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
@@ -133,26 +157,33 @@ type HandlerConfig struct {
 //
 //	handler := NewHandler(HandlerConfig{
 //	    LocalNode: myNode,
-//	    Table: routingTable,
 //	    Sessions: sessionCache,
+//	    OnFindNode: func(msg *FindNode) []*node.Node { ... },
 //	    ResponseFilter: LANAwareResponseFilter(),
 //	})
-func NewHandler(cfg HandlerConfig) *Handler {
+func NewHandler(ctx context.Context, cfg HandlerConfig) *Handler {
 	if cfg.ResponseFilter == nil {
 		cfg.ResponseFilter = LANAwareResponseFilter()
 	}
 
+	// Apply defaults for limits
+	if cfg.MaxPendingHandshakes <= 0 {
+		cfg.MaxPendingHandshakes = defaultMaxPendingHandshakes
+	}
+	if cfg.MaxPendingChallenges <= 0 {
+		cfg.MaxPendingChallenges = defaultMaxPendingChallenges
+	}
+	if cfg.MaxPendingPerIP <= 0 {
+		cfg.MaxPendingPerIP = defaultMaxPendingPerIP
+	}
+
 	h := &Handler{
-		localNode:         cfg.LocalNode,
-		table:             cfg.Table,
-		sessions:          cfg.Sessions,
+		config:            cfg,
+		ctx:               ctx,
 		requests:          NewRequestTracker(cfg.RequestTimeout),
 		pendingHandshakes: make(map[string]*PendingHandshake),
 		pendingChallenges: make(map[string]*PendingChallenge),
-		responseFilter:    cfg.ResponseFilter,
-		privateKey:        cfg.PrivateKey,
-		logger:            cfg.Logger,
-		stopChan:          make(chan struct{}),
+		pendingPerIP:      make(map[string]int),
 	}
 
 	// Start cleanup routine for expired pending entries
@@ -168,6 +199,150 @@ func (h *Handler) SetTransport(transport Transport) {
 	h.transport = transport
 }
 
+// addPendingHandshake adds a pending handshake with limit checking and LRU eviction.
+// Must be called with h.mu locked.
+func (h *Handler) addPendingHandshake(key string, pending *PendingHandshake) bool {
+	ipKey := pending.ToAddr.IP.String()
+
+	// Check per-IP limit
+	if h.pendingPerIP[ipKey] >= h.config.MaxPendingPerIP {
+		h.rejectedHandshakes++
+		h.config.Logger.WithFields(logrus.Fields{
+			"ip":    ipKey,
+			"count": h.pendingPerIP[ipKey],
+			"limit": h.config.MaxPendingPerIP,
+		}).Debug("handler: rejected pending handshake, per-IP limit reached")
+		return false
+	}
+
+	// Check global limit
+	if len(h.pendingHandshakes) >= h.config.MaxPendingHandshakes {
+		// Evict oldest
+		h.evictOldestHandshake()
+	}
+
+	// Add the entry
+	h.pendingHandshakes[key] = pending
+	h.pendingPerIP[ipKey]++
+
+	return true
+}
+
+// removePendingHandshake removes a pending handshake and updates counters.
+// Must be called with h.mu locked.
+func (h *Handler) removePendingHandshake(key string, pending *PendingHandshake) {
+	delete(h.pendingHandshakes, key)
+	if pending != nil {
+		ipKey := pending.ToAddr.IP.String()
+		h.pendingPerIP[ipKey]--
+		if h.pendingPerIP[ipKey] <= 0 {
+			delete(h.pendingPerIP, ipKey)
+		}
+	}
+}
+
+// evictOldestHandshake removes the oldest pending handshake (LRU).
+// Must be called with h.mu locked.
+func (h *Handler) evictOldestHandshake() {
+	if len(h.pendingHandshakes) == 0 {
+		return
+	}
+
+	var oldestKey string
+	var oldestTime time.Time
+	var oldestPending *PendingHandshake
+	first := true
+
+	for key, pending := range h.pendingHandshakes {
+		if first || pending.CreatedAt.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = pending.CreatedAt
+			oldestPending = pending
+			first = false
+		}
+	}
+
+	h.removePendingHandshake(oldestKey, oldestPending)
+	h.evictedHandshakes++
+
+	h.config.Logger.WithFields(logrus.Fields{
+		"nodeID": oldestPending.ToNodeID.String()[:16],
+		"age":    time.Since(oldestTime),
+	}).Debug("handler: evicted oldest pending handshake")
+}
+
+// addPendingChallenge adds a pending challenge with limit checking and LRU eviction.
+// Must be called with h.mu locked.
+func (h *Handler) addPendingChallenge(key string, pending *PendingChallenge) bool {
+	ipKey := pending.ToAddr.IP.String()
+
+	// Check per-IP limit
+	if h.pendingPerIP[ipKey] >= h.config.MaxPendingPerIP {
+		h.rejectedChallenges++
+		h.config.Logger.WithFields(logrus.Fields{
+			"ip":    ipKey,
+			"count": h.pendingPerIP[ipKey],
+			"limit": h.config.MaxPendingPerIP,
+		}).Debug("handler: rejected pending challenge, per-IP limit reached")
+		return false
+	}
+
+	// Check global limit
+	if len(h.pendingChallenges) >= h.config.MaxPendingChallenges {
+		// Evict oldest
+		h.evictOldestChallenge()
+	}
+
+	// Add the entry
+	h.pendingChallenges[key] = pending
+	h.pendingPerIP[ipKey]++
+
+	return true
+}
+
+// removePendingChallenge removes a pending challenge and updates counters.
+// Must be called with h.mu locked.
+func (h *Handler) removePendingChallenge(key string, pending *PendingChallenge) {
+	delete(h.pendingChallenges, key)
+	if pending != nil {
+		ipKey := pending.ToAddr.IP.String()
+		h.pendingPerIP[ipKey]--
+		if h.pendingPerIP[ipKey] <= 0 {
+			delete(h.pendingPerIP, ipKey)
+		}
+	}
+}
+
+// evictOldestChallenge removes the oldest pending challenge (LRU).
+// Must be called with h.mu locked.
+func (h *Handler) evictOldestChallenge() {
+	if len(h.pendingChallenges) == 0 {
+		return
+	}
+
+	var oldestKey string
+	var oldestTime time.Time
+	var oldestPending *PendingChallenge
+	first := true
+
+	for key, pending := range h.pendingChallenges {
+		if first || pending.CreatedAt.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = pending.CreatedAt
+			oldestPending = pending
+			first = false
+		}
+	}
+
+	h.removePendingChallenge(oldestKey, oldestPending)
+	h.evictedChallenges++
+
+	h.config.Logger.WithFields(logrus.Fields{
+		"nodeID": oldestPending.ToNodeID.String()[:16],
+		"age":    time.Since(oldestTime),
+	}).Debug("handler: evicted oldest pending challenge")
+}
+
 // HandleIncomingPacket processes an incoming UDP packet.
 //
 // This is called by the UDP transport layer when a packet arrives.
@@ -177,13 +352,13 @@ func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr) error {
 	h.mu.Unlock()
 
 	// Decode packet (unmask header and authdata using our local node ID)
-	packet, err := DecodePacket(data, h.localNode.ID())
+	packet, err := DecodePacket(data, h.config.LocalNode.ID())
 	if err != nil {
 		h.mu.Lock()
 		h.invalidPackets++
 		h.mu.Unlock()
 
-		h.logger.WithFields(logrus.Fields{
+		h.config.Logger.WithFields(logrus.Fields{
 			"from":  from,
 			"error": err,
 		}).Debug("handler: invalid packet")
@@ -202,7 +377,7 @@ func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr) error {
 		h.mu.Lock()
 		h.invalidPackets++
 		h.mu.Unlock()
-		h.logger.WithFields(logrus.Fields{
+		h.config.Logger.WithFields(logrus.Fields{
 			"from": from,
 			"type": packet.PacketType,
 		}).Warn("handler: unknown packet type")
@@ -213,7 +388,7 @@ func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr) error {
 // handleOrdinaryPacket handles an ordinary encrypted packet.
 func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error {
 	// Look up session for this address
-	sess := h.sessions.GetByAddr(from)
+	sess := h.config.Sessions.GetByAddr(from)
 	if sess == nil {
 		// No session exists, send WHOAREYOU challenge
 		// Extract dest node ID from packet srcID (sender becomes receiver of WHOAREYOU)
@@ -247,7 +422,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 	// Decode message from plaintext
 	// Plaintext format: message-type (1 byte) + RLP-encoded message
 	if len(plaintext) < 1 {
-		h.logger.WithField("from", from).Debug("handler: message too short")
+		h.config.Logger.WithField("from", from).Debug("handler: message too short")
 		return fmt.Errorf("message too short")
 	}
 
@@ -257,7 +432,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 	// Convert to Message interface and decode RLP data into it
 	msg := h.createMessage(msgType)
 	if msg == nil {
-		h.logger.WithFields(logrus.Fields{
+		h.config.Logger.WithFields(logrus.Fields{
 			"from":    from,
 			"msgType": msgType,
 		}).Warn("handler: unknown message type")
@@ -267,7 +442,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 	// Decode RLP message data into the message struct
 	// ENR records in NODES messages will be properly decoded via the rlp.Decoder interface
 	if err := rlp.DecodeBytes(msgData, msg); err != nil {
-		h.logger.WithFields(logrus.Fields{
+		h.config.Logger.WithFields(logrus.Fields{
 			"from":  from,
 			"error": err,
 		}).Debug("handler: failed to decode message")
@@ -275,7 +450,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 	}
 
 	// Handle message based on type
-	return h.handleMessage(msg, sess.RemoteID, from)
+	return h.handleMessage(msg, sess.RemoteID, from, sess.GetNode())
 }
 
 // handleWHOAREYOUPacket handles a WHOAREYOU challenge.
@@ -301,19 +476,18 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error
 	}
 
 	remoteNodeID := pending.ToNodeID
+	remoteNode := pending.ToNode
 
-	// Get remote node from routing table to get its public key
-	remoteNode := h.table.Get(remoteNodeID)
-	if remoteNode == nil {
-		h.logger.WithField("remoteID", remoteNodeID).Warn("handler: remote node not in table")
-		return fmt.Errorf("remote node not in table: %s", remoteNodeID)
+	// Get remote node's public key from the stored node
+	var remotePubKey *ecdsa.PublicKey
+	if remoteNode != nil {
+		remotePubKey = remoteNode.PublicKey()
 	}
 
-	// Extract remote node's secp256k1 public key from ENR
-	remotePubKey := remoteNode.PublicKey()
+	// If we don't have the node info, we can't complete handshake
 	if remotePubKey == nil {
-		h.logger.Warn("handler: remote node has no public key")
-		return fmt.Errorf("remote node has no public key")
+		h.config.Logger.WithField("remoteID", remoteNodeID).Warn("handler: no node information available for handshake")
+		return fmt.Errorf("no node information available for handshake: %s", remoteNodeID)
 	}
 
 	// Generate ephemeral ECDH key pair
@@ -329,16 +503,16 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error
 	challengeData := packet.HeaderData
 
 	// Create ID nonce signature
-	signature, err := makeIDSignature(h.privateKey, challengeData, ephPubkey, remoteNodeID)
+	signature, err := makeIDSignature(h.config.PrivateKey, challengeData, ephPubkey, remoteNodeID)
 	if err != nil {
 		return fmt.Errorf("failed to create ID signature: %w", err)
 	}
 
 	// Derive session keys using HKDF
 	// We are the initiator (we sent the random packet first)
-	sessionKeys, err := deriveKeys(ephKey, remotePubKey, h.localNode.ID(), remoteNodeID, challengeData)
+	sessionKeys, err := deriveKeys(ephKey, remotePubKey, h.config.LocalNode.ID(), remoteNodeID, challengeData)
 	if err != nil {
-		h.logger.WithError(err).Error("handler: failed to derive session keys")
+		h.config.Logger.WithError(err).Error("handler: failed to derive session keys")
 		return fmt.Errorf("failed to derive session keys: %w", err)
 	}
 
@@ -346,11 +520,11 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error
 	// - If ENRSeq is 0, they don't have our ENR, so always send it
 	// - If ENRSeq > 0, only send if our seq is higher
 	var enrBytes []byte
-	localENR := h.localNode.Record()
+	localENR := h.config.LocalNode.Record()
 	if packet.Challenge.ENRSeq == 0 || packet.Challenge.ENRSeq < localENR.Seq() {
 		enrBytes, err = localENR.EncodeRLP()
 		if err != nil {
-			h.logger.WithError(err).Warn("handler: failed to encode ENR")
+			h.config.Logger.WithError(err).Warn("handler: failed to encode ENR")
 		} else {
 		}
 	}
@@ -373,7 +547,7 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error
 
 	// Build unmasked header data for GCM authentication
 	// This returns: maskingIV, unmasked headerData (IV || header || authdata)
-	maskingIV, headerData, err := BuildHandshakeHeaderData(h.localNode.ID(), nonce,
+	maskingIV, headerData, err := BuildHandshakeHeaderData(h.config.LocalNode.ID(), nonce,
 		signature, ephPubkey, enrBytes)
 	if err != nil {
 		return fmt.Errorf("failed to build header data: %w", err)
@@ -387,7 +561,7 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error
 
 	// Encode final handshake packet with encrypted message
 	// This uses the same maskingIV to ensure consistency
-	packetBytes, err := EncodeHandshakePacket(h.localNode.ID(), remoteNodeID, maskingIV, nonce,
+	packetBytes, err := EncodeHandshakePacket(h.config.LocalNode.ID(), remoteNodeID, maskingIV, nonce,
 		signature, ephPubkey, enrBytes, ciphertext)
 	if err != nil {
 		return fmt.Errorf("failed to encode handshake packet: %w", err)
@@ -401,11 +575,24 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error
 		true, // we are the initiator
 		12*time.Hour,
 	)
-	h.sessions.Put(sess)
+
+	// Try to get the node from a previous session to set it
+	if existingSess := h.config.Sessions.Get(remoteNodeID); existingSess != nil {
+		if existingNode := existingSess.GetNode(); existingNode != nil {
+			sess.SetNode(existingNode)
+		}
+	}
+
+	h.config.Sessions.Put(sess)
+
+	// Call OnHandshakeComplete callback for outgoing handshake
+	if sess.GetNode() != nil && h.config.OnHandshakeComplete != nil {
+		h.config.OnHandshakeComplete(sess.GetNode(), false) // incoming = false
+	}
 
 	// Remove pending handshake
 	h.mu.Lock()
-	delete(h.pendingHandshakes, pendingKey)
+	h.removePendingHandshake(pendingKey, pending)
 	h.mu.Unlock()
 
 	// Send handshake packet
@@ -481,10 +668,10 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 	pendingChallenge, exists := h.pendingChallenges[challengeKey]
 	if !exists {
 		h.mu.Unlock()
-		h.logger.WithField("from", from).Debug("handler: no pending challenge found for handshake")
+		h.config.Logger.WithField("from", from).Debug("handler: no pending challenge found for handshake")
 		return fmt.Errorf("no pending challenge for handshake from %s", from)
 	}
-	delete(h.pendingChallenges, challengeKey)
+	h.removePendingChallenge(challengeKey, pendingChallenge)
 	h.mu.Unlock()
 
 	// Get sender's static public key for signature verification
@@ -494,11 +681,11 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 	if len(packet.Handshake.ENR) > 0 {
 		enrRecord := &enr.Record{}
 		if err := enrRecord.DecodeRLPBytes(packet.Handshake.ENR); err != nil {
-			h.logger.WithError(err).Warn("handler: failed to decode ENR from handshake")
+			h.config.Logger.WithError(err).Warn("handler: failed to decode ENR from handshake")
 		} else {
 			remoteNode, err := node.New(enrRecord)
 			if err != nil {
-				h.logger.WithError(err).Warn("handler: failed to create node from ENR")
+				h.config.Logger.WithError(err).Warn("handler: failed to create node from ENR")
 			} else {
 				remoteNodeFromENR = remoteNode
 				senderPubKey = remoteNode.PublicKey()
@@ -506,18 +693,10 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 		}
 	}
 
-	// Fall back to routing table if ENR not present or failed to decode
+	// ENR is required in handshake packet for signature verification
 	if senderPubKey == nil {
-		senderNode := h.table.Get(sourceNodeID)
-		if senderNode == nil {
-			h.logger.WithField("sourceNodeID", sourceNodeID.String()[:16]).Warn("handler: sender node not in table and no ENR provided")
-			return fmt.Errorf("sender node not in table and no ENR provided")
-		}
-		senderPubKey = senderNode.PublicKey()
-		if senderPubKey == nil {
-			h.logger.Warn("handler: sender node has no public key")
-			return fmt.Errorf("sender node has no public key")
-		}
+		h.config.Logger.WithField("sourceNodeID", sourceNodeID.String()[:16]).Warn("handler: no ENR provided in handshake packet")
+		return fmt.Errorf("no ENR provided in handshake packet")
 	}
 
 	// Decode ephemeral public key (for ECDH)
@@ -530,22 +709,22 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 	// The signature is over: "discovery v5 identity proof" || challenge-data || ephemeral-pubkey || dest-id
 	// where challenge-data is the WHOAREYOU packet bytes and dest-id is our local node ID
 	if !verifyIDSignature(senderPubKey, packet.Handshake.Signature, pendingChallenge.ChallengeData,
-		packet.Handshake.EphemeralPubKey, h.localNode.ID()) {
-		h.logger.WithField("from", from).Warn("handler: invalid handshake signature")
+		packet.Handshake.EphemeralPubKey, h.config.LocalNode.ID()) {
+		h.config.Logger.WithField("from", from).Warn("handler: invalid handshake signature")
 		return fmt.Errorf("invalid handshake signature")
 	}
 
 	// Derive session keys
 	// We are the recipient (we sent the WHOAREYOU), they are the initiator
 	sessionKeys, err := deriveKeys(
-		h.privateKey,                   // Our private key
+		h.config.PrivateKey,            // Our private key
 		ephPubKey,                      // Their ephemeral public key
 		sourceNodeID,                   // Initiator ID (them)
-		h.localNode.ID(),               // Recipient ID (us)
+		h.config.LocalNode.ID(),        // Recipient ID (us)
 		pendingChallenge.ChallengeData, // Challenge data as salt
 	)
 	if err != nil {
-		h.logger.WithError(err).Error("handler: failed to derive session keys")
+		h.config.Logger.WithError(err).Error("handler: failed to derive session keys")
 		return fmt.Errorf("failed to derive session keys: %w", err)
 	}
 
@@ -558,7 +737,7 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 		packet.Message,
 	)
 	if err != nil {
-		h.logger.WithError(err).Error("handler: failed to decrypt handshake message")
+		h.config.Logger.WithError(err).Error("handler: failed to decrypt handshake message")
 		return fmt.Errorf("failed to decrypt handshake message: %w", err)
 	}
 
@@ -570,16 +749,19 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 		false, // we are the recipient, not the initiator
 		12*time.Hour,
 	)
-	h.sessions.Put(sess)
+	h.config.Sessions.Put(sess)
 
-	h.logger.WithFields(logrus.Fields{
+	h.config.Logger.WithFields(logrus.Fields{
 		"sourceNodeID": sourceNodeID.String()[:16],
 		"from":         from,
 	}).Info("handler: session established successfully")
 
-	// Add node to routing table if we extracted it from the ENR
+	// Store node in session and call OnHandshakeComplete callback
 	if remoteNodeFromENR != nil {
-		h.table.Add(remoteNodeFromENR)
+		sess.SetNode(remoteNodeFromENR)
+		if h.config.OnHandshakeComplete != nil {
+			h.config.OnHandshakeComplete(remoteNodeFromENR, true) // incoming = true
+		}
 	}
 
 	// Decode and process the message
@@ -593,36 +775,41 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 	// Convert to Message interface and decode
 	msg := h.createMessage(msgType)
 	if msg == nil {
-		h.logger.WithField("msgType", msgType).Warn("handler: unknown message type in handshake")
+		h.config.Logger.WithField("msgType", msgType).Warn("handler: unknown message type in handshake")
 		return fmt.Errorf("unknown message type: %d", msgType)
 	}
 
 	if err := rlp.DecodeBytes(msgData, msg); err != nil {
-		h.logger.WithError(err).Error("handler: failed to decode handshake message")
+		h.config.Logger.WithError(err).Error("handler: failed to decode handshake message")
 		return fmt.Errorf("failed to decode message: %w", err)
 	}
 
 	// Handle the message
-	return h.handleMessage(msg, sourceNodeID, from)
+	return h.handleMessage(msg, sourceNodeID, from, sess.GetNode())
 }
 
 // handleMessage dispatches a decoded message to the appropriate handler.
-func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr) error {
+func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+	if remoteNode != nil {
+		remoteNode.SetLastSeen(time.Now())
+		remoteNode.ResetFailureCount()
+	}
+
 	switch msg.Type() {
 	case PingMsg:
-		return h.handlePing(msg.(*Ping), remoteID, from)
+		return h.handlePing(msg.(*Ping), remoteID, from, remoteNode)
 	case PongMsg:
-		return h.handlePong(msg.(*Pong), remoteID, from)
+		return h.handlePong(msg.(*Pong), remoteID, from, remoteNode)
 	case FindNodeMsg:
-		return h.handleFindNode(msg.(*FindNode), remoteID, from)
+		return h.handleFindNode(msg.(*FindNode), remoteID, from, remoteNode)
 	case NodesMsg:
 		return h.handleNodes(msg.(*Nodes), remoteID, from)
 	case TalkReqMsg:
-		return h.handleTalkReq(msg.(*TalkReq), remoteID, from)
+		return h.handleTalkReq(msg.(*TalkReq), remoteID, from, remoteNode)
 	case TalkRespMsg:
 		return h.handleTalkResp(msg.(*TalkResp), remoteID, from)
 	default:
-		h.logger.Debug("handler: unknown message type",
+		h.config.Logger.Debug("handler: unknown message type",
 			"type", msg.Type(),
 			"from", from,
 		)
@@ -631,40 +818,39 @@ func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr
 }
 
 // handlePing handles a PING message.
-func (h *Handler) handlePing(msg *Ping, remoteID node.ID, from *net.UDPAddr) error {
-	h.logger.WithFields(logrus.Fields{
+func (h *Handler) handlePing(msg *Ping, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+	h.config.Logger.WithFields(logrus.Fields{
 		"from":   from,
 		"nodeID": remoteID,
 	}).Debug("handler: received PING")
 
 	// Check if remote has a higher ENR sequence than what we have
-	if existingNode := h.table.Get(remoteID); existingNode != nil {
-		if msg.ENRSeq > existingNode.Record().Seq() {
-			h.logger.WithFields(logrus.Fields{
+	if remoteNode != nil {
+		if msg.ENRSeq > remoteNode.Record().Seq() {
+			h.config.Logger.WithFields(logrus.Fields{
 				"nodeID":   remoteID.String()[:16],
-				"ourSeq":   existingNode.Record().Seq(),
+				"ourSeq":   remoteNode.Record().Seq(),
 				"theirSeq": msg.ENRSeq,
 			}).Debug("handler: remote has newer ENR, requesting update")
-			// Request the updated ENR immediately via FINDNODE distance 0
-			h.requestENRUpdate(existingNode)
+			h.requestENRUpdate(remoteNode)
 		}
 	}
 
 	// Create PONG response
 	pong := &Pong{
 		RequestID: msg.RequestID,
-		ENRSeq:    h.localNode.Record().Seq(),
+		ENRSeq:    h.config.LocalNode.Record().Seq(),
 		IP:        from.IP,
 		Port:      uint16(from.Port),
 	}
 
 	// Send PONG
-	return h.sendMessage(pong, remoteID, from)
+	return h.SendMessage(pong, remoteID, from, nil)
 }
 
 // handlePong handles a PONG message.
-func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr) error {
-	h.logger.WithFields(logrus.Fields{
+func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+	h.config.Logger.WithFields(logrus.Fields{
 		"from":   from,
 		"nodeID": remoteID,
 	}).Debug("handler: received PONG")
@@ -673,19 +859,16 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr) err
 	h.requests.MatchResponse(msg.RequestID, remoteID, msg)
 
 	// Update node's last seen time
-	if n := h.table.Get(remoteID); n != nil {
-		n.SetLastSeen(time.Now())
-		n.ResetFailureCount()
-
+	if remoteNode != nil {
 		// Check if remote has a higher ENR sequence than what we have
-		if msg.ENRSeq > n.Record().Seq() {
-			h.logger.WithFields(logrus.Fields{
+		if msg.ENRSeq > remoteNode.Record().Seq() {
+			h.config.Logger.WithFields(logrus.Fields{
 				"nodeID":   remoteID.String()[:16],
-				"ourSeq":   n.Record().Seq(),
+				"ourSeq":   remoteNode.Record().Seq(),
 				"theirSeq": msg.ENRSeq,
 			}).Debug("handler: remote has newer ENR, requesting update")
 			// Request the updated ENR immediately via FINDNODE distance 0
-			h.requestENRUpdate(n)
+			h.requestENRUpdate(remoteNode)
 		}
 	}
 
@@ -693,12 +876,12 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr) err
 }
 
 // handleFindNode handles a FINDNODE message.
-func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPAddr) error {
+func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
 	h.mu.Lock()
 	h.findNodeReceived++
 	h.mu.Unlock()
 
-	h.logger.WithFields(logrus.Fields{
+	h.config.Logger.WithFields(logrus.Fields{
 		"from":      from,
 		"nodeID":    remoteID,
 		"distances": msg.Distances,
@@ -709,51 +892,27 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 
 	if len(msg.Distances) == 1 && msg.Distances[0] == 0 {
 		// Special case: distance 0 means "return your own ENR"
-		nodes = []*node.Node{h.localNode}
-		h.logger.WithFields(logrus.Fields{
+		nodes = []*node.Node{h.config.LocalNode}
+		h.config.Logger.WithFields(logrus.Fields{
 			"from":   from,
 			"nodeID": remoteID.String()[:16],
 		}).Debug("handler: FINDNODE distance 0, returning our ENR")
-	} else if len(msg.Distances) == 1 && msg.Distances[0] == 256 {
-		// Special case: return all nodes
-		nodes = h.table.FindClosestNodes(h.localNode.ID(), 16)
 	} else {
-		// Find nodes at requested distances
-		// Collect nodes from buckets matching the requested distances
-		var collectedNodes []*node.Node
-		for _, distance := range msg.Distances {
-			// Validate distance is in valid range (0-255)
-			if distance >= 256 {
-				h.logger.WithFields(logrus.Fields{
-					"from":     from,
-					"nodeID":   remoteID.String()[:16],
-					"distance": distance,
-				}).Debug("handler: FINDNODE invalid distance, skipping")
-				continue
-			}
-
-			// Get nodes from the bucket at this distance
-			bucketNodes := h.table.GetBucketNodes(int(distance))
-			collectedNodes = append(collectedNodes, bucketNodes...)
-
-			// Limit total nodes to 16 (standard Kademlia bucket size)
-			if len(collectedNodes) >= 16 {
-				collectedNodes = collectedNodes[:16]
-				break
-			}
+		// Use OnFindNode callback to get nodes
+		if h.config.OnFindNode != nil {
+			nodes = h.config.OnFindNode(msg)
 		}
-		nodes = collectedNodes
 
-		h.logger.WithFields(logrus.Fields{
+		h.config.Logger.WithFields(logrus.Fields{
 			"from":      from,
 			"nodeID":    remoteID.String()[:16],
 			"distances": msg.Distances,
 			"found":     len(nodes),
-		}).Debug("handler: FINDNODE distance-based lookup completed")
+		}).Debug("handler: FINDNODE lookup completed via callback")
 	}
 
 	// Apply response filter (Stage 2)
-	filteredNodes := FilterNodes(from, nodes, h.responseFilter)
+	filteredNodes := FilterNodes(from, nodes, h.config.ResponseFilter)
 
 	if len(filteredNodes) < len(nodes) {
 		h.mu.Lock()
@@ -791,7 +950,7 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 			Records:   records,
 		}
 
-		if err := h.sendMessage(nodesMsg, remoteID, from); err != nil {
+		if err := h.SendMessage(nodesMsg, remoteID, from, remoteNode); err != nil {
 			return err
 		}
 	}
@@ -801,7 +960,7 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 
 // handleNodes handles a NODES message.
 func (h *Handler) handleNodes(msg *Nodes, remoteID node.ID, from *net.UDPAddr) error {
-	h.logger.WithFields(logrus.Fields{
+	h.config.Logger.WithFields(logrus.Fields{
 		"from":   from,
 		"nodeID": remoteID,
 		"count":  len(msg.Records),
@@ -810,46 +969,38 @@ func (h *Handler) handleNodes(msg *Nodes, remoteID node.ID, from *net.UDPAddr) e
 	// Match with pending request
 	h.requests.MatchResponse(msg.RequestID, remoteID, msg)
 
-	// Add discovered nodes to routing table
-	for _, record := range msg.Records {
-		n, err := node.New(record)
-		if err != nil {
-			h.logger.WithFields(logrus.Fields{
-				"from":   from,
-				"nodeID": remoteID,
-				"error":  err,
-			}).Debug("handler: invalid node in NODES response")
-			continue
-		}
-
-		// Try to add to routing table (will apply admission filter)
-		h.table.Add(n)
-	}
+	// Note: discovered nodes are handled by the application via the response channel
+	// The bootnode service will receive these nodes and decide what to do with them
+	// (add to table, filter, etc.)
 
 	return nil
 }
 
 // handleTalkReq handles a TALKREQ message.
-func (h *Handler) handleTalkReq(msg *TalkReq, remoteID node.ID, from *net.UDPAddr) error {
-	h.logger.WithFields(logrus.Fields{
+func (h *Handler) handleTalkReq(msg *TalkReq, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+	h.config.Logger.WithFields(logrus.Fields{
 		"from":     from,
 		"nodeID":   remoteID,
 		"protocol": string(msg.Protocol),
 	}).Debug("handler: received TALKREQ")
 
-	// For now, send empty TALKRESP
-	// Applications can register custom TALK handlers
-	resp := &TalkResp{
-		RequestID: msg.RequestID,
-		Response:  []byte{},
+	// Use OnTalkReq callback to handle the request
+	var respData []byte
+	if h.config.OnTalkReq != nil {
+		respData = h.config.OnTalkReq(msg)
 	}
 
-	return h.sendMessage(resp, remoteID, from)
+	resp := &TalkResp{
+		RequestID: msg.RequestID,
+		Response:  respData,
+	}
+
+	return h.SendMessage(resp, remoteID, from, remoteNode)
 }
 
 // handleTalkResp handles a TALKRESP message.
 func (h *Handler) handleTalkResp(msg *TalkResp, remoteID node.ID, from *net.UDPAddr) error {
-	h.logger.WithFields(logrus.Fields{
+	h.config.Logger.WithFields(logrus.Fields{
 		"from":   from,
 		"nodeID": remoteID,
 	}).Debug("handler: received TALKRESP")
@@ -860,10 +1011,14 @@ func (h *Handler) handleTalkResp(msg *TalkResp, remoteID node.ID, from *net.UDPA
 	return nil
 }
 
-// sendMessage sends a message to a remote node.
-func (h *Handler) sendMessage(msg Message, remoteID node.ID, to *net.UDPAddr) error {
+// SendMessage sends a message to a remote node.
+//
+// This is a public method that can be used by higher-level services
+// to send arbitrary messages through the protocol handler.
+// remoteNode is optional - if provided, it will be stored in pending handshakes for WHOAREYOU responses.
+func (h *Handler) SendMessage(msg Message, remoteID node.ID, to *net.UDPAddr, remoteNode *node.Node) error {
 	// Look up session
-	sess := h.sessions.Get(remoteID)
+	sess := h.config.Sessions.Get(remoteID)
 
 	var packetBytes []byte
 	var err error
@@ -872,19 +1027,32 @@ func (h *Handler) sendMessage(msg Message, remoteID node.ID, to *net.UDPAddr) er
 		// No session - send random packet to trigger WHOAREYOU from receiver
 
 		// Store pending message for handshake completion
+		// Include the node object if we have it (needed for handshake)
 		handshakeKey := makeHandshakeKey(remoteID, to)
-		h.mu.Lock()
-		h.pendingHandshakes[handshakeKey] = &PendingHandshake{
+		pending := &PendingHandshake{
 			Message:   msg,
+			ToNode:    remoteNode,
 			ToAddr:    to,
 			ToNodeID:  remoteID,
 			CreatedAt: time.Now(),
 		}
+
+		h.mu.Lock()
+		accepted := h.addPendingHandshake(handshakeKey, pending)
 		h.mu.Unlock()
+
+		if !accepted {
+			return fmt.Errorf("pending handshake limit reached")
+		}
+
+		// Log if we don't have node info for potential handshake
+		if remoteNode == nil {
+			h.config.Logger.WithField("remoteID", remoteID).Debug("handler: sending random packet without node info, may fail handshake if WHOAREYOU received")
+		}
 
 		// Encode random packet (go-ethereum style)
 		// This will be 91 bytes: IV(16) + header(23) + authdata(32) + random(20)
-		packetBytes, err = EncodeRandomPacket(h.localNode.ID(), remoteID)
+		packetBytes, err = EncodeRandomPacket(h.config.LocalNode.ID(), remoteID)
 		if err != nil {
 			return fmt.Errorf("failed to encode random packet: %w", err)
 		}
@@ -909,7 +1077,7 @@ func (h *Handler) sendMessage(msg Message, remoteID node.ID, to *net.UDPAddr) er
 		}
 
 		// Get local node ID
-		localNodeID := h.localNode.ID()
+		localNodeID := h.config.LocalNode.ID()
 
 		// Authdata for ordinary message with session: srcID (32 bytes)
 		authdata := localNodeID[:]
@@ -953,7 +1121,7 @@ func (h *Handler) sendMessage(msg Message, remoteID node.ID, to *net.UDPAddr) er
 	h.packetsSent++
 	h.mu.Unlock()
 
-	h.logger.WithFields(logrus.Fields{
+	h.config.Logger.WithFields(logrus.Fields{
 		"type":   msg.Type(),
 		"to":     to,
 		"nodeID": remoteID,
@@ -965,7 +1133,6 @@ func (h *Handler) sendMessage(msg Message, remoteID node.ID, to *net.UDPAddr) er
 
 // sendWHOAREYOU sends a WHOAREYOU challenge.
 func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
-
 	// Generate random ID nonce for the challenge (32 bytes, but only first 16 used)
 	idNonce, err := crypto.GenerateRandomBytes(32)
 	if err != nil {
@@ -980,8 +1147,10 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
 
 	// Get the current ENR sequence we have for this node
 	enrSeq := uint64(0)
-	if existingNode := h.table.Get(destNodeID); existingNode != nil {
-		enrSeq = existingNode.Record().Seq()
+	if sess := h.config.Sessions.Get(destNodeID); sess != nil {
+		if existingNode := sess.GetNode(); existingNode != nil {
+			enrSeq = existingNode.Record().Seq()
+		}
 	}
 
 	// Create WHOAREYOU challenge
@@ -992,7 +1161,7 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
 
 	// Encode WHOAREYOU packet (go-ethereum style)
 	// This will be 63 bytes: IV(16) + header(23) + authdata(24)
-	packetBytes, maskingIV, err := EncodeWHOAREYOUPacketWithIV(destNodeID, nonce, challenge)
+	packetBytes, maskingIV, err := EncodeWHOAREYOUPacket(destNodeID, nonce, challenge)
 	if err != nil {
 		return fmt.Errorf("failed to encode WHOAREYOU packet: %w", err)
 	}
@@ -1004,15 +1173,25 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
 
 	// Store the challenge so we can verify the handshake response
 	challengeKey := makeHandshakeKey(destNodeID, to)
-	h.mu.Lock()
-	h.pendingChallenges[challengeKey] = &PendingChallenge{
+	pendingChallenge := &PendingChallenge{
 		ToAddr:        to,
 		ToNodeID:      destNodeID,
-		Challenge:     challenge,
 		ChallengeData: challengeData,
 		CreatedAt:     time.Now(),
 	}
+
+	h.mu.Lock()
+	accepted := h.addPendingChallenge(challengeKey, pendingChallenge)
 	h.mu.Unlock()
+
+	if !accepted {
+		// Challenge rejected due to limits - still send it but won't be able to verify handshake
+		h.config.Logger.WithFields(logrus.Fields{
+			"to":     to,
+			"nodeID": destNodeID.String()[:16],
+		}).Debug("handler: pending challenge limit reached, sending WHOAREYOU anyway")
+		// Continue anyway - they might retry and succeed later
+	}
 
 	// Send via UDP transport
 	h.mu.RLock()
@@ -1039,7 +1218,7 @@ func (h *Handler) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			h.cleanupExpiredEntries()
-		case <-h.stopChan:
+		case <-h.ctx.Done():
 			return
 		}
 	}
@@ -1052,30 +1231,38 @@ func (h *Handler) cleanupExpiredEntries() {
 	h.mu.Lock()
 
 	// Clean up expired pending handshakes
-	expiredHandshakes := 0
+	var toRemoveHandshakes []string
 	for key, pending := range h.pendingHandshakes {
 		if now.Sub(pending.CreatedAt) > pendingHandshakeTimeout {
-			delete(h.pendingHandshakes, key)
-			expiredHandshakes++
+			toRemoveHandshakes = append(toRemoveHandshakes, key)
 		}
 	}
+	for _, key := range toRemoveHandshakes {
+		pending := h.pendingHandshakes[key]
+		h.removePendingHandshake(key, pending)
+	}
+	expiredHandshakes := len(toRemoveHandshakes)
 
 	// Clean up expired pending challenges
-	expiredChallenges := 0
+	var toRemoveChallenges []string
 	for key, pending := range h.pendingChallenges {
 		if now.Sub(pending.CreatedAt) > pendingChallengeTimeout {
-			delete(h.pendingChallenges, key)
-			expiredChallenges++
+			toRemoveChallenges = append(toRemoveChallenges, key)
 		}
 	}
+	for _, key := range toRemoveChallenges {
+		pending := h.pendingChallenges[key]
+		h.removePendingChallenge(key, pending)
+	}
+	expiredChallenges := len(toRemoveChallenges)
 
 	h.mu.Unlock()
 
 	// Clean up expired sessions
-	expiredSessions := h.sessions.CleanupExpired()
+	expiredSessions := h.config.Sessions.CleanupExpired()
 
 	if expiredHandshakes > 0 || expiredChallenges > 0 || expiredSessions > 0 {
-		h.logger.WithFields(logrus.Fields{
+		h.config.Logger.WithFields(logrus.Fields{
 			"expiredHandshakes": expiredHandshakes,
 			"expiredChallenges": expiredChallenges,
 			"expiredSessions":   expiredSessions,
@@ -1083,9 +1270,11 @@ func (h *Handler) cleanupExpiredEntries() {
 	}
 }
 
-// Close stops the handler and cleans up resources.
-func (h *Handler) Close() {
-	close(h.stopChan)
+// Requests returns the request tracker.
+//
+// This allows higher-level services to track pending requests.
+func (h *Handler) Requests() *RequestTracker {
+	return h.requests
 }
 
 // SendPing sends a PING to a remote node.
@@ -1099,15 +1288,15 @@ func (h *Handler) SendPing(n *node.Node) (<-chan *Response, error) {
 
 	ping := &Ping{
 		RequestID: requestID,
-		ENRSeq:    h.localNode.Record().Seq(),
+		ENRSeq:    h.config.LocalNode.Record().Seq(),
 	}
 
 	// Register pending request
 	respChan := h.requests.AddRequest(requestID, n.ID(), PingMsg)
 
-	// Send PING
-	if err := h.sendMessage(ping, n.ID(), n.Addr()); err != nil {
-		h.logger.WithFields(logrus.Fields{
+	// Send PING (pass node object so it's available for handshake if needed)
+	if err := h.SendMessage(ping, n.ID(), n.Addr(), n); err != nil {
+		h.config.Logger.WithFields(logrus.Fields{
 			"to":     n.Addr(),
 			"nodeID": n.ID(),
 			"error":  err,
@@ -1116,7 +1305,7 @@ func (h *Handler) SendPing(n *node.Node) (<-chan *Response, error) {
 		return nil, err
 	}
 
-	h.logger.WithFields(logrus.Fields{
+	h.config.Logger.WithFields(logrus.Fields{
 		"to":     n.Addr(),
 		"nodeID": n.ID(),
 	}).Debug("handler: PING sent successfully")
@@ -1130,7 +1319,7 @@ func (h *Handler) SendPing(n *node.Node) (<-chan *Response, error) {
 // The request is sent asynchronously and the response is handled in a goroutine.
 func (h *Handler) requestENRUpdate(n *node.Node) {
 	go func() {
-		h.logger.WithFields(logrus.Fields{
+		h.config.Logger.WithFields(logrus.Fields{
 			"nodeID": n.ID().String()[:16],
 			"addr":   n.Addr(),
 		}).Debug("handler: requesting ENR update via FINDNODE distance 0")
@@ -1138,7 +1327,7 @@ func (h *Handler) requestENRUpdate(n *node.Node) {
 		// Send FINDNODE with distance 0 (requests the node's own ENR)
 		respChan, err := h.SendFindNode(n, []uint{0})
 		if err != nil {
-			h.logger.WithFields(logrus.Fields{
+			h.config.Logger.WithFields(logrus.Fields{
 				"nodeID": n.ID().String()[:16],
 				"error":  err,
 			}).Debug("handler: failed to request ENR update")
@@ -1149,7 +1338,7 @@ func (h *Handler) requestENRUpdate(n *node.Node) {
 		select {
 		case resp := <-respChan:
 			if resp.Error != nil {
-				h.logger.WithFields(logrus.Fields{
+				h.config.Logger.WithFields(logrus.Fields{
 					"nodeID": n.ID().String()[:16],
 					"error":  resp.Error,
 				}).Debug("handler: ENR update request failed")
@@ -1159,14 +1348,14 @@ func (h *Handler) requestENRUpdate(n *node.Node) {
 			// The NODES response handler will automatically update the ENR in our table
 			nodesMsg, ok := resp.Message.(*Nodes)
 			if ok && len(nodesMsg.Records) > 0 {
-				h.logger.WithFields(logrus.Fields{
+				h.config.Logger.WithFields(logrus.Fields{
 					"nodeID": n.ID().String()[:16],
 					"count":  len(nodesMsg.Records),
 				}).Debug("handler: received ENR update")
 			}
 
 		case <-time.After(5 * time.Second):
-			h.logger.WithFields(logrus.Fields{
+			h.config.Logger.WithFields(logrus.Fields{
 				"nodeID": n.ID().String()[:16],
 			}).Debug("handler: ENR update request timed out")
 		}
@@ -1190,9 +1379,9 @@ func (h *Handler) SendFindNode(n *node.Node, distances []uint) (<-chan *Response
 	// Register pending request
 	respChan := h.requests.AddRequest(requestID, n.ID(), FindNodeMsg)
 
-	// Send FINDNODE
-	if err := h.sendMessage(findNode, n.ID(), n.Addr()); err != nil {
-		h.logger.WithFields(logrus.Fields{
+	// Send FINDNODE (pass node object so it's available for handshake if needed)
+	if err := h.SendMessage(findNode, n.ID(), n.Addr(), n); err != nil {
+		h.config.Logger.WithFields(logrus.Fields{
 			"to":        n.Addr(),
 			"nodeID":    n.ID(),
 			"distances": distances,
@@ -1202,7 +1391,7 @@ func (h *Handler) SendFindNode(n *node.Node, distances []uint) (<-chan *Response
 		return nil, err
 	}
 
-	h.logger.WithFields(logrus.Fields{
+	h.config.Logger.WithFields(logrus.Fields{
 		"to":        n.Addr(),
 		"nodeID":    n.ID(),
 		"distances": distances,
@@ -1213,14 +1402,19 @@ func (h *Handler) SendFindNode(n *node.Node, distances []uint) (<-chan *Response
 
 // GetStats returns handler statistics.
 type HandlerStats struct {
-	PacketsReceived   int
-	PacketsSent       int
-	InvalidPackets    int
-	FilteredResponses int
-	FindNodeReceived  int
-	PendingHandshakes int
-	PendingChallenges int
-	RequestStats      RequestStats
+	PacketsReceived    int
+	PacketsSent        int
+	InvalidPackets     int
+	FilteredResponses  int
+	FindNodeReceived   int
+	PendingHandshakes  int
+	PendingChallenges  int
+	RejectedHandshakes int
+	RejectedChallenges int
+	EvictedHandshakes  int
+	EvictedChallenges  int
+	PendingPerIPCount  int
+	RequestStats       RequestStats
 }
 
 // GetStats returns statistics about the handler.
@@ -1229,14 +1423,19 @@ func (h *Handler) GetStats() HandlerStats {
 	defer h.mu.RUnlock()
 
 	return HandlerStats{
-		PacketsReceived:   h.packetsReceived,
-		PacketsSent:       h.packetsSent,
-		InvalidPackets:    h.invalidPackets,
-		FilteredResponses: h.filteredResponses,
-		FindNodeReceived:  h.findNodeReceived,
-		PendingHandshakes: len(h.pendingHandshakes),
-		PendingChallenges: len(h.pendingChallenges),
-		RequestStats:      h.requests.GetStats(),
+		PacketsReceived:    h.packetsReceived,
+		PacketsSent:        h.packetsSent,
+		InvalidPackets:     h.invalidPackets,
+		FilteredResponses:  h.filteredResponses,
+		FindNodeReceived:   h.findNodeReceived,
+		PendingHandshakes:  len(h.pendingHandshakes),
+		PendingChallenges:  len(h.pendingChallenges),
+		RejectedHandshakes: h.rejectedHandshakes,
+		RejectedChallenges: h.rejectedChallenges,
+		EvictedHandshakes:  h.evictedHandshakes,
+		EvictedChallenges:  h.evictedChallenges,
+		PendingPerIPCount:  len(h.pendingPerIP),
+		RequestStats:       h.requests.GetStats(),
 	}
 }
 

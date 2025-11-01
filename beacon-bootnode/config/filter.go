@@ -1,4 +1,4 @@
-package clconfig
+package config
 
 import (
 	"encoding/binary"
@@ -549,4 +549,18 @@ func uint64ToBytes(v uint64) []byte {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, v)
 	return b
+}
+
+// ForkFilterStats contains statistics about fork digest filtering.
+type ForkFilterStats struct {
+	NetworkName     string
+	CurrentFork     string
+	CurrentDigest   string
+	GracePeriod     string
+	OldDigests      map[string]time.Duration
+	AcceptedCurrent int
+	AcceptedOld     int
+	RejectedInvalid int
+	RejectedExpired int
+	TotalChecks     int
 }

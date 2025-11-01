@@ -1,19 +1,20 @@
 package discv5
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"net"
 	"time"
 
-	"github.com/pk910/bootoor/discv5/enr"
-	"github.com/pk910/bootoor/discv5/node"
-	"github.com/pk910/bootoor/discv5/nodedb"
 	"github.com/pk910/bootoor/discv5/protocol"
 	"github.com/sirupsen/logrus"
 )
 
 // Config contains configuration for the discv5 service.
 type Config struct {
+	// Service context
+	Context context.Context
+
 	// PrivateKey is the node's private key
 	PrivateKey *ecdsa.PrivateKey
 
@@ -36,39 +37,28 @@ type Config struct {
 	// This should be the 16-byte encoded eth2 field containing fork digest and next fork info
 	ETH2Data []byte
 
-	// BootNodes are the initial nodes to connect to
-	BootNodes []*node.Node
+	// Callbacks (all optional, can be nil)
 
-	// NodeDB is the database for storing discovered nodes
-	// If nil, an in-memory database is used
-	NodeDB nodedb.DB
+	// OnHandshakeComplete is called when a handshake completes successfully
+	OnHandshakeComplete protocol.OnHandshakeCompleteCallback
 
-	// AdmissionFilter is applied before adding nodes to the routing table (Stage 1)
-	AdmissionFilter enr.ENRFilter
+	// OnNodeUpdate is called when a node's ENR is updated
+	OnNodeUpdate protocol.OnNodeUpdateCallback
+
+	// OnFindNode is called when a FINDNODE request is received
+	OnFindNode protocol.OnFindNodeCallback
+
+	// OnTalkReq is called when a TALKREQ request is received
+	OnTalkReq protocol.OnTalkReqCallback
 
 	// ResponseFilter is applied when serving FINDNODE responses (Stage 2)
 	ResponseFilter protocol.ResponseFilter
-
-	// MaxNodesPerIP is the maximum nodes allowed per IP address (default 10)
-	MaxNodesPerIP int
-
-	// EnableLANFiltering enables LAN/WAN awareness for response filtering (default true)
-	EnableLANFiltering bool
 
 	// SessionLifetime is how long sessions remain valid (default 12 hours)
 	SessionLifetime time.Duration
 
 	// MaxSessions is the maximum number of cached sessions (default 1000)
 	MaxSessions int
-
-	// PingInterval is how often to ping nodes (default 30 seconds)
-	PingInterval time.Duration
-
-	// MaxNodeAge is the maximum time since last seen (default 24 hours)
-	MaxNodeAge time.Duration
-
-	// MaxFailures is the maximum consecutive failures (default 3)
-	MaxFailures int
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
@@ -77,15 +67,10 @@ type Config struct {
 // DefaultConfig returns a default configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		BindIP:             net.IPv4zero,
-		BindPort:           9000,
-		MaxNodesPerIP:      10,
-		EnableLANFiltering: true,
-		SessionLifetime:    12 * time.Hour,
-		MaxSessions:        1000,
-		PingInterval:       30 * time.Second,
-		MaxNodeAge:         24 * time.Hour,
-		MaxFailures:        3,
+		BindIP:          net.IPv4zero,
+		BindPort:        9000,
+		SessionLifetime: 12 * time.Hour,
+		MaxSessions:     1000,
 	}
 }
 

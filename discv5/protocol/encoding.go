@@ -13,9 +13,10 @@ import (
 // EncodeRandomPacket encodes a random packet to trigger WHOAREYOU (go-ethereum style).
 //
 // Random packet format (no session):
-//   packet = masking-iv (16) || masked-header (23) || masked-authdata (32) || random-message (20)
-//   masking-key = dest-node-id[:16]
-//   mask = AES-CTR(masking-key, masking-iv)
+//
+//	packet = masking-iv (16) || masked-header (23) || masked-authdata (32) || random-message (20)
+//	masking-key = dest-node-id[:16]
+//	mask = AES-CTR(masking-key, masking-iv)
 //
 // The authdata for random packets contains: srcID (32 bytes)
 // The message is 20 bytes of random data
@@ -36,8 +37,8 @@ func EncodeRandomPacket(localNodeID, destNodeID node.ID) ([]byte, error) {
 	// protocol-id (6) || version (2) || flag (1) || nonce (12) || authsize (2)
 	staticHeader := make([]byte, 23)
 	copy(staticHeader[0:6], []byte("discv5"))
-	binary.BigEndian.PutUint16(staticHeader[6:8], 1)     // version
-	staticHeader[8] = OrdinaryPacket                      // flag = ordinary message (0x00)
+	binary.BigEndian.PutUint16(staticHeader[6:8], 1) // version
+	staticHeader[8] = OrdinaryPacket                 // flag = ordinary message (0x00)
 	copy(staticHeader[9:21], nonce)
 	binary.BigEndian.PutUint16(staticHeader[21:23], 32) // authsize = 32 bytes (srcID)
 
@@ -95,8 +96,8 @@ func BuildOrdinaryHeaderData(localNodeID node.ID, nonce, authdata []byte) ([]byt
 	// Build static header (23 bytes) - UNMASKED
 	staticHeader := make([]byte, 23)
 	copy(staticHeader[0:6], []byte("discv5"))
-	binary.BigEndian.PutUint16(staticHeader[6:8], 1)        // version
-	staticHeader[8] = OrdinaryPacket                        // flag = ordinary message (0x00)
+	binary.BigEndian.PutUint16(staticHeader[6:8], 1) // version
+	staticHeader[8] = OrdinaryPacket                 // flag = ordinary message (0x00)
 	copy(staticHeader[9:21], nonce)
 	binary.BigEndian.PutUint16(staticHeader[21:23], uint16(len(authdata)))
 
@@ -112,8 +113,9 @@ func BuildOrdinaryHeaderData(localNodeID node.ID, nonce, authdata []byte) ([]byt
 // EncodeOrdinaryPacket encodes an ordinary packet with an established session.
 //
 // Packet format (with session):
-//   packet = masking-iv (16) || masked-header (23) || masked-authdata (32) || message-ciphertext
-//   authdata = srcID (32 bytes)
+//
+//	packet = masking-iv (16) || masked-header (23) || masked-authdata (32) || message-ciphertext
+//	authdata = srcID (32 bytes)
 func EncodeOrdinaryPacket(localNodeID, destNodeID node.ID, maskingIV, nonce []byte, authdata []byte, message []byte) ([]byte, error) {
 	if len(maskingIV) != 16 {
 		return nil, fmt.Errorf("invalid masking IV length: %d (expected 16)", len(maskingIV))
@@ -122,8 +124,8 @@ func EncodeOrdinaryPacket(localNodeID, destNodeID node.ID, maskingIV, nonce []by
 	// Build static header (23 bytes)
 	staticHeader := make([]byte, 23)
 	copy(staticHeader[0:6], []byte("discv5"))
-	binary.BigEndian.PutUint16(staticHeader[6:8], 1)        // version
-	staticHeader[8] = OrdinaryPacket                         // flag = ordinary message (0x00)
+	binary.BigEndian.PutUint16(staticHeader[6:8], 1) // version
+	staticHeader[8] = OrdinaryPacket                 // flag = ordinary message (0x00)
 	copy(staticHeader[9:21], nonce)
 	binary.BigEndian.PutUint16(staticHeader[21:23], uint16(len(authdata)))
 
@@ -160,8 +162,9 @@ func EncodeOrdinaryPacket(localNodeID, destNodeID node.ID, maskingIV, nonce []by
 // EncodeHandshakePacket encodes a handshake message packet.
 //
 // Handshake packet format:
-//   packet = masking-iv (16) || masked-header (23) || masked-authdata || message-ciphertext
-//   authdata = src-id (32) || sig-size (1) || eph-key-size (1) || id-signature || eph-pubkey || record
+//
+//	packet = masking-iv (16) || masked-header (23) || masked-authdata || message-ciphertext
+//	authdata = src-id (32) || sig-size (1) || eph-key-size (1) || id-signature || eph-pubkey || record
 //
 // The minimal authdata is 34 bytes (src-id + sig-size + eph-key-size).
 // Plus variable-length signature (~64 bytes), ephemeral pubkey (33 bytes), and optional ENR.
@@ -172,20 +175,20 @@ func EncodeHandshakePacket(localNodeID, destNodeID node.ID, maskingIV, nonce []b
 
 	// Build authdata: src-id || sig-size || eph-key-size || signature || eph-pubkey || enr
 	authdata := make([]byte, 0, 34+len(signature)+len(ephPubkey)+len(enrBytes))
-	authdata = append(authdata, localNodeID[:]...)                    // 32 bytes
-	authdata = append(authdata, byte(len(signature)))                 // 1 byte
-	authdata = append(authdata, byte(len(ephPubkey)))                 // 1 byte
-	authdata = append(authdata, signature...)                         // variable
-	authdata = append(authdata, ephPubkey...)                         // variable
-	authdata = append(authdata, enrBytes...)                          // variable (optional)
+	authdata = append(authdata, localNodeID[:]...)    // 32 bytes
+	authdata = append(authdata, byte(len(signature))) // 1 byte
+	authdata = append(authdata, byte(len(ephPubkey))) // 1 byte
+	authdata = append(authdata, signature...)         // variable
+	authdata = append(authdata, ephPubkey...)         // variable
+	authdata = append(authdata, enrBytes...)          // variable (optional)
 
 	authsize := len(authdata)
 
 	// Build static header (23 bytes)
 	staticHeader := make([]byte, 23)
 	copy(staticHeader[0:6], []byte("discv5"))
-	binary.BigEndian.PutUint16(staticHeader[6:8], 1)           // version
-	staticHeader[8] = HandshakePacket                          // flag = handshake (0x02)
+	binary.BigEndian.PutUint16(staticHeader[6:8], 1) // version
+	staticHeader[8] = HandshakePacket                // flag = handshake (0x02)
 	copy(staticHeader[9:21], nonce)
 	binary.BigEndian.PutUint16(staticHeader[21:23], uint16(authsize))
 
@@ -232,20 +235,20 @@ func BuildHandshakeHeaderData(localNodeID node.ID, nonce []byte, signature, ephP
 
 	// Build authdata: src-id || sig-size || eph-key-size || signature || eph-pubkey || enr
 	authdata := make([]byte, 0, 34+len(signature)+len(ephPubkey)+len(enrBytes))
-	authdata = append(authdata, localNodeID[:]...)                    // 32 bytes
-	authdata = append(authdata, byte(len(signature)))                 // 1 byte
-	authdata = append(authdata, byte(len(ephPubkey)))                 // 1 byte
-	authdata = append(authdata, signature...)                         // variable
-	authdata = append(authdata, ephPubkey...)                         // variable
-	authdata = append(authdata, enrBytes...)                          // variable (optional)
+	authdata = append(authdata, localNodeID[:]...)    // 32 bytes
+	authdata = append(authdata, byte(len(signature))) // 1 byte
+	authdata = append(authdata, byte(len(ephPubkey))) // 1 byte
+	authdata = append(authdata, signature...)         // variable
+	authdata = append(authdata, ephPubkey...)         // variable
+	authdata = append(authdata, enrBytes...)          // variable (optional)
 
 	authsize := len(authdata)
 
 	// Build static header (23 bytes) - UNMASKED
 	staticHeader := make([]byte, 23)
 	copy(staticHeader[0:6], []byte("discv5"))
-	binary.BigEndian.PutUint16(staticHeader[6:8], 1)           // version
-	staticHeader[8] = HandshakePacket                          // flag = handshake (0x02)
+	binary.BigEndian.PutUint16(staticHeader[6:8], 1) // version
+	staticHeader[8] = HandshakePacket                // flag = handshake (0x02)
 	copy(staticHeader[9:21], nonce)
 	binary.BigEndian.PutUint16(staticHeader[21:23], uint16(authsize))
 
@@ -258,24 +261,15 @@ func BuildHandshakeHeaderData(localNodeID node.ID, nonce []byte, signature, ephP
 	return maskingIV, headerData, nil
 }
 
-// EncodeWHOAREYOUPacket encodes a WHOAREYOU packet according to discv5 spec.
+// EncodeWHOAREYOUPacket encodes a WHOAREYOU packet and returns both the packet and the masking IV.
 //
 // WHOAREYOU packet format:
-//   whoareyou-packet = masking-iv (16) || masked-header (23) || masked-authdata (24)
-//   authdata = id-nonce (16) || enr-seq (8)
-func EncodeWHOAREYOUPacket(destNodeID node.ID, nonce []byte, challenge *WHOAREYOUChallenge) ([]byte, error) {
-	packet, _, err := EncodeWHOAREYOUPacketWithIV(destNodeID, nonce, challenge)
-	return packet, err
-}
-
-// EncodeWHOAREYOUPacketWithIV encodes a WHOAREYOU packet and returns both the packet and the masking IV.
 //
-// WHOAREYOU packet format:
-//   whoareyou-packet = masking-iv (16) || masked-header (23) || masked-authdata (24)
-//   authdata = id-nonce (16) || enr-seq (8)
+//	whoareyou-packet = masking-iv (16) || masked-header (23) || masked-authdata (24)
+//	authdata = id-nonce (16) || enr-seq (8)
 //
 // Returns: (packet bytes, masking IV, error)
-func EncodeWHOAREYOUPacketWithIV(destNodeID node.ID, nonce []byte, challenge *WHOAREYOUChallenge) ([]byte, []byte, error) {
+func EncodeWHOAREYOUPacket(destNodeID node.ID, nonce []byte, challenge *WHOAREYOUChallenge) ([]byte, []byte, error) {
 	// Generate random masking IV (16 bytes)
 	maskingIV, err := crypto.GenerateRandomBytes(16)
 	if err != nil {
@@ -286,7 +280,7 @@ func EncodeWHOAREYOUPacketWithIV(destNodeID node.ID, nonce []byte, challenge *WH
 	staticHeader := make([]byte, 23)
 	copy(staticHeader[0:6], []byte("discv5"))
 	binary.BigEndian.PutUint16(staticHeader[6:8], 1) // version
-	staticHeader[8] = WHOAREYOUPacket                  // flag = WHOAREYOU (0x01)
+	staticHeader[8] = WHOAREYOUPacket                // flag = WHOAREYOU (0x01)
 	copy(staticHeader[9:21], nonce)
 	binary.BigEndian.PutUint16(staticHeader[21:23], 24) // authsize = 24 bytes
 

@@ -4,7 +4,7 @@
 //   - Parsing CL config files (YAML format)
 //   - Computing fork digests for different network forks
 //   - Tracking fork schedules and activation epochs
-package clconfig
+package config
 
 import (
 	"crypto/sha256"
