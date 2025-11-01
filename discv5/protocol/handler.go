@@ -39,6 +39,7 @@ type PendingChallenge struct {
 	ToAddr        *net.UDPAddr
 	ToNodeID      node.ID
 	ChallengeData []byte
+	PacketBytes   []byte    // Raw WHOAREYOU packet bytes for resending
 	CreatedAt     time.Time
 }
 
@@ -282,7 +283,19 @@ func (h *Handler) evictOldestHandshake() {
 
 // addPendingChallenge adds a pending challenge with limit checking and LRU eviction.
 // Must be called with h.mu locked.
+// Returns false if the challenge was rejected or if one already exists.
 func (h *Handler) addPendingChallenge(key string, pending *PendingChallenge) bool {
+	// Check if a challenge already exists for this key
+	if existing := h.pendingChallenges[key]; existing != nil {
+		// Don't overwrite - client might already be responding to the existing challenge
+		h.config.Logger.WithFields(logrus.Fields{
+			"nodeID": pending.ToNodeID.String()[:16],
+			"addr":   pending.ToAddr,
+			"age":    time.Since(existing.CreatedAt),
+		}).Debug("handler: pending challenge already exists, not overwriting")
+		return false
+	}
+
 	ipKey := pending.ToAddr.IP.String()
 
 	// Check per-IP limit
@@ -360,6 +373,12 @@ func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr) error {
 	h.packetsReceived++
 	h.mu.Unlock()
 
+	h.config.Logger.WithFields(logrus.Fields{
+		"from":      from,
+		"size":      len(data),
+		"packetHex": fmt.Sprintf("%x", data[:min(100, len(data))]),
+	}).Trace("handler: incoming packet")
+
 	// Decode packet (unmask header and authdata using our local node ID)
 	packet, err := DecodePacket(data, h.config.LocalNode.ID())
 	if err != nil {
@@ -426,7 +445,11 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 
 	if sess == nil {
 		// No session exists, send WHOAREYOU challenge
-		return h.sendWHOAREYOU(from, srcNodeID)
+		h.config.Logger.WithFields(logrus.Fields{
+			"from":   from,
+			"nodeID": srcNodeID.String()[:16],
+		}).Debug("handler: no session, sending WHOAREYOU")
+		return h.sendWHOAREYOU(from, srcNodeID, packet.Header.Nonce)
 	}
 
 	// Decrypt message using session key
@@ -453,7 +476,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 		}
 		var destNodeID node.ID
 		copy(destNodeID[:], packet.SrcID)
-		return h.sendWHOAREYOU(from, destNodeID)
+		return h.sendWHOAREYOU(from, destNodeID, packet.Header.Nonce)
 	}
 
 	// Decode message from plaintext
@@ -714,10 +737,10 @@ func makeHandshakeKey(nodeID node.ID, addr *net.UDPAddr) string {
 	return fmt.Sprintf("%s@%s", nodeID.String(), addr.String())
 }
 
-// buildWHOAREYOUChallengeData builds the unmasked challenge data for signature verification.
+// BuildWHOAREYOUChallengeData builds the unmasked challenge data for signature verification.
 // This matches the headerData that the remote node will extract when decoding the WHOAREYOU packet.
 // Format: IV (16) || unmasked-header (23) || unmasked-authdata (24)
-func buildWHOAREYOUChallengeData(maskingIV, nonce []byte, challenge *WHOAREYOUChallenge) []byte {
+func BuildWHOAREYOUChallengeData(maskingIV, nonce []byte, challenge *WHOAREYOUChallenge) []byte {
 	// Build unmasked static header (23 bytes)
 	// Format: protocol-id(6) || version(2) || flag(1) || nonce(12) || authsize(2)
 	staticHeader := make([]byte, 23)
@@ -743,6 +766,9 @@ func buildWHOAREYOUChallengeData(maskingIV, nonce []byte, challenge *WHOAREYOUCh
 
 // handleHandshakePacket handles a handshake packet.
 func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error {
+	h.config.Logger.WithFields(logrus.Fields{
+		"from": from,
+	}).Debug("handler: received HANDSHAKE packet")
 	// This is a response to our WHOAREYOU challenge
 
 	if packet.Handshake == nil {
@@ -1234,17 +1260,12 @@ func (h *Handler) SendMessage(msg Message, remoteID node.ID, to *net.UDPAddr, re
 }
 
 // sendWHOAREYOU sends a WHOAREYOU challenge.
-func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
-	// Generate random ID nonce for the challenge (32 bytes, but only first 16 used)
-	idNonce, err := crypto.GenerateRandomBytes(32)
+// The nonce parameter must be the nonce from the client's original packet.
+func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID, nonce []byte) error {
+	// Generate random ID nonce for the challenge (16 bytes)
+	idNonce, err := crypto.GenerateRandomBytes(16)
 	if err != nil {
 		return fmt.Errorf("failed to generate ID nonce: %w", err)
-	}
-
-	// Generate nonce for packet
-	nonce, err := crypto.GenerateRandomBytes(12)
-	if err != nil {
-		return fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
 	// Get the current ENR sequence we have for this node
@@ -1271,7 +1292,7 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
 	// Build unmasked challenge data for signature verification
 	// Format: IV || unmasked-header || unmasked-authdata
 	// This is what the remote node will use when creating their handshake signature
-	challengeData := buildWHOAREYOUChallengeData(maskingIV, nonce, challenge)
+	challengeData := BuildWHOAREYOUChallengeData(maskingIV, nonce, challenge)
 
 	// Store the challenge so we can verify the handshake response
 	challengeKey := makeHandshakeKey(destNodeID, to)
@@ -1279,14 +1300,41 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
 		ToAddr:        to,
 		ToNodeID:      destNodeID,
 		ChallengeData: challengeData,
+		PacketBytes:   packetBytes, // Store for resending
 		CreatedAt:     time.Now(),
 	}
 
 	h.mu.Lock()
+	existing := h.pendingChallenges[challengeKey]
 	accepted := h.addPendingChallenge(challengeKey, pendingChallenge)
 	h.mu.Unlock()
 
 	if !accepted {
+		if existing != nil {
+			// Challenge already exists - resend the exact same WHOAREYOU packet
+			// This handles the case where the client sent multiple concurrent requests
+			// or the WHOAREYOU was lost in transit
+			h.config.Logger.WithFields(logrus.Fields{
+				"to":     to,
+				"nodeID": destNodeID.String()[:16],
+				"age":    time.Since(existing.CreatedAt),
+			}).Debug("handler: resending existing WHOAREYOU challenge")
+
+			// Get transport and resend the exact same packet
+			h.mu.RLock()
+			transport := h.transport
+			h.mu.RUnlock()
+
+			if transport == nil {
+				return fmt.Errorf("transport not initialized")
+			}
+
+			if err := transport.SendTo(existing.PacketBytes, to); err != nil {
+				return fmt.Errorf("failed to resend WHOAREYOU packet: %w", err)
+			}
+
+			return nil
+		}
 		// Challenge rejected due to limits - still send it but won't be able to verify handshake
 		h.config.Logger.WithFields(logrus.Fields{
 			"to":     to,
@@ -1307,6 +1355,16 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID) error {
 	if err := transport.SendTo(packetBytes, to); err != nil {
 		return fmt.Errorf("failed to send WHOAREYOU packet: %w", err)
 	}
+
+	h.config.Logger.WithFields(logrus.Fields{
+		"to":         to,
+		"nodeID":     destNodeID.String()[:16],
+		"enrSeq":     enrSeq,
+		"idNonce":    fmt.Sprintf("%x", idNonce),
+		"packetHex":  fmt.Sprintf("%x", packetBytes),
+		"maskingIV":  fmt.Sprintf("%x", maskingIV),
+		"nonce":      fmt.Sprintf("%x", nonce),
+	}).Debug("handler: sent WHOAREYOU challenge")
 
 	return nil
 }

@@ -464,19 +464,19 @@
 
 {{ define "js" }}
 <script>
-  // Initialize Bootstrap popovers
+  /* Initialize Bootstrap popovers */
   document.addEventListener('DOMContentLoaded', function() {
     var popoverTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="popover"]'));
     var popoverList = popoverTriggerList.map(function(popoverTriggerEl) {
       return new bootstrap.Popover(popoverTriggerEl);
     });
 
-    // Handle copy button/icon clicks
+    /* Handle copy button/icon clicks */
     document.querySelectorAll('[data-clipboard-text]').forEach(function(element) {
       element.addEventListener('click', function() {
         var text = this.getAttribute('data-clipboard-text');
         navigator.clipboard.writeText(text).then(function() {
-          // Update tooltip to show success
+          /* Update tooltip to show success */
           var tooltip = bootstrap.Tooltip.getInstance(element);
           if (!tooltip) {
             tooltip = new bootstrap.Tooltip(element);
@@ -492,14 +492,14 @@
       });
     });
 
-    // Start auto-update
+    /* Start auto-update */
     startAutoUpdate();
   });
 
   function formatTimeDiff(startTime) {
     var now = new Date();
     var start = new Date(startTime);
-    var diff = Math.floor((now - start) / 1000); // seconds
+    var diff = Math.floor((now - start) / 1000); /* seconds */
 
     var days = Math.floor(diff / 86400);
     var hours = Math.floor((diff % 86400) / 3600);
@@ -529,35 +529,35 @@
         return response.json();
       })
       .then(function(data) {
-        // Update all dynamic values
+        /* Update all dynamic values */
         updateValue('[data-stat="status"]', data.Status);
         if (data.NetworkName) updateValue('[data-stat="network"]', data.NetworkName);
         updateValue('[data-stat="uptime"]', formatTimeDiff(data.StartTime));
         updateValue('[data-stat="bind-address"]', data.BindAddress);
         if (data.LocalENRSeq) updateValue('[data-stat="enr-seq"]', data.LocalENRSeq);
 
-        // Routing table
+        /* Routing table */
         updateValue('[data-stat="table-size"]', data.TableSize);
         updateValue('[data-stat="active-nodes"]', data.ActiveNodes);
         updateValue('[data-stat="inactive-nodes"]', data.InactiveNodes);
 
-        // Discovery stats
+        /* Discovery stats */
         updateValue('[data-stat="lookups-started"]', data.LookupsStarted);
         updateValue('[data-stat="lookups-completed"]', data.LookupsCompleted);
         updateValue('[data-stat="lookups-failed"]', data.LookupsFailed);
 
-        // Ping stats
+        /* Ping stats */
         updateValue('[data-stat="pings-sent"]', data.PingsSent);
         updateValue('[data-stat="pongs-received"]', data.PongsReceived);
         updateValue('[data-stat="ping-success-rate"]', data.PingSuccessRate.toFixed(1) + '%');
 
-        // Session & Protocol stats
+        /* Session & Protocol stats */
         updateValue('[data-stat="sessions-active"]', data.SessionsActive);
         updateValue('[data-stat="sessions-total"]', data.SessionsTotal);
         updateValue('[data-stat="pending-handshakes"]', data.PendingHandshakes);
         updateValue('[data-stat="pending-challenges"]', data.PendingChallenges);
 
-        // Database stats
+        /* Database stats */
         updateValue('[data-stat="db-queue-size"]', data.DBQueueSize);
         updateValue('[data-stat="db-processed-updates"]', data.DBProcessedUpdates);
         updateValue('[data-stat="db-merged-updates"]', data.DBMergedUpdates);
@@ -568,18 +568,18 @@
           updateValue('[data-stat="db-failed-updates"]', data.DBFailedUpdates);
         }
 
-        // Packet stats
+        /* Packet stats */
         updateValue('[data-stat="packets-received"]', data.PacketsReceived);
         updateValue('[data-stat="packets-sent"]', data.PacketsSent);
         updateValue('[data-stat="findnode-received"]', data.FindNodeReceived);
         updateValue('[data-stat="invalid-packets"]', data.InvalidPackets);
         updateValue('[data-stat="filtered-responses"]', data.FilteredResponses);
 
-        // Fork info (if present)
+        /* Fork info (if present) */
         if (data.CurrentFork) updateValue('[data-stat="current-fork"]', data.CurrentFork);
         if (data.GracePeriod) updateValue('[data-stat="grace-period"]', data.GracePeriod);
 
-        // Fork filter stats (if present)
+        /* Fork filter stats (if present) */
         if (data.FilterTotalChecks) {
           updateValue('[data-stat="filter-total-checks"]', data.FilterTotalChecks);
           updateValue('[data-stat="filter-accepted-current"]', data.FilterAcceptedCurrent);
@@ -594,7 +594,7 @@
   }
 
   function startAutoUpdate() {
-    // Update every 10 seconds
+    /* Update every 10 seconds */
     setInterval(updateOverviewData, 10000);
   }
 </script>

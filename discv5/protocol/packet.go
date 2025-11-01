@@ -99,10 +99,10 @@ type PacketHeader struct {
 // It challenges the sender to prove their identity before establishing a session.
 //
 // Format:
-//   - IDNonce: Random challenge nonce (32 bytes)
+//   - IDNonce: Random challenge nonce (16 bytes)
 //   - ENRSeq: Highest ENR sequence number we have for this node
 type WHOAREYOUChallenge struct {
-	// IDNonce is a random challenge value (32 bytes)
+	// IDNonce is a random challenge value (16 bytes)
 	IDNonce []byte
 
 	// ENRSeq is the highest ENR sequence number we have
@@ -415,10 +415,10 @@ func DecodePacket(data []byte, localNodeID node.ID) (*Packet, error) {
 			return nil, fmt.Errorf("invalid WHOAREYOU authsize: %d (expected 24)", authsize)
 		}
 		packet.Challenge = &WHOAREYOUChallenge{
-			IDNonce: make([]byte, 32), // Store full 32 bytes (first 16 from authdata)
+			IDNonce: make([]byte, 16), // ID nonce is 16 bytes
 			ENRSeq:  binary.BigEndian.Uint64(authdata[16:24]),
 		}
-		copy(packet.Challenge.IDNonce[0:16], authdata[0:16])
+		copy(packet.Challenge.IDNonce, authdata[0:16])
 		// WHOAREYOU has no message data
 
 	case HandshakePacket: // flag = 0x02 for handshake
