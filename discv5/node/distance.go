@@ -1,7 +1,6 @@
 package node
 
 import (
-	"crypto/rand"
 	"math/bits"
 )
 
@@ -160,63 +159,4 @@ func sortByDistance(target ID, nodes []ID) {
 // This is the same as LogDistance but named more clearly for routing table use.
 func BucketIndex(local, remote ID) int {
 	return LogDistance(local, remote)
-}
-
-// RandomNodeID generates a random node ID at a specific logarithmic distance.
-//
-// This is used for random walks in the routing table to find nodes
-// at a specific distance bucket.
-//
-// Example:
-//
-//	// Find nodes at distance bucket 128
-//	targetID := RandomNodeID(localID, 128)
-//	// Use targetID in FINDNODE request
-func RandomNodeID(base ID, logDist int) ID {
-	if logDist < 0 || logDist > 255 {
-		return base
-	}
-
-	// Create a distance with MSB at position logDist
-	var dist ID
-
-	// Calculate byte and bit indices for the MSB position
-	// logDist numbering:
-	// - logDist 0: rightmost bit of byte 0 (0x01)
-	// - logDist 7: leftmost bit of byte 0 (0x80)
-	// - logDist 8: rightmost bit of byte 1
-	// - logDist 15: leftmost bit of byte 1
-	// etc.
-	byteIndex := logDist / 8
-	bitInByte := logDist % 8
-
-	// The bit position for shifting (0 = LSB, 7 = MSB)
-	bitPosition := bitInByte
-
-	// Set the bit at logDist position (this is the MSB of the distance)
-	dist[byteIndex] = 1 << bitPosition
-
-	// Generate random bytes for the lower-order bits
-	randomBytes := make([]byte, len(dist)-byteIndex)
-	if _, err := rand.Read(randomBytes); err != nil {
-		// Fallback to deterministic if random fails (shouldn't happen)
-		for i := range randomBytes {
-			randomBytes[i] = byte((i + 1) * 37)
-		}
-	}
-
-	// Apply the random bytes to lower-order bits
-	for i := byteIndex; i < len(dist); i++ {
-		if i == byteIndex {
-			// Only randomize bits lower than the MSB in this byte
-			lowerBitsMask := byte((1 << bitPosition) - 1)
-			dist[i] |= randomBytes[i-byteIndex] & lowerBitsMask
-		} else {
-			// Fully randomize subsequent bytes
-			dist[i] = randomBytes[i-byteIndex]
-		}
-	}
-
-	// XOR with base to get the target ID
-	return Distance(base, dist)
 }

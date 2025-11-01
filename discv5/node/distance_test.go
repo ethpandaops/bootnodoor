@@ -57,13 +57,13 @@ func TestLogDistance(t *testing.T) {
 		expected int
 	}{
 		// MSB in first byte, bit 7 (leftmost)
-		{ID{0x00}, ID{0x80}, 7},
+		{ID{0x00}, ID{0x80}, 255},
 		// MSB in first byte, bit 0 (rightmost)
-		{ID{0x00}, ID{0x01}, 0},
+		{ID{0x00}, ID{0x01}, 248},
 		// MSB in second byte, bit 7
-		{ID{0x00, 0x00}, ID{0x00, 0x80}, 15},
+		{ID{0x00, 0x00}, ID{0x00, 0x80}, 247},
 		// MSB in second byte, bit 0
-		{ID{0x00, 0x00}, ID{0x00, 0x01}, 8},
+		{ID{0x00, 0x00}, ID{0x00, 0x01}, 240},
 	}
 
 	for _, tt := range tests {
@@ -145,50 +145,17 @@ func TestBucketIndex(t *testing.T) {
 	local := ID{0x00}
 	remote := ID{0x80}
 
-	// MSB is at position 7 (first byte, bit 7)
+	// MSB is at position 255 (first byte, bit 7, counted from right across all bytes)
 	bucket := BucketIndex(local, remote)
 
-	if bucket != 7 {
-		t.Errorf("BucketIndex = %d, want 7", bucket)
+	if bucket != 255 {
+		t.Errorf("BucketIndex = %d, want 255", bucket)
 	}
 
 	// Same node should return -1
 	bucket = BucketIndex(local, local)
 	if bucket != -1 {
 		t.Errorf("BucketIndex for same node = %d, want -1", bucket)
-	}
-}
-
-func TestRandomNodeID(t *testing.T) {
-	base := ID{0x00}
-
-	// Generate ID at distance 7 (MSB should be at position 7)
-	random := RandomNodeID(base, 7)
-
-	// Check the logarithmic distance
-	bucket := BucketIndex(base, random)
-	if bucket != 7 {
-		t.Errorf("Generated ID bucket = %d, want 7", bucket)
-	}
-
-	// Verify the distance has MSB at bit 7
-	dist := Distance(base, random)
-	if dist[0]&0x80 == 0 {
-		t.Errorf("Distance MSB not at position 7: distance = %x", dist[0])
-	}
-
-	// Generate another ID at the same distance
-	random2 := RandomNodeID(base, 7)
-	bucket2 := BucketIndex(base, random2)
-	if bucket2 != 7 {
-		t.Errorf("Second generated ID bucket = %d, want 7", bucket2)
-	}
-
-	// Test different distance
-	random3 := RandomNodeID(base, 15)
-	bucket3 := BucketIndex(base, random3)
-	if bucket3 != 15 {
-		t.Errorf("Generated ID at distance 15 bucket = %d, want 15", bucket3)
 	}
 }
 
