@@ -14,23 +14,24 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// updateType represents the type of update to perform
-type updateType uint8
+// updateFlags represents which fields should be updated (bitmask).
+type updateFlags uint8
 
 const (
-	updateTypeENR        updateType = iota // Update seq+enr+ip only (preserve stats & timestamps)
-	updateTypeFull                         // Full update including stats (after ping/stats change)
-	updateTypeLastActive                   // Update last_active timestamp only
-	updateTypeLastSeen                     // Update last_seen timestamp only
+	updateFlagENR        updateFlags = 1 << iota // Update seq+enr+ip only
+	updateFlagStats                              // Update stats (failures, successes, etc.)
+	updateFlagLastActive                         // Update last_active timestamp
+	updateFlagLastSeen                           // Update last_seen timestamp
 )
 
 // nodeUpdate represents a pending database update for a node.
+// Multiple updates can be merged together using the flags bitmask.
 type nodeUpdate struct {
-	nodeID     node.ID
-	updateType updateType
-	node       *node.Node // For ENR and full updates
-	active     bool       // For last_active updates
-	timestamp  time.Time  // For last_seen updates
+	nodeID         node.ID
+	flags          updateFlags
+	node           *node.Node // For ENR and stats updates
+	lastActiveTime time.Time  // For last_active updates
+	lastSeenTime   time.Time  // For last_seen updates
 }
 
 // NodeDB wraps the Database and provides node storage with async updates.
@@ -72,9 +73,9 @@ func (ndb *NodeDB) UpdateNodeENR(n *node.Node) error {
 	}
 
 	update := nodeUpdate{
-		nodeID:     n.ID(),
-		updateType: updateTypeENR,
-		node:       n,
+		nodeID: n.ID(),
+		flags:  updateFlagENR,
+		node:   n,
 	}
 
 	return ndb.queueUpdate(update)
@@ -88,20 +89,20 @@ func (ndb *NodeDB) UpdateNodeFull(n *node.Node) error {
 	}
 
 	update := nodeUpdate{
-		nodeID:     n.ID(),
-		updateType: updateTypeFull,
-		node:       n,
+		nodeID: n.ID(),
+		flags:  updateFlagENR | updateFlagStats,
+		node:   n,
 	}
 
 	return ndb.queueUpdate(update)
 }
 
 // UpdateLastActive queues a last_active timestamp update.
-func (ndb *NodeDB) UpdateLastActive(id node.ID, active bool) error {
+func (ndb *NodeDB) UpdateLastActive(id node.ID, timestamp time.Time) error {
 	update := nodeUpdate{
-		nodeID:     id,
-		updateType: updateTypeLastActive,
-		active:     active,
+		nodeID:         id,
+		flags:          updateFlagLastActive,
+		lastActiveTime: timestamp,
 	}
 
 	return ndb.queueUpdate(update)
@@ -110,9 +111,9 @@ func (ndb *NodeDB) UpdateLastActive(id node.ID, active bool) error {
 // UpdateLastSeen queues a last_seen timestamp update.
 func (ndb *NodeDB) UpdateLastSeen(id node.ID, timestamp time.Time) error {
 	update := nodeUpdate{
-		nodeID:     id,
-		updateType: updateTypeLastSeen,
-		timestamp:  timestamp,
+		nodeID:       id,
+		flags:        updateFlagLastSeen,
+		lastSeenTime: timestamp,
 	}
 
 	return ndb.queueUpdate(update)
@@ -125,33 +126,30 @@ func (ndb *NodeDB) queueUpdate(update nodeUpdate) error {
 
 	// Check if there's already a pending update for this node
 	if existing, ok := ndb.updateQueueSet[update.nodeID]; ok {
-		// Merge updates based on priority:
-		// updateTypeFull > updateTypeENR > updateTypeLastActive/updateTypeLastSeen
+		// Merge updates by OR-ing flags together
+		existing.flags |= update.flags
 
-		if update.updateType == updateTypeFull {
-			// Full update takes precedence over everything
-			existing.updateType = updateTypeFull
-			existing.node = update.node
-		} else if existing.updateType == updateTypeFull {
-			// Don't downgrade from full update
-			return nil
-		} else if update.updateType == updateTypeENR {
-			// ENR update takes precedence over timestamp updates
-			if existing.updateType != updateTypeENR {
-				existing.updateType = updateTypeENR
+		// Update node reference if new update has ENR or stats
+		if update.flags&(updateFlagENR|updateFlagStats) != 0 {
+			if existing.node == nil || update.node.Record().Seq() >= existing.node.Record().Seq() {
 				existing.node = update.node
 			}
-		} else if existing.updateType == updateTypeENR {
-			// Don't downgrade from ENR update
-			return nil
-		} else {
-			// Merge timestamp updates
-			if update.updateType == updateTypeLastActive {
-				existing.active = update.active
-			} else if update.updateType == updateTypeLastSeen {
-				existing.timestamp = update.timestamp
+		}
+
+		// Update lastActiveTime if new update has it (use most recent)
+		if update.flags&updateFlagLastActive != 0 {
+			if existing.lastActiveTime.IsZero() || update.lastActiveTime.After(existing.lastActiveTime) {
+				existing.lastActiveTime = update.lastActiveTime
 			}
 		}
+
+		// Update lastSeenTime if new update has it (use most recent)
+		if update.flags&updateFlagLastSeen != 0 {
+			if existing.lastSeenTime.IsZero() || update.lastSeenTime.After(existing.lastSeenTime) {
+				existing.lastSeenTime = update.lastSeenTime
+			}
+		}
+
 		return nil
 	}
 
@@ -214,20 +212,56 @@ func (ndb *NodeDB) batchUpdate(updates []nodeUpdate) {
 
 	err := ndb.db.RunDBTransaction(func(tx *sqlx.Tx) error {
 		for _, update := range updates {
-			var err error
-			switch update.updateType {
-			case updateTypeENR:
-				err = ndb.updateNodeENRTx(tx, update.node)
-			case updateTypeFull:
-				err = ndb.upsertNodeTx(tx, update.node)
-			case updateTypeLastActive:
-				err = ndb.db.UpdateNodeLastActive(tx, update.nodeID[:], update.active)
-			case updateTypeLastSeen:
-				err = ndb.updateNodeLastSeenTx(tx, update.nodeID, update.timestamp)
-			}
+			// Apply updates based on flags
+			// If both ENR and Stats are set, do a full upsert
+			if update.flags&updateFlagStats != 0 {
+				// Full update with stats
+				if err := ndb.upsertNodeTx(tx, update.node); err != nil {
+					ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to upsert node in batch")
+					continue
+				}
 
-			if err != nil {
-				ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update node in batch")
+				// Apply timestamp updates separately (merged from queued updates)
+				if update.flags&updateFlagLastActive != 0 {
+					if err := ndb.db.UpdateNodeLastActive(tx, update.nodeID[:], update.lastActiveTime.Unix()); err != nil {
+						ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update last_active in batch")
+					}
+				}
+				if update.flags&updateFlagLastSeen != 0 {
+					if err := ndb.updateNodeLastSeenTx(tx, update.nodeID, update.lastSeenTime); err != nil {
+						ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update last_seen in batch")
+					}
+				}
+			} else if update.flags&updateFlagENR != 0 {
+				// ENR-only update
+				if err := ndb.updateNodeENRTx(tx, update.node); err != nil {
+					ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update ENR in batch")
+					continue
+				}
+
+				// Apply timestamp updates separately
+				if update.flags&updateFlagLastActive != 0 {
+					if err := ndb.db.UpdateNodeLastActive(tx, update.nodeID[:], update.lastActiveTime.Unix()); err != nil {
+						ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update last_active in batch")
+					}
+				}
+				if update.flags&updateFlagLastSeen != 0 {
+					if err := ndb.updateNodeLastSeenTx(tx, update.nodeID, update.lastSeenTime); err != nil {
+						ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update last_seen in batch")
+					}
+				}
+			} else {
+				// Timestamp-only updates
+				if update.flags&updateFlagLastActive != 0 {
+					if err := ndb.db.UpdateNodeLastActive(tx, update.nodeID[:], update.lastActiveTime.Unix()); err != nil {
+						ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update last_active in batch")
+					}
+				}
+				if update.flags&updateFlagLastSeen != 0 {
+					if err := ndb.updateNodeLastSeenTx(tx, update.nodeID, update.lastSeenTime); err != nil {
+						ndb.logger.WithError(err).WithField("nodeID", update.nodeID).Error("failed to update last_seen in batch")
+					}
+				}
 			}
 		}
 		return nil

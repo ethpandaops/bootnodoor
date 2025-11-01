@@ -45,6 +45,10 @@ type OnHandshakeCompleteCallback func(n *node.Node, incoming bool)
 // OnNodeUpdateCallback is called when a node's ENR is updated.
 type OnNodeUpdateCallback func(n *node.Node)
 
+// OnNodeSeenCallback is called when a node is seen (receives a message).
+// This is useful for tracking last_seen timestamps in the database.
+type OnNodeSeenCallback func(n *node.Node, timestamp time.Time)
+
 // OnFindNodeCallback is called when a FINDNODE request is received.
 // The requester parameter provides the requesting node's address for context-aware filtering (e.g., LAN-aware filtering).
 type OnFindNodeCallback func(msg *FindNode, requester *net.UDPAddr) []*node.Node
@@ -134,6 +138,7 @@ type HandlerConfig struct {
 	// Callbacks (all optional, can be nil)
 	OnHandshakeComplete OnHandshakeCompleteCallback
 	OnNodeUpdate        OnNodeUpdateCallback
+	OnNodeSeen          OnNodeSeenCallback
 	OnFindNode          OnFindNodeCallback
 	OnTalkReq           OnTalkReqCallback
 	OnPongReceived      OnPongReceivedCallback
@@ -789,8 +794,14 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 // handleMessage dispatches a decoded message to the appropriate handler.
 func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
 	if remoteNode != nil {
-		remoteNode.SetLastSeen(time.Now())
+		now := time.Now()
+		remoteNode.SetLastSeen(now)
 		remoteNode.ResetFailureCount()
+
+		// Call OnNodeSeen callback for persistence
+		if h.config.OnNodeSeen != nil {
+			h.config.OnNodeSeen(remoteNode, now)
+		}
 	}
 
 	switch msg.Type() {

@@ -20,9 +20,6 @@ const (
 	// DefaultPingRate is the maximum number of pings per minute
 	DefaultPingRate = 400
 
-	// DefaultSweepInterval is how often to rotate active/inactive nodes
-	DefaultSweepInterval = 10 * time.Minute
-
 	// DefaultSweepPercent is the percentage of active nodes to rotate during sweep
 	DefaultSweepPercent = 10
 )
@@ -66,14 +63,8 @@ type FlatTable struct {
 	// maxFailures is the maximum consecutive failures
 	maxFailures int
 
-	// sweepInterval is how often to rotate active/inactive nodes
-	sweepInterval time.Duration
-
 	// sweepPercent is percentage of nodes to rotate during sweep
 	sweepPercent int
-
-	// lastSweep tracks when we last did a sweep
-	lastSweep time.Time
 
 	// nodeChangedCallback is called when nodes are added/updated
 	nodeChangedCallback NodeChangedCallback
@@ -121,9 +112,6 @@ type FlatTableConfig struct {
 	// MaxFailures is the maximum consecutive failures
 	MaxFailures int
 
-	// SweepInterval is how often to rotate active/inactive nodes (default 10 min)
-	SweepInterval time.Duration
-
 	// SweepPercent is percentage of nodes to rotate during sweep (default 10%)
 	SweepPercent int
 
@@ -164,10 +152,6 @@ func NewFlatTable(cfg FlatTableConfig) (*FlatTable, error) {
 		cfg.MaxFailures = DefaultMaxFailures
 	}
 
-	if cfg.SweepInterval <= 0 {
-		cfg.SweepInterval = DefaultSweepInterval
-	}
-
 	if cfg.SweepPercent <= 0 || cfg.SweepPercent > 100 {
 		cfg.SweepPercent = DefaultSweepPercent
 	}
@@ -183,9 +167,7 @@ func NewFlatTable(cfg FlatTableConfig) (*FlatTable, error) {
 		pingRate:            cfg.PingRate,
 		maxNodeAge:          cfg.MaxNodeAge,
 		maxFailures:         cfg.MaxFailures,
-		sweepInterval:       cfg.SweepInterval,
 		sweepPercent:        cfg.SweepPercent,
-		lastSweep:           time.Now(),
 		nodeChangedCallback: cfg.NodeChangedCallback,
 		logger:              cfg.Logger,
 	}
@@ -202,6 +184,10 @@ func (t *FlatTable) LoadInitialNodesFromDB() error {
 		if t.ipLimiter.CanAdd(n) {
 			t.activeNodes[n.ID()] = n
 			t.ipLimiter.Add(n)
+
+			if err := t.db.UpdateLastActive(n.ID(), time.Now()); err != nil {
+				t.logger.WithError(err).Warn("failed to mark node as active")
+			}
 		}
 	}
 
@@ -313,7 +299,7 @@ func (t *FlatTable) Add(n *node.Node) bool {
 		t.logger.WithError(err).Warn("failed to queue new node")
 		return false
 	}
-	if err := t.db.UpdateLastActive(nodeID, true); err != nil {
+	if err := t.db.UpdateLastActive(nodeID, time.Now()); err != nil {
 		t.logger.WithError(err).Warn("failed to mark new node as active")
 	}
 
@@ -487,30 +473,29 @@ func (t *FlatTable) GetNodesNeedingPing() []*node.Node {
 // to allow newly discovered nodes to be tested before being demoted.
 // Loads inactive nodes from DB and tries to promote them to fill available slots.
 func (t *FlatTable) PerformSweep() {
-	now := time.Now()
-
 	t.mu.Lock()
-	if now.Sub(t.lastSweep) < t.sweepInterval {
-		t.mu.Unlock()
-		return // Not time yet
-	}
-	t.lastSweep = now
-
 	activeCount := len(t.activeNodes)
 	t.mu.Unlock()
 
 	// Calculate how many nodes to demote
 	var demoteCount int
 	var reason string
+
+	sweepMax := activeCount
+	if sweepMax > t.maxActiveNodes {
+		sweepMax = t.maxActiveNodes
+	}
+	sweepCount := int(float64(sweepMax) * float64(t.sweepPercent) / 100.0)
+
 	if activeCount > t.maxActiveNodes {
 		// Over capacity - remove excess only
 		demoteCount = activeCount - t.maxActiveNodes
-		reason = "excess capacity"
+		reason = "demote excess"
 	} else {
 		// At or under capacity - don't demote any nodes
 		// This allows newly discovered nodes to remain and be tested
 		demoteCount = 0
-		reason = "at capacity, no demotion needed"
+		reason = "active sweep"
 	}
 
 	// Only process demotion if we need to demote nodes
@@ -551,33 +536,23 @@ func (t *FlatTable) PerformSweep() {
 			t.ipLimiter.Remove(nodeID)
 			t.nodesDemoted++
 
-			// Update last_active to mark as inactive
-			if err := t.db.UpdateLastActive(nodeID, false); err != nil {
-				t.logger.WithError(err).Warn("failed to mark node as inactive")
+			// Do full update to store latest request stats & timestamps
+			if err := t.db.UpdateNodeFull(n); err != nil {
+				t.logger.WithError(err).Warn("failed to update node")
 			}
 		}
 		demotedCount = len(nodesToDemote)
 		slotsAvailable = t.maxActiveNodes - len(t.activeNodes)
 		t.mu.Unlock()
-
-		t.logger.WithFields(logrus.Fields{
-			"demoted": demotedCount,
-			"reason":  reason,
-			"slots":   slotsAvailable,
-		}).Info("performed active pool sweep - demoted nodes")
 	} else {
 		// No demotion needed
 		t.mu.Lock()
 		slotsAvailable = t.maxActiveNodes - len(t.activeNodes)
-		currentActive := len(t.activeNodes)
 		t.mu.Unlock()
-
-		t.logger.WithFields(logrus.Fields{
-			"activeNodes": currentActive,
-			"maxActive":   t.maxActiveNodes,
-			"reason":      reason,
-		}).Debug("performed active pool sweep - no demotion needed")
 	}
+
+	// Add sweep count to promote inactive nodes
+	slotsAvailable += sweepCount
 
 	// Load inactive nodes from DB and try to promote them
 	if slotsAvailable > 0 {
@@ -597,7 +572,7 @@ func (t *FlatTable) PerformSweep() {
 			}
 
 			// Check if we have room
-			if currentSize >= t.maxActiveNodes {
+			if currentSize >= t.maxActiveNodes+sweepCount {
 				break
 			}
 
@@ -614,7 +589,7 @@ func (t *FlatTable) PerformSweep() {
 			t.mu.Unlock()
 
 			// Update last_active to mark as active
-			if err := t.db.UpdateLastActive(n.ID(), true); err != nil {
+			if err := t.db.UpdateLastActive(n.ID(), time.Now()); err != nil {
 				t.logger.WithError(err).Warn("failed to mark node as active")
 			}
 
@@ -625,8 +600,14 @@ func (t *FlatTable) PerformSweep() {
 			}
 		}
 
-		if promotedCount > 0 {
-			t.logger.WithField("promoted", promotedCount).Info("performed active pool sweep - promoted inactive nodes")
+		if promotedCount > 0 || demotedCount > 0 {
+			t.logger.WithFields(logrus.Fields{
+				"promoted": promotedCount,
+				"demoted":  demotedCount,
+				"reason":   reason,
+				"slots":    slotsAvailable,
+				"sweep":    sweepCount,
+			}).Info("active pool sweep completed")
 		}
 	}
 }
@@ -682,7 +663,7 @@ func (t *FlatTable) performImmediateSweep() {
 		t.nodesDemoted++
 
 		// Update last_active to mark as inactive
-		if err := t.db.UpdateLastActive(nodeID, false); err != nil {
+		if err := t.db.UpdateLastActive(nodeID, time.Now()); err != nil {
 			t.logger.WithError(err).Warn("failed to mark node as inactive")
 		}
 	}

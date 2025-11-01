@@ -118,6 +118,7 @@ func New(cfg *Config) (*Service, error) {
 		PrivateKey:          cfg.PrivateKey,
 		OnHandshakeComplete: cfg.OnHandshakeComplete,
 		OnNodeUpdate:        cfg.OnNodeUpdate,
+		OnNodeSeen:          cfg.OnNodeSeen,
 		OnFindNode:          cfg.OnFindNode,
 		OnTalkReq:           cfg.OnTalkReq,
 		OnPongReceived:      cfg.OnPongReceived,

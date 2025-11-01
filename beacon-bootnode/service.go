@@ -110,9 +110,8 @@ func New(cfg *Config) (*Service, error) {
 		PingRate:            200, // pings per minute
 		MaxNodeAge:          cfg.MaxNodeAge,
 		MaxFailures:         cfg.MaxFailures,
-		SweepInterval:       10 * time.Minute, // Rotate nodes every 10 minutes
-		SweepPercent:        10,               // Rotate 10% of active nodes
-		NodeChangedCallback: nil,              // DB updates are queued automatically
+		SweepPercent:        10,  // Rotate 10% of active nodes
+		NodeChangedCallback: nil, // DB updates are queued automatically
 		Logger:              cfg.Logger,
 	}
 	routingTable, err := table.NewFlatTable(flatTableConfig)
@@ -160,6 +159,13 @@ func New(cfg *Config) (*Service, error) {
 		s.CheckAndAddNode(n)
 	}
 
+	discv5Config.OnNodeSeen = func(n *node.Node, timestamp time.Time) {
+		// Queue last_seen timestamp update for persistence
+		if err := s.nodeDB.UpdateLastSeen(n.ID(), timestamp); err != nil {
+			s.config.Logger.WithError(err).WithField("nodeID", n.ID()).Debug("failed to queue last_seen update")
+		}
+	}
+
 	discv5Config.OnFindNode = func(msg *protocol.FindNode, requester *net.UDPAddr) []*node.Node {
 		// Serve FINDNODE requests from routing table with score-weighted random selection
 		nodes := routingTable.GetNodesByDistance(localID, msg.Distances, 16)
@@ -175,7 +181,7 @@ func New(cfg *Config) (*Service, error) {
 	if cfg.EnableIPDiscovery {
 		// Create IP discovery service with callback for consensus
 		ipDiscoveryConfig := discv5.IPDiscoveryConfig{
-			MinReports:        3,
+			MinReports:        5,
 			MajorityThreshold: 0.75,
 			ReportExpiry:      30 * time.Minute,
 			RecentWindow:      5 * time.Minute,
@@ -429,8 +435,14 @@ func (s *Service) connectBootNodes() {
 		}
 
 		// Update node stats and add to active pool
-		bootNode.SetLastSeen(time.Now())
+		now := time.Now()
+		bootNode.SetLastSeen(now)
 		bootNode.ResetFailureCount()
+
+		// Queue last_seen update
+		if err := s.nodeDB.UpdateLastSeen(bootNode.ID(), now); err != nil {
+			s.config.Logger.WithError(err).Warn("failed to queue last_seen update for boot node")
+		}
 
 		// Perform lookup using boot node
 		_, err = s.lookup.Lookup(s.ctx, bootNode.ID(), 16)
@@ -582,8 +594,14 @@ func (s *Service) CheckAndAddNode(n *node.Node) bool {
 
 		// Ping successful - update stats and add to table
 		s.config.Logger.WithField("peerID", n.PeerID()).WithField("rtt", rtt).Info("ping successful, adding new node")
-		n.SetLastSeen(time.Now())
+		now := time.Now()
+		n.SetLastSeen(now)
 		n.ResetFailureCount() // This also increments success count
+
+		// Queue last_seen update
+		if err := s.nodeDB.UpdateLastSeen(n.ID(), now); err != nil {
+			s.config.Logger.WithError(err).Warn("failed to queue last_seen update")
+		}
 
 		// Add to table (will go to active even if over capacity, sweep handles cleanup)
 		return s.table.Add(n)

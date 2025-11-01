@@ -203,13 +203,8 @@ func (d *Database) UpdateNodeLastSeen(tx *sqlx.Tx, nodeID []byte, timestamp int6
 }
 
 // UpdateNodeLastActive updates the last_active timestamp of a node.
-// If active is true, sets last_active to current time. If false, sets to NULL (inactive).
-func (d *Database) UpdateNodeLastActive(tx *sqlx.Tx, nodeID []byte, active bool) error {
-	if active {
-		_, err := tx.Exec("UPDATE nodes SET last_active = $1 WHERE nodeid = $2", time.Now().Unix(), nodeID)
-		return err
-	}
-	_, err := tx.Exec("UPDATE nodes SET last_active = NULL WHERE nodeid = $1", nodeID)
+func (d *Database) UpdateNodeLastActive(tx *sqlx.Tx, nodeID []byte, timestamp int64) error {
+	_, err := tx.Exec("UPDATE nodes SET last_active = $1 WHERE nodeid = $2", timestamp, nodeID)
 	return err
 }
 

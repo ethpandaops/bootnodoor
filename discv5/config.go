@@ -51,6 +51,9 @@ type Config struct {
 	// OnNodeUpdate is called when a node's ENR is updated
 	OnNodeUpdate protocol.OnNodeUpdateCallback
 
+	// OnNodeSeen is called when a node is seen (receives a message)
+	OnNodeSeen protocol.OnNodeSeenCallback
+
 	// OnFindNode is called when a FINDNODE request is received
 	OnFindNode protocol.OnFindNodeCallback
 
