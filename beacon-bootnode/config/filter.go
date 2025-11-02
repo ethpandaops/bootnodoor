@@ -380,7 +380,7 @@ func (f *ForkDigestFilter) GetCurrentFork() string {
 	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
 
 	// Get fork name for current epoch
-	return f.config.GetForkNameForEpoch(currentEpoch)
+	return f.config.GetForkNameAtEpoch(currentEpoch)
 }
 
 // GetCurrentDigest returns the current fork digest as a hex string.
