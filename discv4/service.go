@@ -21,25 +21,22 @@ import (
 
 	"github.com/ethpandaops/bootnodoor/discv4/node"
 	"github.com/ethpandaops/bootnodoor/discv4/protocol"
-	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/enode"
-	"github.com/ethpandaops/bootnodoor/transport"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/sirupsen/logrus"
 )
 
-// transportAdapter adapts the transport.UDPTransport to the protocol.Transport interface.
-type transportAdapter struct {
-	sendFunc func(data []byte, to *net.UDPAddr) error
-}
-
-func (t *transportAdapter) SendTo(data []byte, to *net.UDPAddr) error {
-	return t.sendFunc(data, to)
+// Transport is the interface for sending packets.
+// It must have a LocalAddr() method to get the bind address.
+type Transport interface {
+	protocol.Transport
+	LocalAddr() *net.UDPAddr
+	AddHandler(handler func(data []byte, from *net.UDPAddr) bool)
 }
 
 // Service represents a discv4 service instance.
 //
 // The service manages:
-//   - UDP transport layer
 //   - Protocol handler
 //   - Node database
 //   - Request routing
@@ -54,7 +51,7 @@ type Service struct {
 	localENR *enr.Record
 
 	// Transport layer
-	transport *transport.UDPTransport
+	transport Transport
 
 	// Protocol handler
 	handler *protocol.Handler
@@ -69,7 +66,26 @@ type Service struct {
 }
 
 // New creates a new discv4 service.
-func New(config *Config) (*Service, error) {
+//
+// The transport must be created first and passed to New().
+// The service will register its packet handler with the transport.
+//
+// Example:
+//
+//	transport, _ := transport.NewUDPTransport(&transport.Config{
+//	    ListenAddr: "0.0.0.0:30303",
+//	})
+//
+//	privKey, _ := crypto.GenerateKey()
+//	config := DefaultConfig()
+//	config.PrivateKey = privKey
+//
+//	service, err := New(config, transport)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer service.Stop()
+func New(config *Config, transport Transport) (*Service, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -78,18 +94,63 @@ func New(config *Config) (*Service, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Get local address from transport for handler config
+	localAddr := transport.LocalAddr()
+
+	// Create protocol handler
+	handlerConfig := protocol.HandlerConfig{
+		PrivateKey:       config.PrivateKey,
+		LocalENR:         config.LocalENR,
+		LocalAddr:        localAddr,
+		BondExpiration:   config.BondExpiration,
+		RequestTimeout:   config.RequestTimeout,
+		ExpirationWindow: config.ExpirationWindow,
+		OnPing:           config.OnPing,
+		OnFindnode:       config.OnFindnode,
+		OnENRRequest:     config.OnENRRequest,
+		OnNodeSeen:       config.OnNodeSeen,
+	}
+
+	handler := protocol.NewHandler(ctx, handlerConfig, transport)
+
 	s := &Service{
 		config:     config,
 		privateKey: config.PrivateKey,
 		localENR:   config.LocalENR,
+		transport:  transport,
+		handler:    handler,
 		ctx:        ctx,
 		cancel:     cancel,
 	}
 
+	// Register packet handler with transport
+	transport.AddHandler(s.packetHandler)
+
 	return s, nil
 }
 
+// packetHandler is the packet handler function registered with the transport.
+// It wraps the protocol handler's HandlePacket method.
+func (s *Service) packetHandler(data []byte, from *net.UDPAddr) bool {
+	// Try to handle as discv4 packet.
+	// The handler validates the packet signature and structure.
+	// Note: We don't pre-filter based on magic strings because a discv4
+	// packet (which has a random hash) could theoretically start with
+	// the bytes "discv5". We rely on cryptographic validation.
+	s.handler.HandlePacket(data, from)
+
+	// Note: discv4.HandlePacket doesn't currently return an error.
+	// The handler internally validates and drops invalid packets.
+	// For now, we assume any packet that reaches here could be discv4.
+	// This means if both discv5 and discv4 reject a packet, discv4
+	// will be the last one to try (and silently drop it).
+	return true
+}
+
 // Start starts the discv4 service.
+//
+// Note: The transport is started separately and passed to New().
+// This method is kept for compatibility and lifecycle management.
 func (s *Service) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -98,67 +159,17 @@ func (s *Service) Start() error {
 		return fmt.Errorf("service already running")
 	}
 
-	logrus.WithFields(logrus.Fields{
-		"listen_addr": s.config.ListenAddr,
-	}).Info("Starting discv4 service")
-
-	// Create protocol handler first (needed for transport handler)
-	handlerConfig := protocol.HandlerConfig{
-		PrivateKey:       s.privateKey,
-		LocalENR:         s.localENR,
-		LocalAddr:        s.config.ListenAddr,
-		BondExpiration:   s.config.BondExpiration,
-		RequestTimeout:   s.config.RequestTimeout,
-		ExpirationWindow: s.config.ExpirationWindow,
-		OnPing:           s.config.OnPing,
-		OnFindnode:       s.config.OnFindnode,
-		OnENRRequest:     s.config.OnENRRequest,
-		OnNodeSeen:       s.config.OnNodeSeen,
-	}
-
-	// Dummy transport for handler creation (will be replaced)
-	dummyTransport := &transportAdapter{sendFunc: func(data []byte, to *net.UDPAddr) error {
-		return fmt.Errorf("transport not initialized")
-	}}
-
-	s.handler = protocol.NewHandler(s.ctx, handlerConfig, dummyTransport)
-
-	// Create transport with handler
-	// Wrap the handler to match the transport.PacketHandler signature
-	packetHandler := func(data []byte, from *net.UDPAddr) {
-		if err := s.handler.HandlePacket(data, from); err != nil {
-			logrus.WithError(err).Debug("Error handling packet")
-		}
-	}
-
-	transportConfig := &transport.Config{
-		ListenAddr:     s.config.ListenAddr.String(),
-		Handler:        packetHandler,
-		RateLimitPerIP: int(s.config.RateLimitPerIP),
-		ReadBuffer:     s.config.ReadBufferSize,
-		WriteBuffer:    s.config.WriteBufferSize,
-	}
-
-	t, err := transport.NewUDPTransport(transportConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create transport: %w", err)
-	}
-
-	s.transport = t
-
-	// Update handler with real transport
-	s.handler = protocol.NewHandler(s.ctx, handlerConfig, &transportAdapter{
-		sendFunc: s.transport.SendTo,
-	})
-
 	s.running = true
 
-	logrus.Info("discv4 service started successfully")
+	logrus.Info("discv4 service started")
 
 	return nil
 }
 
 // Stop stops the discv4 service.
+//
+// Note: This does NOT close the transport as it's managed externally.
+// The caller is responsible for closing the transport.
 func (s *Service) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -172,12 +183,7 @@ func (s *Service) Stop() error {
 	// Cancel context
 	s.cancel()
 
-	// Stop transport
-	if s.transport != nil {
-		if err := s.transport.Close(); err != nil {
-			logrus.WithError(err).Error("Error stopping transport")
-		}
-	}
+	// NOTE: Transport is NOT closed here - it's managed by the caller
 
 	s.running = false
 
@@ -312,8 +318,9 @@ func (s *Service) BondedNodes() []*node.Node {
 
 // LocalAddr returns the local listening address.
 func (s *Service) LocalAddr() *net.UDPAddr {
-	return s.config.ListenAddr
+	return s.transport.LocalAddr()
 }
+
 
 // LocalNodeID returns the local node ID.
 func (s *Service) LocalNodeID() node.ID {
@@ -336,7 +343,7 @@ func (s *Service) SetLocalENR(record *enr.Record) {
 		s.handler = protocol.NewHandler(s.ctx, protocol.HandlerConfig{
 			PrivateKey:       s.privateKey,
 			LocalENR:         record,
-			LocalAddr:        s.config.ListenAddr,
+			LocalAddr:        s.transport.LocalAddr(),
 			BondExpiration:   s.config.BondExpiration,
 			RequestTimeout:   s.config.RequestTimeout,
 			ExpirationWindow: s.config.ExpirationWindow,
@@ -344,20 +351,19 @@ func (s *Service) SetLocalENR(record *enr.Record) {
 			OnFindnode:       s.config.OnFindnode,
 			OnENRRequest:     s.config.OnENRRequest,
 			OnNodeSeen:       s.config.OnNodeSeen,
-		}, &transportAdapter{
-			sendFunc: s.transport.SendTo,
-		})
+		}, s.transport)
 	}
 	s.mu.Unlock()
 }
 
 // LocalEnode returns the local enode:// URL.
 func (s *Service) LocalEnode() string {
+	addr := s.transport.LocalAddr()
 	en := &enode.Enode{
 		PublicKey: &s.privateKey.PublicKey,
-		IP:        s.config.ListenAddr.IP,
-		UDP:       uint16(s.config.ListenAddr.Port),
-		TCP:       uint16(s.config.ListenAddr.Port),
+		IP:        addr.IP,
+		UDP:       uint16(addr.Port),
+		TCP:       uint16(addr.Port),
 	}
 	return en.String()
 }
@@ -372,10 +378,7 @@ func (s *Service) Stats() map[string]interface{} {
 
 	stats := s.handler.Stats()
 
-	// Add transport stats
-	if s.transport != nil {
-		stats["transport"] = s.transport.Metrics()
-	}
+	// Note: Transport stats are not included since transport is managed externally
 
 	return stats
 }

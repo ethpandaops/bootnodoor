@@ -18,6 +18,7 @@ import (
 	"github.com/ethpandaops/bootnodoor/discv5"
 	"github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/transport"
 )
 
 var (
@@ -279,24 +280,36 @@ func createTempService() (*discv5.Service, error) {
 		logger.SetLevel(logrus.PanicLevel)
 	}
 
+	// Create transport first
+	listenAddr := fmt.Sprintf("%s:%d", bindIP.String(), bindPort)
+	transportConfig := &transport.Config{
+		ListenAddr: listenAddr,
+		Logger:     logger,
+	}
+	udpTransport, err := transport.NewUDPTransport(transportConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create service config
 	cfg := discv5.DefaultConfig()
 	cfg.PrivateKey = privKey
-	cfg.BindIP = bindIP
-	cfg.BindPort = bindPort
 	cfg.ENRIP = enrIPAddr
-	cfg.ENRPort = 0 // Will use actual bound port
+	cfg.ENRPort = 0 // Will use actual bound port from transport
 	cfg.Logger = logger
 	cfg.Context = context.Background()
 
-	// Create service
-	service, err := discv5.New(cfg)
+	// Create service (pass transport)
+	service, err := discv5.New(cfg, udpTransport)
 	if err != nil {
+		udpTransport.Close()
 		return nil, err
 	}
 
 	// Start service
 	if err := service.Start(); err != nil {
+		service.Stop()
+		udpTransport.Close()
 		return nil, err
 	}
 

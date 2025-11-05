@@ -35,7 +35,8 @@ const (
 //
 // The handler should process the packet and return quickly.
 // Long-running operations should be done in a separate goroutine.
-type PacketHandler func(data []byte, from *net.UDPAddr)
+// Returns true if the packet was handled, false if not recognized.
+type PacketHandler func(data []byte, from *net.UDPAddr) bool
 
 // UDPTransport manages UDP socket I/O for the discv5 protocol.
 //
@@ -44,12 +45,14 @@ type PacketHandler func(data []byte, from *net.UDPAddr)
 //   - Per-IP rate limiting
 //   - Metrics collection
 //   - Graceful shutdown
+//   - Multiple protocol handler support
 type UDPTransport struct {
 	// conn is the UDP connection
 	conn *net.UDPConn
 
-	// handler is called for each received packet
-	handler PacketHandler
+	// handlers is a list of packet handlers (tried in order)
+	handlers []PacketHandler
+	handlersMu sync.RWMutex
 
 	// logger for debug and error messages
 	logger logrus.FieldLogger
@@ -74,10 +77,12 @@ type UDPTransport struct {
 // Config contains configuration for the UDP transport.
 type Config struct {
 	// ListenAddr is the address to bind to (e.g., "0.0.0.0:9000")
+	// Ignored if Conn is provided.
 	ListenAddr string
 
-	// Handler is called for each received packet
-	Handler PacketHandler
+	// Conn is an optional existing UDP connection to use instead of creating a new one.
+	// When provided, ListenAddr, ReadBuffer, and WriteBuffer are ignored.
+	Conn *net.UDPConn
 
 	// Logger for debug and error messages (optional)
 	Logger logrus.FieldLogger
@@ -86,36 +91,35 @@ type Config struct {
 	RateLimitPerIP int
 
 	// ReadBuffer size in bytes (0 = use default)
+	// Ignored if Conn is provided.
 	ReadBuffer int
 
 	// WriteBuffer size in bytes (0 = use default)
+	// Ignored if Conn is provided.
 	WriteBuffer int
 }
 
 // NewUDPTransport creates a new UDP transport.
 //
 // The transport starts listening immediately and spawns goroutines
-// for packet reception. Call Close() to shut down gracefully.
+// for packet reception. Use AddHandler() to register protocol handlers.
+// Call Close() to shut down gracefully.
 //
 // Example:
 //
 //	transport, err := NewUDPTransport(&Config{
 //	    ListenAddr: "0.0.0.0:9000",
-//	    Handler: func(data []byte, from *net.UDPAddr) {
-//	        // Process packet
-//	    },
 //	})
 //	if err != nil {
 //	    return err
 //	}
 //	defer transport.Close()
+//
+//	// Register handlers
+//	transport.AddHandler(myHandler)
 func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("transport: nil config")
-	}
-
-	if cfg.Handler == nil {
-		return nil, fmt.Errorf("transport: nil packet handler")
 	}
 
 	// Default logger
@@ -125,33 +129,47 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		logger = logrus.StandardLogger()
 	}
 
-	// Resolve listen address
-	addr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
-	if err != nil {
-		return nil, fmt.Errorf("transport: failed to resolve address: %w", err)
-	}
+	var conn *net.UDPConn
 
-	// Create UDP socket
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("transport: failed to listen: %w", err)
-	}
+	// Use provided connection or create a new one
+	if cfg.Conn != nil {
+		// Use provided connection (for multiplexing)
+		conn = cfg.Conn
+		logger.WithField("addr", conn.LocalAddr()).Debug("transport: using provided connection")
+	} else {
+		// Create new connection
+		if cfg.ListenAddr == "" {
+			return nil, fmt.Errorf("transport: ListenAddr required when Conn is not provided")
+		}
 
-	// Set buffer sizes
-	readBuf := cfg.ReadBuffer
-	if readBuf == 0 {
-		readBuf = DefaultReadBuffer
-	}
-	writeBuf := cfg.WriteBuffer
-	if writeBuf == 0 {
-		writeBuf = DefaultWriteBuffer
-	}
+		// Resolve listen address
+		addr, err := net.ResolveUDPAddr("udp", cfg.ListenAddr)
+		if err != nil {
+			return nil, fmt.Errorf("transport: failed to resolve address: %w", err)
+		}
 
-	if err := conn.SetReadBuffer(readBuf); err != nil {
-		logger.Warn("transport: failed to set read buffer", "error", err)
-	}
-	if err := conn.SetWriteBuffer(writeBuf); err != nil {
-		logger.Warn("transport: failed to set write buffer", "error", err)
+		// Create UDP socket
+		conn, err = net.ListenUDP("udp", addr)
+		if err != nil {
+			return nil, fmt.Errorf("transport: failed to listen: %w", err)
+		}
+
+		// Set buffer sizes
+		readBuf := cfg.ReadBuffer
+		if readBuf == 0 {
+			readBuf = DefaultReadBuffer
+		}
+		writeBuf := cfg.WriteBuffer
+		if writeBuf == 0 {
+			writeBuf = DefaultWriteBuffer
+		}
+
+		if err := conn.SetReadBuffer(readBuf); err != nil {
+			logger.Warn("transport: failed to set read buffer", "error", err)
+		}
+		if err := conn.SetWriteBuffer(writeBuf); err != nil {
+			logger.Warn("transport: failed to set write buffer", "error", err)
+		}
 	}
 
 	// Create context for shutdown
@@ -165,7 +183,7 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 
 	t := &UDPTransport{
 		conn:        conn,
-		handler:     cfg.Handler,
+		handlers:    make([]PacketHandler, 0),
 		logger:      logger,
 		rateLimiter: rateLimiter,
 		metrics:     NewMetrics(),
@@ -195,6 +213,37 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 // LocalAddr returns the local UDP address being listened on.
 func (t *UDPTransport) LocalAddr() *net.UDPAddr {
 	return t.conn.LocalAddr().(*net.UDPAddr)
+}
+
+// Conn returns the underlying UDP connection.
+func (t *UDPTransport) Conn() *net.UDPConn {
+	return t.conn
+}
+
+// AddHandler registers a packet handler.
+//
+// Handlers are called in the order they are registered.
+// The first handler to return true stops the handler chain.
+// If a handler returns false, the next handler in the chain is tried.
+//
+// For optimal performance, register handlers in order of likelihood:
+//   - Register discv5 before discv4 (discv5 has magic string, faster to validate)
+//   - Each handler should quickly validate and return false if not their protocol
+//
+// This is thread-safe and can be called while the transport is running.
+//
+// Example:
+//
+//	transport.AddHandler(func(data []byte, from *net.UDPAddr) bool {
+//	    // Try to handle packet, return true if successful
+//	    err := myProtocol.HandlePacket(data, from)
+//	    return err == nil
+//	})
+func (t *UDPTransport) AddHandler(handler func(data []byte, from *net.UDPAddr) bool) {
+	t.handlersMu.Lock()
+	defer t.handlersMu.Unlock()
+	t.handlers = append(t.handlers, PacketHandler(handler))
+	t.logger.Debug("transport: handler registered")
 }
 
 // SendTo sends a packet to the specified address.
@@ -264,6 +313,29 @@ func (t *UDPTransport) Send(data []byte, to *net.UDPAddr) error {
 		"size": n,
 	}).Trace("transport: packet sent successfully")
 	return nil
+}
+
+// dispatchPacket routes a packet to the registered handlers.
+//
+// Handlers are tried in order until one returns true.
+func (t *UDPTransport) dispatchPacket(data []byte, from *net.UDPAddr) {
+	t.handlersMu.RLock()
+	handlers := t.handlers
+	t.handlersMu.RUnlock()
+
+	// Try each handler in order
+	for _, handler := range handlers {
+		if handler(data, from) {
+			// Handler accepted the packet
+			return
+		}
+	}
+
+	// No handler recognized the packet
+	t.logger.WithFields(logrus.Fields{
+		"from": from,
+		"size": len(data),
+	}).Debug("transport: unrecognized packet (no handler accepted it)")
 }
 
 // receiveLoop receives packets from the UDP socket.
@@ -338,8 +410,8 @@ func (t *UDPTransport) receiveLoop() {
 		dataCopy := make([]byte, n)
 		copy(dataCopy, buffer[:n])
 
-		// Call handler (non-blocking)
-		go t.handler(dataCopy, from)
+		// Call handlers (non-blocking)
+		go t.dispatchPacket(dataCopy, from)
 	}
 }
 

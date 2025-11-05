@@ -14,11 +14,10 @@ import (
 	"sync"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/discv5/protocol"
 	"github.com/ethpandaops/bootnodoor/discv5/session"
-	"github.com/ethpandaops/bootnodoor/transport"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/sirupsen/logrus"
 )
 
@@ -34,7 +33,7 @@ type Service struct {
 	localNode *node.Node
 
 	// transport is the UDP transport layer
-	transport *transport.UDPTransport
+	transport protocol.Transport
 
 	// sessions manages encrypted sessions
 	sessions *session.Cache
@@ -49,20 +48,35 @@ type Service struct {
 	cancelCtx context.CancelFunc
 }
 
+// Transport is the interface for sending packets.
+// It must have a LocalAddr() method to get the bind address.
+type Transport interface {
+	protocol.Transport
+	LocalAddr() *net.UDPAddr
+	AddHandler(handler func(data []byte, from *net.UDPAddr) bool)
+}
+
 // New creates a new discv5 service.
 //
+// The transport must be created first and passed to New().
+// The service will register its packet handler with the transport.
+//
 // Example:
+//
+//	transport, _ := transport.NewUDPTransport(&transport.Config{
+//	    ListenAddr: "0.0.0.0:9000",
+//	})
 //
 //	privKey, _ := crypto.GenerateKey()
 //	config := DefaultConfig()
 //	config.PrivateKey = privKey
 //
-//	service, err := New(config)
+//	service, err := New(config, transport)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
 //	defer service.Stop()
-func New(cfg *Config) (*Service, error) {
+func New(cfg *Config, transport Transport) (*Service, error) {
 	if cfg == nil {
 		cfg = DefaultConfig()
 	}
@@ -77,8 +91,17 @@ func New(cfg *Config) (*Service, error) {
 		cfg.Logger = logrus.New()
 	}
 
+	// Get ENR port from transport if not specified
+	enrPort := cfg.ENRPort
+	if enrPort == 0 {
+		// Get port from transport's bind address
+		bindAddr := transport.LocalAddr()
+		enrPort = bindAddr.Port
+		cfg.Logger.WithField("port", enrPort).Debug("using transport port for ENR")
+	}
+
 	// Create local ENR (using provided ENR as baseline if available)
-	localENR, err := createLocalENR(cfg)
+	localENR, err := createLocalENR(cfg, enrPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create local ENR: %w", err)
 	}
@@ -91,8 +114,6 @@ func New(cfg *Config) (*Service, error) {
 
 	cfg.Logger.WithFields(logrus.Fields{
 		"peerID": localNode.PeerID(),
-		"ip":     cfg.BindIP,
-		"port":   cfg.BindPort,
 	}).Info("created local node")
 
 	enrStr, err := localENR.EncodeBase64()
@@ -110,7 +131,7 @@ func New(cfg *Config) (*Service, error) {
 	// Create session cache
 	sessionCache := session.NewCache(cfg.MaxSessions, cfg.SessionLifetime, cfg.Logger)
 
-	// Create protocol handler (transport will be set later)
+	// Create protocol handler (transport will be set via SetTransport)
 	// Wire up callbacks from our config to the handler
 	handlerConfig := protocol.HandlerConfig{
 		LocalNode:           localNode,
@@ -126,42 +147,48 @@ func New(cfg *Config) (*Service, error) {
 	}
 	protocolHandler := protocol.NewHandler(ctx, handlerConfig)
 
-	// Create UDP transport
-	listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), cfg.BindPort)
-	transportConfig := &transport.Config{
-		ListenAddr: listenAddr,
-		Handler: func(data []byte, from *net.UDPAddr) {
-			protocolHandler.HandleIncomingPacket(data, from)
-		},
-		Logger:         cfg.Logger,
-		RateLimitPerIP: 100, // 100 packets/sec per IP
-	}
-
-	udpTransport, err := transport.NewUDPTransport(transportConfig)
-	if err != nil {
-		cancelCtx() // Clean up context
-		return nil, fmt.Errorf("failed to create UDP transport: %w", err)
-	}
-
-	// Connect transport to handler
-	protocolHandler.SetTransport(udpTransport)
-
 	s := &Service{
 		config:    cfg,
 		localNode: localNode,
-		transport: udpTransport,
+		transport: transport,
 		sessions:  sessionCache,
 		handler:   protocolHandler,
 		ctx:       ctx,
 		cancelCtx: cancelCtx,
 	}
 
+	// Set transport on handler
+	protocolHandler.SetTransport(transport)
+
+	// Register packet handler with transport
+	transport.AddHandler(s.packetHandler)
+
 	return s, nil
+}
+
+// packetHandler is the packet handler function registered with the transport.
+// It wraps the protocol handler's HandleIncomingPacket method.
+func (s *Service) packetHandler(data []byte, from *net.UDPAddr) bool {
+	// Try to handle as discv5 packet.
+	// The handler does full validation including checking the "discv5" magic string.
+	// Note: While discv5 packets normally start with "discv5", we don't pre-filter
+	// because a discv4 packet could theoretically have a random hash collision.
+	// We rely on proper cryptographic validation in the handler.
+	err := s.handler.HandleIncomingPacket(data, from)
+	if err != nil {
+		// Could not handle as discv5, let other handlers try
+		s.config.Logger.WithError(err).Trace("discv5: could not handle packet")
+		return false
+	}
+
+	// Successfully handled as discv5
+	return true
 }
 
 // Start starts the discv5 service.
 //
-// This starts the UDP packet receiver.
+// Note: The transport is started separately and passed to New().
+// This method is kept for compatibility and lifecycle management.
 func (s *Service) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -177,7 +204,8 @@ func (s *Service) Start() error {
 
 // Stop stops the discv5 service.
 //
-// This gracefully shuts down all components.
+// Note: This does NOT close the transport as it's managed externally.
+// The caller is responsible for closing the transport.
 func (s *Service) Stop() error {
 	s.mu.Lock()
 	if !s.running {
@@ -190,12 +218,7 @@ func (s *Service) Stop() error {
 	// Signal stop to background tasks
 	s.cancelCtx()
 
-	// Close UDP transport
-	if s.transport != nil {
-		if err := s.transport.Close(); err != nil {
-			s.config.Logger.WithError(err).Error("failed to close UDP transport")
-		}
-	}
+	// NOTE: Transport is NOT closed here - it's managed by the caller
 
 	// Close session cache
 	if err := s.sessions.Close(); err != nil {
@@ -223,10 +246,6 @@ func (s *Service) Sessions() *session.Cache {
 	return s.sessions
 }
 
-// Transport returns the UDP transport.
-func (s *Service) Transport() *transport.UDPTransport {
-	return s.transport
-}
 
 // Ping sends a PING request to a node and waits for a PONG response.
 //
@@ -358,7 +377,7 @@ func (s *Service) TalkReq(n *node.Node, protocolName string, request []byte) ([]
 // createLocalENR creates a local node's ENR record.
 // If cfg.LocalENR is provided and nothing changed, it returns the stored ENR as-is.
 // Only increments sequence number if there are actual changes.
-func createLocalENR(cfg *Config) (*enr.Record, error) {
+func createLocalENR(cfg *Config, enrPort int) (*enr.Record, error) {
 	// If we have a stored ENR, check if we need to update it
 	if cfg.LocalENR != nil {
 		needsUpdate := false
@@ -386,15 +405,13 @@ func createLocalENR(cfg *Config) (*enr.Record, error) {
 			}
 		}
 
-		if cfg.ENRPort != 0 {
-			storedPort := cfg.LocalENR.UDP()
-			if storedPort != uint16(cfg.ENRPort) {
-				needsUpdate = true
-				cfg.Logger.WithFields(logrus.Fields{
-					"old": storedPort,
-					"new": cfg.ENRPort,
-				}).Debug("port changed")
-			}
+		storedPort := cfg.LocalENR.UDP()
+		if storedPort != uint16(enrPort) {
+			needsUpdate = true
+			cfg.Logger.WithFields(logrus.Fields{
+				"old": storedPort,
+				"new": enrPort,
+			}).Debug("port changed")
 		}
 
 		// Check if eth2 field changed
@@ -428,13 +445,11 @@ func createLocalENR(cfg *Config) (*enr.Record, error) {
 	var enrIPv4 net.IP
 	var enrIPv6 net.IP
 
-	// IPv4: priority is ENRIP > stored ENR > BindIP
+	// IPv4: priority is ENRIP > stored ENR
 	if cfg.ENRIP != nil {
 		enrIPv4 = cfg.ENRIP
 	} else if cfg.LocalENR != nil && cfg.LocalENR.IP() != nil {
 		enrIPv4 = cfg.LocalENR.IP()
-	} else {
-		enrIPv4 = cfg.BindIP
 	}
 
 	// IPv6: priority is ENRIP6 > stored ENR
@@ -442,16 +457,6 @@ func createLocalENR(cfg *Config) (*enr.Record, error) {
 		enrIPv6 = cfg.ENRIP6
 	} else if cfg.LocalENR != nil && cfg.LocalENR.IP6() != nil {
 		enrIPv6 = cfg.LocalENR.IP6()
-	}
-
-	// Determine which port to use
-	var enrPort uint16
-	if cfg.ENRPort != 0 {
-		enrPort = uint16(cfg.ENRPort)
-	} else if cfg.LocalENR != nil && cfg.LocalENR.UDP() != 0 {
-		enrPort = cfg.LocalENR.UDP()
-	} else {
-		enrPort = uint16(cfg.BindPort)
 	}
 
 	// Add IPv4 address
@@ -464,8 +469,8 @@ func createLocalENR(cfg *Config) (*enr.Record, error) {
 		record.Set("ip6", enrIPv6)
 	}
 
-	// Add UDP port
-	record.Set("udp", enrPort)
+	// Add UDP port (from parameter, which comes from config or transport)
+	record.Set("udp", uint16(enrPort))
 
 	// Add TCP port if present in stored ENR
 	if cfg.LocalENR != nil && cfg.LocalENR.TCP() != 0 {

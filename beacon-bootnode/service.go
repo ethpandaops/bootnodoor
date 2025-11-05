@@ -15,6 +15,7 @@ import (
 	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/discv5/protocol"
+	"github.com/ethpandaops/bootnodoor/transport"
 	"github.com/sirupsen/logrus"
 )
 
@@ -28,6 +29,9 @@ import (
 type Service struct {
 	// config is the bootnode configuration
 	config *Config
+
+	// transport is the UDP transport layer
+	transport *transport.UDPTransport
 
 	// discv5Service is the underlying discv5 service
 	discv5Service *discv5.Service
@@ -130,6 +134,18 @@ func New(cfg *Config) (*Service, error) {
 	// Create context for graceful shutdown
 	s.ctx, s.cancelCtx = context.WithCancel(context.Background())
 
+	// Create UDP transport first
+	listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), cfg.BindPort)
+	transportConfig := &transport.Config{
+		ListenAddr: listenAddr,
+		Logger:     cfg.Logger,
+	}
+	udpTransport, err := transport.NewUDPTransport(transportConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create UDP transport: %w", err)
+	}
+	s.transport = udpTransport
+
 	// Load stored ENR if available (discv5 will create new one if nil)
 	storedENR := s.loadStoredENR()
 
@@ -138,8 +154,6 @@ func New(cfg *Config) (*Service, error) {
 	discv5Config.LocalENR = storedENR
 	discv5Config.Context = s.ctx
 	discv5Config.PrivateKey = cfg.PrivateKey
-	discv5Config.BindIP = cfg.BindIP
-	discv5Config.BindPort = cfg.BindPort
 	discv5Config.ENRIP = cfg.ENRIP
 	discv5Config.ENRIP6 = cfg.ENRIP6
 	discv5Config.ENRPort = cfg.ENRPort
@@ -202,9 +216,11 @@ func New(cfg *Config) (*Service, error) {
 		cfg.Logger.Info("IP discovery enabled - will detect public IP:Port from PONG responses")
 	}
 
-	// Create the discv5 service
-	s.discv5Service, err = discv5.New(discv5Config)
+	// Create the discv5 service (pass transport)
+	s.discv5Service, err = discv5.New(discv5Config, udpTransport)
 	if err != nil {
+		// Clean up transport if service creation fails
+		udpTransport.Close()
 		return nil, fmt.Errorf("failed to create discv5 service: %w", err)
 	}
 
@@ -292,6 +308,11 @@ func (s *Service) Stop() error {
 	// Stop discv5 service
 	if err := s.discv5Service.Stop(); err != nil {
 		s.config.Logger.WithError(err).Error("failed to stop discv5 service")
+	}
+
+	// Close transport
+	if err := s.transport.Close(); err != nil {
+		s.config.Logger.WithError(err).Error("failed to close transport")
 	}
 
 	// Signal stop to background tasks via context cancellation

@@ -3,7 +3,6 @@ package discv4
 import (
 	"crypto/ecdsa"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/ethpandaops/bootnodoor/discv4/protocol"
@@ -14,9 +13,6 @@ import (
 type Config struct {
 	// PrivateKey is the node's private key (required)
 	PrivateKey *ecdsa.PrivateKey
-
-	// ListenAddr is the UDP address to listen on (required)
-	ListenAddr *net.UDPAddr
 
 	// LocalENR is the node's ENR record (optional)
 	// If provided, it will be shared via ENRRESPONSE
@@ -32,20 +28,6 @@ type Config struct {
 	// ExpirationWindow is the acceptable time range for packet expiration (default: 20s)
 	// Packets with expiration outside this window are rejected
 	ExpirationWindow time.Duration
-
-	// Transport Configuration
-
-	// RateLimitPerIP is the maximum packets per second per IP address (default: 25)
-	RateLimitPerIP float64
-
-	// ReadBufferSize is the UDP read buffer size in bytes (default: 2MB)
-	ReadBufferSize int
-
-	// WriteBufferSize is the UDP write buffer size in bytes (default: 2MB)
-	WriteBufferSize int
-
-	// ReceiveWorkers is the number of concurrent receive workers (default: 4)
-	ReceiveWorkers int
 
 	// Callbacks
 
@@ -68,10 +50,6 @@ type Config struct {
 func (c *Config) Validate() error {
 	if c.PrivateKey == nil {
 		return fmt.Errorf("private key is required")
-	}
-
-	if c.ListenAddr == nil {
-		return fmt.Errorf("listen address is required")
 	}
 
 	if c.BondExpiration < 0 {
@@ -102,27 +80,11 @@ func (c *Config) ApplyDefaults() {
 	if c.ExpirationWindow == 0 {
 		c.ExpirationWindow = 20 * time.Second
 	}
-
-	if c.RateLimitPerIP == 0 {
-		c.RateLimitPerIP = 25.0
-	}
-
-	if c.ReadBufferSize == 0 {
-		c.ReadBufferSize = 2 * 1024 * 1024 // 2MB
-	}
-
-	if c.WriteBufferSize == 0 {
-		c.WriteBufferSize = 2 * 1024 * 1024 // 2MB
-	}
-
-	if c.ReceiveWorkers == 0 {
-		c.ReceiveWorkers = 4
-	}
 }
 
 // DefaultConfig returns a configuration with sensible defaults.
 //
-// You must set PrivateKey and ListenAddr before using.
+// You must set PrivateKey before using.
 func DefaultConfig() *Config {
 	config := &Config{}
 	config.ApplyDefaults()
@@ -147,12 +109,6 @@ func (b *ConfigBuilder) WithPrivateKey(key *ecdsa.PrivateKey) *ConfigBuilder {
 	return b
 }
 
-// WithListenAddr sets the listen address.
-func (b *ConfigBuilder) WithListenAddr(addr *net.UDPAddr) *ConfigBuilder {
-	b.config.ListenAddr = addr
-	return b
-}
-
 // WithLocalENR sets the local ENR record.
 func (b *ConfigBuilder) WithLocalENR(record *enr.Record) *ConfigBuilder {
 	b.config.LocalENR = record
@@ -174,12 +130,6 @@ func (b *ConfigBuilder) WithRequestTimeout(d time.Duration) *ConfigBuilder {
 // WithExpirationWindow sets the expiration window.
 func (b *ConfigBuilder) WithExpirationWindow(d time.Duration) *ConfigBuilder {
 	b.config.ExpirationWindow = d
-	return b
-}
-
-// WithRateLimitPerIP sets the rate limit per IP.
-func (b *ConfigBuilder) WithRateLimitPerIP(limit float64) *ConfigBuilder {
-	b.config.RateLimitPerIP = limit
 	return b
 }
 

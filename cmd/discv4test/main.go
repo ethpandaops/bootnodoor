@@ -17,6 +17,7 @@ import (
 	"github.com/ethpandaops/bootnodoor/discv4"
 	"github.com/ethpandaops/bootnodoor/discv4/node"
 	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/transport"
 )
 
 var (
@@ -450,22 +451,32 @@ func createTempService() (*discv4.Service, error) {
 		logrus.SetLevel(logrus.InfoLevel)
 	}
 
+	// Create transport first
+	listenAddr := fmt.Sprintf("%s:%d", bindIP.String(), bindPort)
+	transportConfig := &transport.Config{
+		ListenAddr: listenAddr,
+		Logger:     logrus.StandardLogger(),
+	}
+	udpTransport, err := transport.NewUDPTransport(transportConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create service config
 	cfg := discv4.DefaultConfig()
 	cfg.PrivateKey = privKey
-	cfg.ListenAddr = &net.UDPAddr{
-		IP:   bindIP,
-		Port: bindPort,
-	}
 
-	// Create service
-	service, err := discv4.New(cfg)
+	// Create service (pass transport)
+	service, err := discv4.New(cfg, udpTransport)
 	if err != nil {
+		udpTransport.Close()
 		return nil, err
 	}
 
 	// Start service
 	if err := service.Start(); err != nil {
+		service.Stop()
+		udpTransport.Close()
 		return nil, err
 	}
 
