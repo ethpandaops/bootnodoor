@@ -1,60 +1,122 @@
 # Universal Bootnode Package
 
-The `bootnode` package provides a comprehensive Ethereum bootnode implementation supporting both Execution Layer (EL) and Consensus Layer (CL) discovery protocols.
+The `bootnode` package provides a production-ready, comprehensive Ethereum bootnode implementation supporting both Execution Layer (EL) and Consensus Layer (CL) discovery protocols with intelligent fork-aware filtering.
+
+## Overview
+
+This package serves as the main orchestration layer for a universal Ethereum bootnode that can:
+- Serve EL nodes (Ethereum mainnet and testnets)
+- Serve CL nodes (Beacon chain)
+- Serve both simultaneously on the same port (dual-stack mode)
+- Support both Discovery v4 (discv4) and Discovery v5 (discv5) protocols
+- Automatically filter nodes based on fork compatibility
+- Prevent network topology leaks with LAN-aware filtering
 
 ## Features
 
 ### Multi-Layer Support
-- **Execution Layer (EL)**: Ethereum mainnet, testnets (via `eth` ENR field with fork IDs)
-- **Consensus Layer (CL)**: Beacon chain (via `eth2` ENR field with fork digests)
-- **Dual Mode**: Run both EL and CL simultaneously on the same service
+- **Execution Layer (EL)**: Full support for Ethereum execution layer networks
+  - Fork ID validation via `eth` ENR field (EIP-2124)
+  - Accepts any valid historical fork
+  - Supports both mainnet and all testnets
+- **Consensus Layer (CL)**: Full support for Ethereum beacon chain
+  - Fork digest validation via `eth2` ENR field
+  - Grace period support for fork transitions (configurable, default 60 minutes)
+  - Automatic fork schedule awareness
+- **Dual Mode**: Run both EL and CL simultaneously
+  - Separate routing tables (500 nodes each by default)
+  - Independent fork filtering per layer
+  - Shared protocols and transport
 
 ### Multi-Protocol Support
 - **Discovery v4 (discv4)**: Legacy UDP protocol for EL nodes
-- **Discovery v5 (discv5)**: Modern encrypted protocol for both EL and CL
+  - Full wire protocol: PING/PONG, FINDNODE/NEIGHBORS, ENRREQUEST/ENRRESPONSE
+  - Bond mechanism with storm prevention
+  - Supports ENR and legacy enode URLs
+  - EL-only (CL nodes don't use discv4)
+- **Discovery v5 (discv5)**: Modern encrypted protocol
+  - Supports both EL and CL nodes
+  - Session management with encryption
+  - Full wire protocol: PING/PONG, FINDNODE/NODES, TALKREQ/TALKRESP
 - **Protocol Multiplexing**: Both protocols share a single UDP socket
+  - Transport layer routes packets to correct protocol handler
+  - Per-IP rate limiting at transport layer
 
 ### Intelligent Node Routing
 - **Layer Separation**: Separate routing tables for EL and CL nodes
-- **Fork-Aware Filtering**: Validates nodes based on EL fork IDs and CL fork digests
-- **Protocol-Aware Responses**: Returns only compatible nodes to requesters
+  - Each table maintains up to 500 active nodes (configurable)
+  - Independent quality tracking and statistics
+  - Separate database persistence
+- **Fork-Aware Filtering**:
+  - **EL**: Validates fork IDs against chain config (accepts any valid historical fork)
+  - **CL**: Validates fork digests with grace period support
+- **Protocol-Aware Responses**:
+  - Only returns nodes supporting the requested protocol (v4 or v5)
+  - Discv4 requests only receive EL nodes with v4 support
+  - Discv5 requests receive both EL and CL nodes with v5 support
 - **LAN-Aware Filtering**: Prevents leaking private network topology to WAN peers
+  - RFC1918 address detection
+  - WAN clients don't receive LAN nodes
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Bootnode Service                         │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────────┐              ┌──────────────┐            │
-│  │  EL Table    │              │  CL Table    │            │
-│  │  (500 nodes) │              │  (500 nodes) │            │
-│  └──────┬───────┘              └──────┬───────┘            │
-│         │                              │                    │
-│  ┌──────┴───────┐              ┌──────┴───────┐            │
-│  │  EL NodeDB   │              │  CL NodeDB   │            │
-│  │  (SQLite)    │              │  (SQLite)    │            │
-│  └──────────────┘              └──────────────┘            │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │              ENR Manager                             │  │
-│  │  - Local ENR with 'eth' + 'eth2' fields             │  │
-│  │  - EL Fork ID Filter (EIP-2124)                     │  │
-│  │  - CL Fork Digest Filter                            │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                                                             │
-│  ┌─────────────┐                ┌─────────────┐            │
-│  │  Discv4     │                │  Discv5     │            │
-│  │  Service    │                │  Service    │            │
-│  └──────┬──────┘                └──────┬──────┘            │
-│         └───────────┬────────────────┬─┘                   │
-│                     │                │                     │
-│              ┌──────┴────────────────┴──────┐              │
-│              │   UDP Transport (Shared)     │              │
-│              │   0.0.0.0:30303              │              │
-│              └─────────────────────────────┘              │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                       Universal Bootnode Service                   │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  ┌────────────────────┐              ┌────────────────────┐        │
+│  │   EL Routing       │              │   CL Routing       │        │
+│  │   Table            │              │   Table            │        │
+│  │   - 500 nodes      │              │   - 500 nodes      │        │
+│  │   - IP limiting    │              │   - IP limiting    │        │
+│  │   - Quality track  │              │   - Quality track  │        │
+│  └─────────┬──────────┘              └─────────┬──────────┘        │
+│            │                                   │                   │
+│  ┌─────────┴──────────┐              ┌─────────┴──────────┐        │
+│  │  EL Database       │              │  CL Database       │        │
+│  │  (SQLite - layer   │              │  (SQLite - layer   │        │
+│  │   'el')            │              │   'cl')            │        │
+│  │  - nodes table     │              │  - nodes table     │        │
+│  │  - bad_nodes table │              │  - bad_nodes table │        │
+│  └────────────────────┘              └────────────────────┘        │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                    ENR Manager                               │  │
+│  │  - Local ENR with 'eth' + 'eth2' fields                      │  │
+│  │  - EL Fork ID Computation (EIP-2124)                         │  │
+│  │  - CL Fork Digest Computation                                │  │
+│  │  - Automatic IP discovery from PONG consensus                │  │
+│  │  - Dynamic ENR updates                                       │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                   Maintenance Services                       │  │
+│  │  - Lookup Service (random walks, iterative lookups)          │  │
+│  │  - Ping Service (aliveness checks, protocol detection)       │  │
+│  │  - IP Discovery Service (external IP consensus)              │  │
+│  │  - Table Sweep (10% rotation every 5 minutes)                │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                    │
+│  ┌──────────────┐                      ┌──────────────┐            │
+│  │  Discv4      │                      │  Discv5      │            │
+│  │  Service     │                      │  Service     │            │
+│  │  - EL only   │                      │  - EL + CL   │            │
+│  │  - Bonding   │                      │  - Sessions  │            │
+│  │  - Storm     │                      │  - Encrypted │            │
+│  │    prevention│                      │    messaging │            │
+│  └──────┬───────┘                      └──────┬───────┘            │
+│         │                                     │                    │
+│         └──────────┬──────────────────────────┘                    │
+│                    │                                               │
+│         ┌──────────┴─────────────────────────┐                     │
+│         │   UDP Transport (Shared)           │                     │
+│         │   - Protocol multiplexing          │                     │
+│         │   - Per-IP rate limiting (100/s)   │                     │
+│         │   - Packet routing (v4/v5)         │                     │
+│         │   - Bind: 0.0.0.0:30303            │                     │
+│         └────────────────────────────────────┘                     │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Package Structure
@@ -214,29 +276,49 @@ service.Start()
 
 ### Node Discovery Flow
 
-1. **Incoming Node**: A node connects to the bootnode
-   - Discv4: Receives PING packet
-   - Discv5: Completes handshake
+1. **Incoming Node**: A node initiates contact with the bootnode
+   - **Discv4**: Receives PING packet, validates bond mechanism
+   - **Discv5**: Completes WHOAREYOU handshake, establishes encrypted session
 
-2. **Layer Detection**: Bootnode examines the node's ENR
-   - Checks for `eth` field → EL node
-   - Checks for `eth2` field → CL node
-   - Can have both fields → Multi-layer node
+2. **Layer Detection**: Bootnode examines the node's ENR fields
+   - Checks for `eth` field → EL node detected
+   - Checks for `eth2` field → CL node detected
+   - Both fields present → Multi-layer node (serves both networks)
 
 3. **Fork Validation**:
-   - **EL nodes**: Validates fork ID against chain config
-   - **CL nodes**: Validates fork digest against beacon config
+   - **EL nodes**: Validates fork ID from `eth` field against chain config
+     - Computes expected fork ID from genesis hash and chain config
+     - Accepts any valid historical fork ID
+     - No grace period needed
+   - **CL nodes**: Validates fork digest from `eth2` field against beacon config
+     - Computes current fork digest from current fork version + genesis validators root
+     - Accepts current fork digest
+     - Accepts previous fork digest within grace period (default: 60 minutes)
+     - Accepts but deprioritizes historical fork digests
 
-4. **Table Insertion**: Node is added to appropriate table(s)
-   - EL nodes → EL table + EL database
-   - CL nodes → CL table + CL database
-   - Multi-layer → Both tables
+4. **Bad Node Check**: Before accepting, checks bad_nodes table
+   - If node was previously rejected, skips ENR request and validation
+   - Automatic cleanup of old bad node entries
+   - Prevents repeated validation overhead
 
-5. **FINDNODE Responses**: When a node requests peers
-   - **Discv4 requests**: Returns only EL nodes with discv4 support
-   - **Discv5 requests**: Returns both EL and CL nodes with discv5 support
+5. **Table Insertion**: Node is added to appropriate table(s)
+   - **EL nodes** → EL routing table + EL database (layer='el')
+   - **CL nodes** → CL routing table + CL database (layer='cl')
+   - **Multi-layer** → Both tables with independent tracking
+   - IP limiting enforced (max 10 nodes per IP by default)
+   - Quality metrics initialized (success/failure counts, RTT)
+
+6. **FINDNODE Responses**: When a node requests peers
+   - **Discv4 requests**: Returns only EL nodes with v4 support
+     - Maximum 16 nodes per response (protocol limit)
+     - Only nodes that have been pinged successfully
+   - **Discv5 requests**: Returns appropriate nodes based on layer
+     - If requester has `eth` field: returns EL nodes with v5 support
+     - If requester has `eth2` field: returns CL nodes with v5 support
+     - Can return both if requester supports both layers
    - **Protocol filtering**: Only returns nodes supporting the request protocol
-   - **LAN filtering**: WAN requesters don't receive LAN nodes
+   - **LAN filtering**: WAN requesters don't receive RFC1918 nodes
+   - **Quality-based selection**: Prioritizes nodes with better success rates
 
 ### Fork ID Calculation (EL)
 
@@ -288,39 +370,69 @@ This allows the bootnode to serve both EL and CL clients.
 
 ## Database Schema
 
-The bootnode uses a single SQLite database with a unified schema:
+The bootnode uses SQLite with WAL mode and automatic schema migrations (goose). The database contains three main tables:
+
+### Nodes Table
+
+Stores discovered nodes with quality metrics:
 
 ```sql
 CREATE TABLE nodes (
-    nodeid BLOB PRIMARY KEY,
-    layer TEXT NOT NULL,      -- 'el' or 'cl'
-    ip BLOB,
-    ipv6 BLOB,
-    port INTEGER,
-    seq INTEGER,
-    fork_digest BLOB,         -- Fork ID (EL) or digest (CL)
-    first_seen INTEGER,
-    last_seen INTEGER,
-    last_active INTEGER,
-    enr BLOB,
-    has_v4 INTEGER DEFAULT 0,
-    has_v5 INTEGER DEFAULT 1,
-    success_count INTEGER DEFAULT 0,
-    failure_count INTEGER DEFAULT 0,
-    avg_rtt INTEGER DEFAULT 0
+    nodeid BLOB PRIMARY KEY,        -- Node ID (32 bytes)
+    layer TEXT NOT NULL,             -- 'el' or 'cl'
+    ip BLOB,                         -- IPv4 address (4 bytes)
+    ipv6 BLOB,                       -- IPv6 address (16 bytes, optional)
+    port INTEGER,                    -- UDP port
+    seq INTEGER,                     -- ENR sequence number
+    fork_digest BLOB,                -- Fork ID (EL, 12 bytes) or digest (CL, 4 bytes)
+    first_seen INTEGER,              -- Unix timestamp (first discovery)
+    last_seen INTEGER,               -- Unix timestamp (last seen)
+    last_active INTEGER,             -- Unix timestamp (last successful ping)
+    enr BLOB,                        -- Full ENR record
+    has_v4 INTEGER DEFAULT 0,        -- Supports Discovery v4
+    has_v5 INTEGER DEFAULT 1,        -- Supports Discovery v5
+    success_count INTEGER DEFAULT 0, -- Successful ping count
+    failure_count INTEGER DEFAULT 0, -- Failed ping count
+    avg_rtt INTEGER DEFAULT 0        -- Average round-trip time (ms)
 );
 
 CREATE INDEX idx_nodes_layer ON nodes(layer);
 CREATE INDEX idx_nodes_last_seen ON nodes(layer, last_seen);
 ```
 
-## Performance Characteristics
+### Bad Nodes Table
 
-- **Memory Usage**: ~100MB for 1000 nodes (500 EL + 500 CL)
-- **Database Size**: ~50KB per 1000 nodes
-- **Packet Rate**: Handles 1000+ packets/sec
-- **Discovery Speed**: Discovers 100+ nodes/minute
-- **Node Rotation**: 10% of active nodes rotated every 5 minutes
+Optimization table to avoid repeated validation of rejected nodes:
+
+```sql
+CREATE TABLE bad_nodes (
+    nodeid BLOB PRIMARY KEY,    -- Node ID (32 bytes)
+    reason TEXT,                -- Rejection reason
+    first_rejected INTEGER,     -- Unix timestamp (first rejection)
+    last_rejected INTEGER,      -- Unix timestamp (last rejection)
+    rejection_count INTEGER     -- Number of times rejected
+);
+
+CREATE INDEX idx_bad_nodes_last_rejected ON bad_nodes(last_rejected);
+```
+
+### State Table
+
+Stores runtime state and configuration:
+
+```sql
+CREATE TABLE state (
+    key TEXT PRIMARY KEY,       -- State key
+    value BLOB                  -- State value (e.g., local ENR)
+);
+```
+
+### Migration Management
+
+The database uses goose for schema migrations:
+- Migrations in `db/migrations/`
+- Automatic migration on startup
+- Version tracking in `goose_db_version` table
 
 ## Security Considerations
 
@@ -342,31 +454,47 @@ CREATE INDEX idx_nodes_last_seen ON nodes(layer, last_seen);
 - Invalid signatures rejected
 - Expired packets rejected
 
-## Comparison with beacon-bootnode
+## Key Features Summary
 
-The new `bootnode` package improves upon `beacon-bootnode`:
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **EL Support** | ✅ | Full Execution Layer support with fork ID validation |
+| **CL Support** | ✅ | Full Consensus Layer support with fork digest validation |
+| **Discv4** | ✅ | Full Discovery v4 with bonding and storm prevention |
+| **Discv5** | ✅ | Full Discovery v5 with encryption and sessions |
+| **Protocol Multiplexing** | ✅ | Both protocols on same UDP port |
+| **Dual Tables** | ✅ | Separate routing tables for EL and CL |
+| **Fork ID (EL)** | ✅ | EIP-2124 fork ID validation |
+| **Fork Digest (CL)** | ✅ | Fork digest with grace period |
+| **ENR with both fields** | ✅ | Single ENR with `eth` + `eth2` fields |
+| **Bad Node Caching** | ✅ | Avoid repeated validation of rejected nodes |
+| **IP Discovery** | ✅ | Automatic external IP detection from PONG consensus |
+| **LAN Filtering** | ✅ | WAN clients don't receive LAN nodes |
+| **Quality Metrics** | ✅ | Success/failure tracking, RTT measurement |
+| **Protocol Detection** | ✅ | Automatic v4/v5 capability testing |
+| **Database Persistence** | ✅ | SQLite with WAL mode and migrations |
+| **Web UI** | ✅ | Real-time statistics and node lists |
 
-| Feature | beacon-bootnode | bootnode |
-|---------|----------------|----------|
-| EL Support | ❌ | ✅ |
-| CL Support | ✅ | ✅ |
-| Discv4 | ❌ | ✅ |
-| Discv5 | ✅ | ✅ |
-| Dual Tables | ❌ | ✅ |
-| Fork ID (EL) | ❌ | ✅ |
-| Fork Digest (CL) | ✅ | ✅ |
-| ENR with both fields | ❌ | ✅ |
+## Implementation Status
 
-## Future Enhancements
+### Fully Implemented
+- ✅ Dual-stack bootnode service (EL + CL)
+- ✅ Fork-aware filtering for both layers
+- ✅ Protocol multiplexing (discv4 + discv5)
+- ✅ Separate routing tables with IP limiting
+- ✅ Bad node caching and optimization
+- ✅ IP discovery service
+- ✅ Lookup service (random walks, iterative lookups)
+- ✅ Ping service (aliveness checks, protocol detection)
+- ✅ ENR management with dynamic updates
+- ✅ Database persistence with migrations
+- ✅ Web UI with EL/CL breakdowns
+- ✅ LAN-aware filtering
 
-Planned improvements:
-- [ ] Ping service implementation
-- [ ] Lookup service for random walks
-- [ ] ENR request via discv4 for enode bootnodes
-- [ ] Dynamic ENR updates on fork transitions
-- [ ] Metrics and monitoring endpoints
-- [ ] Configurable node scoring
-- [ ] Geographic diversity in responses
+### Known Limitations
+- Table is flat (not bucket-based Kademlia), which is simpler but less optimal for very large networks
+- No geographic diversity optimization in node selection
+- No advanced node scoring beyond success/failure counts
 
 ## References
 
