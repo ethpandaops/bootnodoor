@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ethpandaops/bootnodoor/enode"
 	"github.com/ethpandaops/bootnodoor/webui/server"
 )
 
@@ -124,6 +125,28 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(localENR))
+}
+
+// Enode serves the local enode URL as plain text
+func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
+	localNode := fh.bootnodeService.LocalNode()
+
+	// Get TCP port from ENR, fallback to UDP port if not available
+	tcpPort := localNode.TCPPort()
+	if tcpPort == 0 {
+		tcpPort = localNode.UDPPort()
+	}
+
+	// Create enode from local node info
+	localEnode := &enode.Enode{
+		PublicKey: localNode.PublicKey(),
+		IP:        localNode.IP(),
+		TCP:       tcpPort,
+		UDP:       localNode.UDPPort(),
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(localEnode.String()))
 }
 
 // Overview renders the overview page
