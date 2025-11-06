@@ -1,4 +1,4 @@
-package table
+package nodes
 
 import (
 	"fmt"
@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethpandaops/bootnodoor/beacon-bootnode/nodedb"
 	"github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/sirupsen/logrus"
 )
@@ -24,6 +23,22 @@ const (
 	DefaultSweepPercent = 10
 )
 
+// ForkScoringInfo contains fork digest information for node scoring.
+type ForkScoringInfo struct {
+	// CurrentForkDigest is the current expected fork digest
+	CurrentForkDigest [4]byte
+
+	// PreviousForkDigest is the previous fork digest (current - 1)
+	PreviousForkDigest [4]byte
+
+	// GenesisForkDigest is the genesis fork digest
+	GenesisForkDigest [4]byte
+
+	// GracePeriodEnd is when the grace period for the previous fork ends
+	// If zero, there is no grace period active
+	GracePeriodEnd time.Time
+}
+
 // FlatTable is a flat node storage with capped active nodes.
 //
 // Unlike the bucket-based Kademlia table, this maintains:
@@ -33,14 +48,14 @@ const (
 //   - Periodic active/inactive rotation
 type FlatTable struct {
 	// localID is our node ID
-	localID node.ID
+	localID [32]byte
 
 	// db is the primary node storage
-	db *nodedb.NodeDB
+	db *NodeDB
 
 	// activeNodes maps node ID to node for quick lookups
 	// Only contains nodes in active state (max maxActiveNodes)
-	activeNodes map[node.ID]*node.Node
+	activeNodes map[[32]byte]*Node
 
 	// maxActiveNodes is the cap for active nodes
 	maxActiveNodes int
@@ -76,7 +91,7 @@ type FlatTable struct {
 	logger logrus.FieldLogger
 
 	// forkScoringInfo contains fork digest information for node scoring
-	forkScoringInfo *node.ForkScoringInfo
+	forkScoringInfo *ForkScoringInfo
 
 	// Stats tracking
 	admissionRejections int
@@ -89,10 +104,10 @@ type FlatTable struct {
 // FlatTableConfig contains configuration for the flat table.
 type FlatTableConfig struct {
 	// LocalID is our node ID
-	LocalID node.ID
+	LocalID [32]byte
 
 	// DB is the primary node storage
-	DB *nodedb.NodeDB
+	DB *NodeDB
 
 	// MaxActiveNodes is the maximum number of active nodes (default 500)
 	MaxActiveNodes int
@@ -159,7 +174,7 @@ func NewFlatTable(cfg FlatTableConfig) (*FlatTable, error) {
 	t := &FlatTable{
 		localID:             cfg.LocalID,
 		db:                  cfg.DB,
-		activeNodes:         make(map[node.ID]*node.Node),
+		activeNodes:         make(map[[32]byte]*Node),
 		maxActiveNodes:      cfg.MaxActiveNodes,
 		ipLimiter:           NewIPLimiter(cfg.MaxNodesPerIP),
 		maxNodesPerIP:       cfg.MaxNodesPerIP,
@@ -185,7 +200,8 @@ func (t *FlatTable) LoadInitialNodesFromDB() error {
 			t.activeNodes[n.ID()] = n
 			t.ipLimiter.Add(n)
 
-			if err := t.db.UpdateLastActive(n.ID(), time.Now()); err != nil {
+			n.SetLastActive(time.Now())
+			if err := t.db.QueueUpdate(n); err != nil {
 				t.logger.WithError(err).Warn("failed to mark node as active")
 			}
 		}
@@ -207,7 +223,7 @@ func (t *FlatTable) LoadInitialNodesFromDB() error {
 // rejecting them immediately. The next sweep will clean up excess nodes.
 //
 // DB writes must be handled by caller.
-func (t *FlatTable) Add(n *node.Node) bool {
+func (t *FlatTable) Add(n *Node) bool {
 	if n == nil {
 		return false
 	}
@@ -232,9 +248,7 @@ func (t *FlatTable) Add(n *node.Node) bool {
 			existing.UpdateENR(n.Record())
 
 			// Queue ENR update (preserves stats)
-			if err := t.db.UpdateNodeENR(existing); err != nil {
-				t.logger.WithError(err).Warn("failed to queue node ENR update")
-			}
+			existing.MarkDirty(DirtyENR)
 
 			if t.nodeChangedCallback != nil {
 				t.nodeChangedCallback(existing)
@@ -298,13 +312,8 @@ func (t *FlatTable) Add(n *node.Node) bool {
 	}
 
 	// Queue ENR update to DB and mark as active
-	if err := t.db.UpdateNodeENR(n); err != nil {
-		t.logger.WithError(err).Warn("failed to queue new node")
-		return false
-	}
-	if err := t.db.UpdateLastActive(nodeID, time.Now()); err != nil {
-		t.logger.WithError(err).Warn("failed to mark new node as active")
-	}
+	n.MarkDirty(DirtyENR)
+	n.SetLastActive(time.Now())
 
 	if t.nodeChangedCallback != nil {
 		t.nodeChangedCallback(n)
@@ -315,14 +324,14 @@ func (t *FlatTable) Add(n *node.Node) bool {
 
 // CanAddNodeByIP checks if we can add a node based on IP limits.
 // This checks against all nodes (active + inactive) in the DB.
-func (t *FlatTable) CanAddNodeByIP(n *node.Node) bool {
+func (t *FlatTable) CanAddNodeByIP(n *Node) bool {
 	// Count nodes with same IP in DB
 	allNodes := t.db.List()
 	sameIPCount := 0
-	nodeIP := n.IP().String()
+	nodeIP := n.Addr().IP.String()
 
 	for _, existing := range allNodes {
-		if existing.IP().String() == nodeIP {
+		if existing.Addr().IP.String() == nodeIP {
 			sameIPCount++
 		}
 	}
@@ -332,7 +341,7 @@ func (t *FlatTable) CanAddNodeByIP(n *node.Node) bool {
 
 // Get retrieves a node by ID.
 // First checks active nodes, then falls back to DB.
-func (t *FlatTable) Get(nodeID node.ID) *node.Node {
+func (t *FlatTable) Get(nodeID [32]byte) *Node {
 	t.mu.RLock()
 	// Check active nodes first
 	if n, exists := t.activeNodes[nodeID]; exists {
@@ -350,11 +359,11 @@ func (t *FlatTable) Get(nodeID node.ID) *node.Node {
 }
 
 // GetActiveNodes returns a copy of all active nodes.
-func (t *FlatTable) GetActiveNodes() []*node.Node {
+func (t *FlatTable) GetActiveNodes() []*Node {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	result := make([]*node.Node, 0, len(t.activeNodes))
+	result := make([]*Node, 0, len(t.activeNodes))
 	for _, n := range t.activeNodes {
 		result = append(result, n)
 	}
@@ -362,7 +371,7 @@ func (t *FlatTable) GetActiveNodes() []*node.Node {
 }
 
 // GetRandomActiveNodes returns up to k random active nodes.
-func (t *FlatTable) GetRandomActiveNodes(k int) []*node.Node {
+func (t *FlatTable) GetRandomActiveNodes(k int) []*Node {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -371,7 +380,7 @@ func (t *FlatTable) GetRandomActiveNodes(k int) []*node.Node {
 	}
 
 	// Collect all active nodes
-	allActive := make([]*node.Node, 0, len(t.activeNodes))
+	allActive := make([]*Node, 0, len(t.activeNodes))
 	for _, n := range t.activeNodes {
 		allActive = append(allActive, n)
 	}
@@ -389,7 +398,7 @@ func (t *FlatTable) GetRandomActiveNodes(k int) []*node.Node {
 }
 
 // FindClosestNodes finds the k closest active nodes to the target ID.
-func (t *FlatTable) FindClosestNodes(target node.ID, k int) []*node.Node {
+func (t *FlatTable) FindClosestNodes(target [32]byte, k int) []*Node {
 	activeNodes := t.GetActiveNodes()
 
 	if len(activeNodes) == 0 {
@@ -399,14 +408,20 @@ func (t *FlatTable) FindClosestNodes(target node.ID, k int) []*node.Node {
 	// Get node IDs
 	nodeIDs := nodesToIDs(activeNodes)
 
-	// Find k closest IDs
-	closestIDs := node.FindClosest(target, nodeIDs, k)
+	// Convert [][32]byte to []node.ID for FindClosest
+	nodeIDsForFind := make([]node.ID, len(nodeIDs))
+	for i, id := range nodeIDs {
+		nodeIDsForFind[i] = node.ID(id)
+	}
+
+	// Find k closest IDs using the discv5/node utility function
+	closestIDs := node.FindClosest(node.ID(target), nodeIDsForFind, k)
 
 	// Convert IDs back to nodes
 	nodeMap := nodesMap(activeNodes)
-	result := make([]*node.Node, 0, len(closestIDs))
+	result := make([]*Node, 0, len(closestIDs))
 	for _, id := range closestIDs {
-		if n, exists := nodeMap[id]; exists {
+		if n, exists := nodeMap[[32]byte(id)]; exists {
 			result = append(result, n)
 		}
 	}
@@ -417,12 +432,12 @@ func (t *FlatTable) FindClosestNodes(target node.ID, k int) []*node.Node {
 // GetNodesNeedingPing returns active nodes that need a PING check.
 //
 // This implements distributed ping scheduling by limiting the number of nodes returned.
-func (t *FlatTable) GetNodesNeedingPing() []*node.Node {
+func (t *FlatTable) GetNodesNeedingPing() []*Node {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	var deadNodes []*node.Node
-	var aliveNodes []*node.Node
+	var deadNodes []*Node
+	var aliveNodes []*Node
 
 	// Separate nodes needing ping into dead and alive
 	for _, n := range t.activeNodes {
@@ -448,7 +463,7 @@ func (t *FlatTable) GetNodesNeedingPing() []*node.Node {
 	maxPings := t.pingRate / 2
 
 	// Select nodes preferring dead nodes (60% dead, 40% alive)
-	var selected []*node.Node
+	var selected []*Node
 	deadSlots := (maxPings * 60) / 100
 
 	// Take dead nodes first (up to 60% of slots)
@@ -540,9 +555,7 @@ func (t *FlatTable) PerformSweep() {
 			t.nodesDemoted++
 
 			// Do full update to store latest request stats & timestamps
-			if err := t.db.UpdateNodeFull(n); err != nil {
-				t.logger.WithError(err).Warn("failed to update node")
-			}
+			n.MarkDirty(DirtyFull)
 		}
 		demotedCount = len(nodesToDemote)
 		slotsAvailable = t.maxActiveNodes - len(t.activeNodes)
@@ -592,7 +605,8 @@ func (t *FlatTable) PerformSweep() {
 			t.mu.Unlock()
 
 			// Update last_active to mark as active
-			if err := t.db.UpdateLastActive(n.ID(), time.Now()); err != nil {
+			n.SetLastActive(time.Now())
+			if err := t.db.QueueUpdate(n); err != nil {
 				t.logger.WithError(err).Warn("failed to mark node as active")
 			}
 
@@ -666,7 +680,8 @@ func (t *FlatTable) performImmediateSweep() {
 		t.nodesDemoted++
 
 		// Update last_active to mark as inactive
-		if err := t.db.UpdateLastActive(nodeID, time.Now()); err != nil {
+		n.SetLastActive(time.Now())
+		if err := t.db.QueueUpdate(n); err != nil {
 			t.logger.WithError(err).Warn("failed to mark node as inactive")
 		}
 	}
@@ -724,13 +739,13 @@ func (t *FlatTable) GetStats() TableStats {
 }
 
 // GetBucketNodes is kept for compatibility but returns empty for flat table.
-func (t *FlatTable) GetBucketNodes(bucketIndex int) []*node.Node {
+func (t *FlatTable) GetBucketNodes(bucketIndex int) []*Node {
 	return nil
 }
 
 // SetForkScoringInfo updates the fork scoring information used for node ranking.
 // This should be called periodically to reflect fork changes.
-func (t *FlatTable) SetForkScoringInfo(info *node.ForkScoringInfo) {
+func (t *FlatTable) SetForkScoringInfo(info *ForkScoringInfo) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.forkScoringInfo = info
@@ -745,7 +760,7 @@ func (t *FlatTable) SetForkScoringInfo(info *node.ForkScoringInfo) {
 //   - Different results on each call (randomized)
 //   - Better nodes are returned more frequently (score-weighted)
 //   - Specific distances are respected
-func (t *FlatTable) GetNodesByDistance(targetID node.ID, distances []uint, k int) []*node.Node {
+func (t *FlatTable) GetNodesByDistance(targetID [32]byte, distances []uint, k int) []*Node {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -754,13 +769,13 @@ func (t *FlatTable) GetNodesByDistance(targetID node.ID, distances []uint, k int
 	}
 
 	// Collect all active nodes
-	allNodes := make([]*node.Node, 0, len(t.activeNodes))
+	allNodes := make([]*Node, 0, len(t.activeNodes))
 	for _, n := range t.activeNodes {
 		allNodes = append(allNodes, n)
 	}
 
 	// Filter by distance if not requesting all (256)
-	var candidateNodes []*node.Node
+	var candidateNodes []*Node
 	if len(distances) == 1 && distances[0] == 256 {
 		// Special case: return all nodes
 		candidateNodes = allNodes
@@ -772,7 +787,7 @@ func (t *FlatTable) GetNodesByDistance(targetID node.ID, distances []uint, k int
 		}
 
 		for _, n := range allNodes {
-			dist := node.LogDistance(targetID, n.ID())
+			dist := node.LogDistance(node.ID(targetID), node.ID(n.ID()))
 			if distanceMap[dist] {
 				candidateNodes = append(candidateNodes, n)
 			}
@@ -796,14 +811,14 @@ func (t *FlatTable) GetNodesByDistance(targetID node.ID, distances []uint, k int
 //
 // Nodes with higher scores have higher probability of being selected.
 // This ensures diversity while favoring better nodes.
-func (t *FlatTable) selectByScore(nodes []*node.Node, k int) []*node.Node {
+func (t *FlatTable) selectByScore(nodes []*Node, k int) []*Node {
 	if len(nodes) <= k {
 		return nodes
 	}
 
 	// Calculate scores for all nodes
 	type scoredNode struct {
-		node  *node.Node
+		node  *Node
 		score float64
 	}
 
@@ -827,7 +842,7 @@ func (t *FlatTable) selectByScore(nodes []*node.Node, k int) []*node.Node {
 	}
 
 	// Weighted random selection without replacement
-	selected := make([]*node.Node, 0, k)
+	selected := make([]*Node, 0, k)
 	remaining := make([]scoredNode, len(scoredNodes))
 	copy(remaining, scoredNodes)
 	currentTotal := totalScore

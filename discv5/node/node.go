@@ -16,6 +16,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/stats"
 )
 
 // ID represents a unique node identifier (32 bytes).
@@ -68,23 +69,8 @@ type Node struct {
 	// tcpPort is the TCP port (if different from UDP)
 	tcpPort uint16
 
-	// firstSeen is the first time we discovered this node
-	firstSeen time.Time
-
-	// lastSeen is the last time we successfully communicated with this node
-	lastSeen time.Time
-
-	// lastPing is the last time we sent a PING to this node
-	lastPing time.Time
-
-	// failureCount tracks consecutive failed communication attempts
-	failureCount int
-
-	// successCount tracks successful communications
-	successCount int
-
-	// avgRTT is the average round-trip time for PING/PONG
-	avgRTT time.Duration
+	// stats points to shared statistics (may be owned by parent node)
+	stats *stats.SharedStats
 }
 
 // New creates a new Node from an ENR record.
@@ -137,18 +123,16 @@ func New(record *enr.Record) (*Node, error) {
 	// Extract optional TCP port
 	tcpPort := record.TCP()
 
+	// Create local stats (will be replaced by parent stats if needed)
 	now := time.Now()
+	nodeStats := stats.NewSharedStats(now)
+
 	return &Node{
-		record:       record,
-		id:           id,
-		addr:         addr,
-		tcpPort:      tcpPort,
-		firstSeen:    now,
-		lastSeen:     time.Time{}, // Zero time indicates never seen
-		lastPing:     time.Time{},
-		failureCount: 0,
-		successCount: 0,
-		avgRTT:       0,
+		record:  record,
+		id:      id,
+		addr:    addr,
+		tcpPort: tcpPort,
+		stats:   nodeStats,
 	}, nil
 }
 
@@ -165,6 +149,14 @@ func (n *Node) Record() *enr.Record {
 // Addr returns the node's UDP address.
 func (n *Node) Addr() *net.UDPAddr {
 	return n.addr
+}
+
+// SetStats replaces the node's stats with a shared stats pointer.
+// This allows the node to update stats owned by a parent node.
+func (n *Node) SetStats(sharedStats *stats.SharedStats) {
+	if sharedStats != nil {
+		n.stats = sharedStats
+	}
 }
 
 // IP returns the node's IP address.
@@ -216,118 +208,39 @@ func (n *Node) Digest() [4]byte {
 	return eth2Data.ForkDigest
 }
 
-// FirstSeen returns the first time we discovered this node.
-func (n *Node) FirstSeen() time.Time {
-	return n.firstSeen
-}
-
-// SetFirstSeen updates the first seen time.
-func (n *Node) SetFirstSeen(t time.Time) {
-	n.firstSeen = t
-}
-
-// LastSeen returns the last time this node was seen.
-//
-// A zero time indicates the node has never been successfully contacted.
-func (n *Node) LastSeen() time.Time {
-	return n.lastSeen
-}
-
-// SetLastSeen updates the last seen time to now.
-//
-// This should be called when we receive a valid response from the node.
+// SetLastSeen updates the last seen time.
 func (n *Node) SetLastSeen(t time.Time) {
-	n.lastSeen = t
+	n.stats.SetLastSeen(t)
 }
 
-// LastPing returns the last time we sent a PING to this node.
-func (n *Node) LastPing() time.Time {
-	return n.lastPing
-}
-
-// SetLastPing updates the last ping time to now.
+// SetLastPing updates the last ping time.
 func (n *Node) SetLastPing(t time.Time) {
-	n.lastPing = t
-}
-
-// FailureCount returns the number of consecutive failed attempts.
-func (n *Node) FailureCount() int {
-	return n.failureCount
+	n.stats.SetLastPing(t)
 }
 
 // SetFailureCount sets the failure count.
 func (n *Node) SetFailureCount(count int) {
-	n.failureCount = count
+	n.stats.SetFailureCount(count)
 }
 
 // SetSuccessCount sets the success count.
 func (n *Node) SetSuccessCount(count int) {
-	n.successCount = count
+	n.stats.SetSuccessCount(count)
 }
 
 // IncrementFailureCount increases the failure count by 1.
-//
-// This should be called when communication with the node fails.
 func (n *Node) IncrementFailureCount() {
-	n.failureCount++
+	n.stats.IncrementFailureCount()
 }
 
-// ResetFailureCount resets the failure count to 0.
-//
-// This should be called when communication succeeds.
+// ResetFailureCount resets the failure count to 0 and increments success count.
 func (n *Node) ResetFailureCount() {
-	n.failureCount = 0
-	n.successCount++
-}
-
-// SuccessCount returns the total number of successful communications.
-func (n *Node) SuccessCount() int {
-	return n.successCount
-}
-
-// AvgRTT returns the average round-trip time for PING/PONG.
-func (n *Node) AvgRTT() time.Duration {
-	return n.avgRTT
+	n.stats.ResetFailureCount()
 }
 
 // UpdateRTT updates the average RTT using exponential moving average.
-//
-// The new average is: avgRTT = (0.875 * avgRTT) + (0.125 * newRTT)
-// This gives more weight to recent measurements while smoothing out noise.
 func (n *Node) UpdateRTT(rtt time.Duration) {
-	if n.avgRTT == 0 {
-		n.avgRTT = rtt
-	} else {
-		// Exponential moving average (7/8 old + 1/8 new)
-		n.avgRTT = (n.avgRTT * 7 / 8) + (rtt / 8)
-	}
-}
-
-// IsAlive checks if the node is considered alive.
-//
-// A node is alive if:
-//   - It has been seen recently (within the last 24 hours), AND
-//   - The failure count is below the threshold (< 3)
-func (n *Node) IsAlive(maxAge time.Duration, maxFailures int) bool {
-	if n.lastSeen.IsZero() {
-		return false // Never seen
-	}
-
-	age := time.Since(n.lastSeen)
-	return age < maxAge && n.failureCount < maxFailures
-}
-
-// NeedsPing checks if the node needs a liveness check.
-//
-// Returns true if:
-//   - We've never pinged it, OR
-//   - It's been longer than pingInterval since the last ping
-func (n *Node) NeedsPing(pingInterval time.Duration) bool {
-	if n.lastPing.IsZero() {
-		return true // Never pinged
-	}
-
-	return time.Since(n.lastPing) > pingInterval
+	n.stats.UpdateRTT(rtt)
 }
 
 // UpdateENR updates the node's ENR record if the new one has a higher sequence number.
@@ -366,11 +279,13 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 //
 // Format: Node[id=abc123..., addr=192.168.1.1:9000, seen=1m ago]
 func (n *Node) String() string {
+	lastSeen := n.stats.LastSeen()
+
 	var seenStr string
-	if n.lastSeen.IsZero() {
+	if lastSeen.IsZero() {
 		seenStr = "never"
 	} else {
-		seenStr = fmt.Sprintf("%v ago", time.Since(n.lastSeen).Round(time.Second))
+		seenStr = fmt.Sprintf("%v ago", time.Since(lastSeen).Round(time.Second))
 	}
 
 	return fmt.Sprintf("Node[id=%s, addr=%s, seen=%s]",
@@ -393,13 +308,14 @@ type Stats struct {
 
 // GetStats returns the current statistics for the node.
 func (n *Node) GetStats() Stats {
+	snapshot := n.stats.GetSnapshot()
 	return Stats{
-		FirstSeen:    n.firstSeen,
-		LastSeen:     n.lastSeen,
-		LastPing:     n.lastPing,
-		FailureCount: n.failureCount,
-		SuccessCount: n.successCount,
-		AvgRTT:       n.avgRTT,
+		FirstSeen:    snapshot.FirstSeen,
+		LastSeen:     snapshot.LastSeen,
+		LastPing:     snapshot.LastPing,
+		FailureCount: snapshot.FailureCount,
+		SuccessCount: snapshot.SuccessCount,
+		AvgRTT:       snapshot.AvgRTT,
 		ENRSeq:       n.record.Seq(),
 	}
 }
@@ -438,13 +354,14 @@ type ForkScoringInfo struct {
 //
 // Returns a score between 0.0 (worst) and 1.0 (best).
 func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
+	snapshot := n.stats.GetSnapshot()
 	now := time.Now()
 
 	// RTT score (30% weight, adjusted from 40%)
 	// Assume 0ms = 1.0, 500ms = 0.0
 	rttScore := 0.0
-	if n.avgRTT > 0 {
-		rttMs := float64(n.avgRTT.Milliseconds())
+	if snapshot.AvgRTT > 0 {
+		rttMs := float64(snapshot.AvgRTT.Milliseconds())
 		rttScore = 1.0 - (rttMs / 500.0)
 		if rttScore < 0 {
 			rttScore = 0
@@ -453,16 +370,16 @@ func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
 
 	// Success rate score (25% weight, adjusted from 30%)
 	successRate := 0.0
-	totalAttempts := n.successCount + n.failureCount
+	totalAttempts := snapshot.SuccessCount + snapshot.FailureCount
 	if totalAttempts > 0 {
-		successRate = float64(n.successCount) / float64(totalAttempts)
+		successRate = float64(snapshot.SuccessCount) / float64(totalAttempts)
 	}
 
 	// Uptime score (15% weight, adjusted from 20%)
 	// Nodes seen longer get higher scores (up to 24 hours)
 	uptimeScore := 0.0
-	if !n.firstSeen.IsZero() {
-		uptimeHours := now.Sub(n.firstSeen).Hours()
+	if !snapshot.FirstSeen.IsZero() {
+		uptimeHours := now.Sub(snapshot.FirstSeen).Hours()
 		uptimeScore = uptimeHours / 24.0
 		if uptimeScore > 1.0 {
 			uptimeScore = 1.0
@@ -472,8 +389,8 @@ func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
 	// Recency score (10% weight)
 	// Recently seen nodes get higher scores
 	recencyScore := 0.0
-	if !n.lastSeen.IsZero() {
-		hoursSinceLastSeen := now.Sub(n.lastSeen).Hours()
+	if !snapshot.LastSeen.IsZero() {
+		hoursSinceLastSeen := now.Sub(snapshot.LastSeen).Hours()
 		recencyScore = 1.0 - (hoursSinceLastSeen / 24.0)
 		if recencyScore < 0 {
 			recencyScore = 0

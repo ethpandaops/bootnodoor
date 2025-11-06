@@ -109,6 +109,7 @@ func New(config *Config, transport Transport) (*Service, error) {
 		OnFindnode:       config.OnFindnode,
 		OnENRRequest:     config.OnENRRequest,
 		OnNodeSeen:       config.OnNodeSeen,
+		OnPongReceived:   config.OnPongReceived,
 	}
 
 	handler := protocol.NewHandler(ctx, handlerConfig, transport)
@@ -351,6 +352,7 @@ func (s *Service) SetLocalENR(record *enr.Record) {
 			OnFindnode:       s.config.OnFindnode,
 			OnENRRequest:     s.config.OnENRRequest,
 			OnNodeSeen:       s.config.OnNodeSeen,
+			OnPongReceived:   s.config.OnPongReceived,
 		}, s.transport)
 	}
 	s.mu.Unlock()

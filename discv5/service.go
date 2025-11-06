@@ -91,32 +91,40 @@ func New(cfg *Config, transport Transport) (*Service, error) {
 		cfg.Logger = logrus.New()
 	}
 
-	// Get ENR port from transport if not specified
-	enrPort := cfg.ENRPort
-	if enrPort == 0 {
-		// Get port from transport's bind address
-		bindAddr := transport.LocalAddr()
-		enrPort = bindAddr.Port
-		cfg.Logger.WithField("port", enrPort).Debug("using transport port for ENR")
+	var localNode *node.Node
+
+	// Use provided local node if available, otherwise create one
+	if cfg.LocalNode != nil {
+		localNode = cfg.LocalNode
+		cfg.Logger.Debug("using pre-created local node")
+	} else {
+		// Get ENR port from transport if not specified
+		enrPort := cfg.ENRPort
+		if enrPort == 0 {
+			// Get port from transport's bind address
+			bindAddr := transport.LocalAddr()
+			enrPort = bindAddr.Port
+			cfg.Logger.WithField("port", enrPort).Debug("using transport port for ENR")
+		}
+
+		// Create local ENR (using provided ENR as baseline if available)
+		localENR, err := createLocalENR(cfg, enrPort)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create local ENR: %w", err)
+		}
+
+		// Create local node
+		localNode, err = node.New(localENR)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create local node: %w", err)
+		}
+
+		cfg.Logger.WithFields(logrus.Fields{
+			"peerID": localNode.PeerID(),
+		}).Info("created local node")
 	}
 
-	// Create local ENR (using provided ENR as baseline if available)
-	localENR, err := createLocalENR(cfg, enrPort)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create local ENR: %w", err)
-	}
-
-	// Create local node
-	localNode, err := node.New(localENR)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create local node: %w", err)
-	}
-
-	cfg.Logger.WithFields(logrus.Fields{
-		"peerID": localNode.PeerID(),
-	}).Info("created local node")
-
-	enrStr, err := localENR.EncodeBase64()
+	enrStr, err := localNode.Record().EncodeBase64()
 	if err == nil {
 		cfg.Logger.Infof("local ENR: %s", enrStr)
 	}

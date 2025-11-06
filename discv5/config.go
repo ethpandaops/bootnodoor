@@ -6,8 +6,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/discv5/protocol"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/sirupsen/logrus"
 )
 
@@ -16,7 +17,11 @@ type Config struct {
 	// Service context
 	Context context.Context
 
-	// PrivateKey is the node's private key
+	// LocalNode is the pre-created local node (optional, preferred)
+	// If provided, this takes precedence over LocalENR and ENR-related config
+	LocalNode *node.Node
+
+	// PrivateKey is the node's private key (required if LocalNode is nil)
 	PrivateKey *ecdsa.PrivateKey
 
 	// ENRIP is the IPv4 address to advertise in the ENR (optional)
@@ -78,7 +83,7 @@ func DefaultConfig() *Config {
 
 // Validate validates the configuration.
 func (c *Config) Validate() error {
-	if c.PrivateKey == nil {
+	if c.LocalNode == nil && c.PrivateKey == nil {
 		return ErrMissingPrivateKey
 	}
 

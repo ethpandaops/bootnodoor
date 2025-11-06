@@ -1,9 +1,8 @@
-package table
+package nodes
 
 import (
 	"time"
 
-	"github.com/ethpandaops/bootnodoor/discv5/node"
 )
 
 // DefaultPingInterval is how often we PING nodes to check liveness.
@@ -26,13 +25,13 @@ const (
 
 // DB is the interface for node database that supports rejection tracking.
 type DB interface {
-	StoreRejection(id node.ID, reason uint8, timestamp time.Time) error
-	LoadRejection(id node.ID) (flags uint8, timestamp time.Time, found bool, err error)
+	StoreRejection(id [32]byte, reason uint8, timestamp time.Time) error
+	LoadRejection(id [32]byte) (flags uint8, timestamp time.Time, found bool, err error)
 	ExpireRejections(ttl time.Duration) (int, error)
 }
 
 // NodeChangedCallback is called when a node is added or updated in the table.
-type NodeChangedCallback func(*node.Node)
+type NodeChangedCallback func(*Node)
 
 // TableStats contains statistics about the routing table.
 type TableStats struct {
@@ -48,8 +47,8 @@ type TableStats struct {
 // Helper functions for node slices
 
 // nodesToIDs converts a slice of nodes to a slice of node IDs.
-func nodesToIDs(nodes []*node.Node) []node.ID {
-	ids := make([]node.ID, len(nodes))
+func nodesToIDs(nodes []*Node) [][32]byte {
+	ids := make([][32]byte, len(nodes))
 	for i, n := range nodes {
 		ids[i] = n.ID()
 	}
@@ -57,8 +56,8 @@ func nodesToIDs(nodes []*node.Node) []node.ID {
 }
 
 // nodesMap creates a map from node ID to node from a slice of nodes.
-func nodesMap(nodes []*node.Node) map[node.ID]*node.Node {
-	m := make(map[node.ID]*node.Node)
+func nodesMap(nodes []*Node) map[[32]byte]*Node {
+	m := make(map[[32]byte]*Node)
 	for _, n := range nodes {
 		m[n.ID()] = n
 	}

@@ -1,11 +1,12 @@
-// Package discover implements node discovery operations for discv5.
+// Package services implements node discovery operations.
 //
-// The discover package provides:
-//   - Iterative FINDNODE lookups
-//   - PING/PONG operations
+// The services package provides:
+//   - Iterative FINDNODE lookups (discv5 + discv4)
+//   - PING/PONG operations (discv5 + discv4)
 //   - Random walks for table maintenance
 //   - ENR-based filtering during discovery
-package discover
+//   - Dual protocol support (prefers v5, falls back to v4)
+package services
 
 import (
 	"context"
@@ -16,10 +17,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethpandaops/bootnodoor/beacon-bootnode/table"
-	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/db"
+	"github.com/ethpandaops/bootnodoor/discv4"
+	v4node "github.com/ethpandaops/bootnodoor/discv4/node"
 	"github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/discv5/protocol"
+	"github.com/ethpandaops/bootnodoor/enr"
+	nodedb "github.com/ethpandaops/bootnodoor/nodes"
 	"github.com/sirupsen/logrus"
 )
 
@@ -30,6 +34,7 @@ const DefaultAlpha = 3
 const DefaultLookupTimeout = 30 * time.Second
 
 // LookupService manages node discovery operations.
+// Supports both discv5 and discv4 protocols (prefers v5, falls back to v4).
 type LookupService struct {
 	// config contains all lookup configuration
 	config Config
@@ -46,18 +51,34 @@ type LookupService struct {
 	lookupsCompleted int
 	lookupsFailed    int
 	nodesDiscovered  int
+	lookupsV5        int // Lookups using v5
+	lookupsV4        int // Lookups using v4
 }
 
 // Config contains configuration for the lookup service.
 type Config struct {
 	// LocalNode is our node information
-	LocalNode *node.Node
+	LocalNode *nodedb.Node
+
+	// NodeDB is the node database
+	NodeDB *nodedb.NodeDB
 
 	// Table is the routing table
-	Table *table.FlatTable
+	Table *nodedb.FlatTable
 
-	// Handler is the protocol handler
-	Handler *protocol.Handler
+	// V5Handler is the discv5 protocol handler (may be nil)
+	V5Handler *protocol.Handler
+
+	// V4Service is the discv4 service (may be nil)
+	V4Service *discv4.Service
+
+	// Database for bad node tracking (may be nil)
+	Database interface {
+		IsBadNode(nodeID []byte, layer db.NodeLayer, recheckInterval time.Duration) (isBad bool, shouldRecheck bool, reason string, err error)
+	}
+
+	// Layer is the layer being looked up
+	Layer db.NodeLayer
 
 	// Alpha is the concurrency factor (default 3)
 	Alpha int
@@ -67,7 +88,7 @@ type Config struct {
 
 	// OnNodeFound is called when a new node is discovered during lookup
 	// The callback should handle admission checks and add the node if valid
-	OnNodeFound func(*node.Node) bool
+	OnNodeFound func(*nodedb.Node) bool
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
@@ -102,12 +123,12 @@ func NewLookupService(cfg Config) *LookupService {
 //   - k: The number of closest nodes to return
 //
 // Returns discovered nodes that were added to the table.
-func (ls *LookupService) Lookup(ctx context.Context, target node.ID, k int) ([]*node.Node, error) {
+func (ls *LookupService) Lookup(ctx context.Context, target node.ID, k int) ([]*nodedb.Node, error) {
 	return ls.lookupInternal(ctx, target, k, false)
 }
 
 // lookupInternal performs the actual lookup with options for random walks
-func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k int, isRandomWalk bool) ([]*node.Node, error) {
+func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k int, isRandomWalk bool) ([]*nodedb.Node, error) {
 	ls.mu.Lock()
 	ls.lookupsStarted++
 	ls.mu.Unlock()
@@ -130,7 +151,7 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 	// Track all discovered nodes and which ones we've queried
 	seen := make(map[node.ID]bool)
 	queried := make(map[node.ID]bool)
-	var allDiscovered []*node.Node
+	var allDiscovered []*nodedb.Node
 	var mu sync.Mutex
 
 	// Add existing table nodes to the candidate pool
@@ -140,7 +161,7 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 
 	// For iterative lookup, we need a list of candidates sorted by distance to target
 	// Start with closest nodes from our table
-	var candidates []*node.Node
+	var candidates []*nodedb.Node
 	if isRandomWalk {
 		// For random walks, start with random selection for diversity
 		candidates = ls.selectRandomNodes(allNodes, ls.config.Alpha*2)
@@ -173,12 +194,12 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 
 		// Query nodes in parallel for this round
 		var wg sync.WaitGroup
-		roundDiscovered := make([]*node.Node, 0)
+		roundDiscovered := make([]*nodedb.Node, 0)
 		var roundMu sync.Mutex
 
 		for _, n := range toQuery {
 			wg.Add(1)
-			go func(n *node.Node) {
+			go func(n *nodedb.Node) {
 				defer wg.Done()
 
 				// Mark as queried
@@ -205,67 +226,190 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 					"distances": distances,
 				}).Trace("sending FINDNODE")
 
-				// Send FINDNODE request
-				respChan, err := ls.config.Handler.SendFindNode(n, distances)
-				if err != nil {
-					ls.config.Logger.WithFields(logrus.Fields{
-						"peerID": n.PeerID(),
-						"addr":   n.Addr(),
-						"error":  err,
-					}).Debug("failed to send FINDNODE")
-					return
+				// Try discv5 first if available
+				var discoveredNodes []*nodedb.Node
+				if v5Node := n.V5(); v5Node != nil && ls.config.V5Handler != nil {
+					mu.Lock()
+					ls.lookupsV5++
+					mu.Unlock()
+
+					respChan, err := ls.config.V5Handler.SendFindNode(v5Node, distances)
+					if err != nil {
+						ls.config.Logger.WithFields(logrus.Fields{
+							"peerID":   n.PeerID(),
+							"addr":     n.Addr(),
+							"protocol": "v5",
+							"error":    err,
+						}).Debug("failed to send FINDNODE v5")
+						// Don't return - try v4 fallback
+					} else {
+						// Wait for response
+						var resp *protocol.Response
+						select {
+						case resp = <-respChan:
+							// Response received
+						case <-ctx.Done():
+							ls.config.Logger.WithField("peerID", n.PeerID()).Debug("lookup cancelled")
+							return
+						}
+
+						if resp.Error == nil {
+							// Extract nodes from v5 response
+							if nodesMsg, ok := resp.Message.(*protocol.Nodes); ok {
+								ls.config.Logger.WithFields(logrus.Fields{
+									"round":       round,
+									"peerID":      n.PeerID(),
+									"protocol":    "v5",
+									"nodesInResp": len(nodesMsg.Records),
+								}).Trace("received NODES v5 response")
+
+								for _, record := range nodesMsg.Records {
+									v5Node, err := node.New(record)
+									if err != nil {
+										ls.config.Logger.WithError(err).Debug("invalid node in NODES response")
+										continue
+									}
+									discoveredNodes = append(discoveredNodes, nodedb.NewFromV5(v5Node, ls.config.NodeDB))
+								}
+							}
+						} else {
+							ls.config.Logger.WithFields(logrus.Fields{
+								"peerID":   n.PeerID(),
+								"protocol": "v5",
+								"error":    resp.Error,
+							}).Debug("FINDNODE v5 timeout or error, trying v4 fallback")
+							// Continue to v4 fallback
+						}
+					}
 				}
 
-				// Wait for response
-				var resp *protocol.Response
-				select {
-				case resp = <-respChan:
-					// Response received
-				case <-ctx.Done():
-					ls.config.Logger.WithField("peerID", n.PeerID()).Debug("lookup cancelled")
-					return
-				}
+				// Try discv4 fallback if no v5 results and v4 is available
+				if len(discoveredNodes) == 0 && n.V4() != nil && ls.config.V4Service != nil {
+					mu.Lock()
+					ls.lookupsV4++
+					mu.Unlock()
 
-				if resp.Error != nil {
-					ls.config.Logger.WithFields(logrus.Fields{
-						"peerID": n.PeerID(),
-						"error":  resp.Error,
-					}).Debug("FINDNODE timeout or error")
-					return
-				}
+					v4Node := n.V4()
+					// Convert target to []byte for v4
+					targetBytes := target[:]
+					nodes, err := ls.config.V4Service.Findnode(v4Node, targetBytes)
+					if err != nil {
+						ls.config.Logger.WithFields(logrus.Fields{
+							"peerID":   n.PeerID(),
+							"addr":     n.Addr(),
+							"protocol": "v4",
+							"error":    err,
+						}).Debug("FINDNODE v4 error")
+						return
+					}
 
-				// Extract nodes from response
-				if nodesMsg, ok := resp.Message.(*protocol.Nodes); ok {
 					ls.config.Logger.WithFields(logrus.Fields{
 						"round":       round,
 						"peerID":      n.PeerID(),
-						"nodesInResp": len(nodesMsg.Records),
-					}).Trace("received NODES response")
+						"protocol":    "v4",
+						"nodesInResp": len(nodes),
+					}).Trace("received neighbors v4 response")
 
-					roundMu.Lock()
-					for _, record := range nodesMsg.Records {
-						newNode, err := node.New(record)
-						if err != nil {
-							ls.config.Logger.WithError(err).Debug("invalid node in NODES response")
-							continue
-						}
+					// Request ENR from all discovered v4 nodes in parallel
+					// Only include nodes that successfully respond with ENR
+					var enrWg sync.WaitGroup
+					var enrMu sync.Mutex
+					nodesWithENR := make([]*nodedb.Node, 0, len(nodes))
 
-						// Skip if already seen
-						mu.Lock()
-						alreadySeen := seen[newNode.ID()]
-						if !alreadySeen {
-							seen[newNode.ID()] = true
-						}
-						mu.Unlock()
+					for _, v4n := range nodes {
+						enrWg.Add(1)
+						go func(v4n *v4node.Node) {
+							defer enrWg.Done()
 
-						if alreadySeen {
-							continue
-						}
+							nodeID := v4n.ID()
+							peerIDStr := fmt.Sprintf("%x", nodeID[:8])
 
+							// Check if this node is marked as bad
+							if ls.config.Database != nil {
+								isBad, shouldRecheck, reason, err := ls.config.Database.IsBadNode(nodeID[:], ls.config.Layer, 0)
+								if err != nil {
+									ls.config.Logger.WithError(err).Debug("failed to check bad node status")
+								} else if isBad && !shouldRecheck {
+									ls.config.Logger.WithFields(logrus.Fields{
+										"peerID": peerIDStr,
+										"reason": reason,
+									}).Debug("skipping bad node (too soon to recheck)")
+									return
+								}
+							}
+
+							// Request ENR from the node
+							enrRecord, err := ls.config.V4Service.RequestENR(v4n)
+							if err != nil {
+								ls.config.Logger.WithFields(logrus.Fields{
+									"peerID":   peerIDStr,
+									"addr":     v4n.Addr(),
+									"protocol": "v4",
+									"error":    err,
+								}).Debug("failed to request ENR from discovered node")
+								return
+							}
+
+							// Verify ENR has required fields
+							if enrRecord.IP() == nil && enrRecord.IP6() == nil {
+								ls.config.Logger.WithFields(logrus.Fields{
+									"peerID": peerIDStr,
+								}).Debug("discovered node ENR missing IP address, skipping")
+								return
+							}
+							if enrRecord.UDP() == 0 {
+								ls.config.Logger.WithFields(logrus.Fields{
+									"peerID": peerIDStr,
+								}).Debug("discovered node ENR missing UDP port, skipping")
+								return
+							}
+
+							// Set the ENR on the v4 node
+							v4n.SetENR(enrRecord)
+
+							// Add to results
+							enrMu.Lock()
+							nodesWithENR = append(nodesWithENR, nodedb.NewFromV4(v4n, ls.config.NodeDB))
+							enrMu.Unlock()
+
+							ls.config.Logger.WithFields(logrus.Fields{
+								"peerID": peerIDStr,
+								"addr":   v4n.Addr(),
+							}).Trace("successfully retrieved ENR for discovered v4 node")
+						}(v4n)
+					}
+
+					enrWg.Wait()
+
+					ls.config.Logger.WithFields(logrus.Fields{
+						"round":           round,
+						"peerID":          n.PeerID(),
+						"protocol":        "v4",
+						"nodesInResp":     len(nodes),
+						"nodesWithENR":    len(nodesWithENR),
+						"nodesWithoutENR": len(nodes) - len(nodesWithENR),
+					}).Debug("completed ENR requests for discovered v4 nodes")
+
+					// Add nodes with valid ENR to discovered nodes
+					discoveredNodes = append(discoveredNodes, nodesWithENR...)
+				}
+
+				// Add discovered nodes to round results
+				roundMu.Lock()
+				for _, newNode := range discoveredNodes {
+					// Skip if already seen
+					mu.Lock()
+					alreadySeen := seen[newNode.ID()]
+					if !alreadySeen {
+						seen[newNode.ID()] = true
+					}
+					mu.Unlock()
+
+					if !alreadySeen {
 						roundDiscovered = append(roundDiscovered, newNode)
 					}
-					roundMu.Unlock()
 				}
+				roundMu.Unlock()
 			}(n)
 		}
 
@@ -310,7 +454,7 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 	}).Debug("lookup queries complete")
 
 	// Add discovered nodes via callback (handles admission checks)
-	var addedNodes []*node.Node
+	var addedNodes []*nodedb.Node
 	for _, n := range allDiscovered {
 		if ls.config.OnNodeFound != nil && ls.config.OnNodeFound(n) {
 			addedNodes = append(addedNodes, n)
@@ -333,14 +477,14 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 }
 
 // selectRandomNodes selects up to count semi-random nodes, preferring alive ones.
-func (ls *LookupService) selectRandomNodes(nodes []*node.Node, count int) []*node.Node {
+func (ls *LookupService) selectRandomNodes(nodes []*nodedb.Node, count int) []*nodedb.Node {
 	if len(nodes) == 0 {
 		return nil
 	}
 
 	// Separate into alive and dead nodes
-	var aliveNodes []*node.Node
-	var deadNodes []*node.Node
+	var aliveNodes []*nodedb.Node
+	var deadNodes []*nodedb.Node
 
 	// Use default values for alive check (24h, 3 failures)
 	maxNodeAge := 24 * time.Hour
@@ -363,7 +507,7 @@ func (ls *LookupService) selectRandomNodes(nodes []*node.Node, count int) []*nod
 	})
 
 	// Select nodes, preferring alive ones
-	var selected []*node.Node
+	var selected []*nodedb.Node
 
 	// Take alive nodes first
 	for i := 0; i < len(aliveNodes) && len(selected) < count; i++ {
@@ -383,13 +527,13 @@ func (ls *LookupService) selectRandomNodes(nodes []*node.Node, count int) []*nod
 // 1. Haven't been queried yet in this lookup
 // 2. Haven't been queried recently (considering query history)
 // 3. Are closest to the target (for non-random-walk lookups)
-func (ls *LookupService) selectNodesToQuery(candidates []*node.Node, queried map[node.ID]bool, target node.ID, count int, isRandomWalk bool) []*node.Node {
+func (ls *LookupService) selectNodesToQuery(candidates []*nodedb.Node, queried map[node.ID]bool, target node.ID, count int, isRandomWalk bool) []*nodedb.Node {
 	if len(candidates) == 0 {
 		return nil
 	}
 
 	// Filter out already queried nodes
-	var unqueried []*node.Node
+	var unqueried []*nodedb.Node
 	for _, n := range candidates {
 		if !queried[n.ID()] {
 			unqueried = append(unqueried, n)
@@ -404,7 +548,7 @@ func (ls *LookupService) selectNodesToQuery(candidates []*node.Node, queried map
 	// - Distance to target (for non-random walks)
 	// - Time since last query (prefer nodes not queried recently)
 	type scoredNode struct {
-		node  *node.Node
+		node  *nodedb.Node
 		score float64
 	}
 
@@ -446,7 +590,7 @@ func (ls *LookupService) selectNodesToQuery(candidates []*node.Node, queried map
 	})
 
 	// Take top count nodes
-	result := make([]*node.Node, 0, count)
+	result := make([]*nodedb.Node, 0, count)
 	for i := 0; i < len(scored) && i < count; i++ {
 		result = append(result, scored[i].node)
 	}
@@ -456,13 +600,13 @@ func (ls *LookupService) selectNodesToQuery(candidates []*node.Node, queried map
 
 // sortNodesByDistance sorts nodes by their distance to the target.
 // Returns nodes sorted from closest to farthest.
-func (ls *LookupService) sortNodesByDistance(nodes []*node.Node, target node.ID) []*node.Node {
+func (ls *LookupService) sortNodesByDistance(nodes []*nodedb.Node, target node.ID) []*nodedb.Node {
 	if len(nodes) == 0 {
 		return nil
 	}
 
 	// Create a copy to avoid modifying the input
-	sorted := make([]*node.Node, len(nodes))
+	sorted := make([]*nodedb.Node, len(nodes))
 	copy(sorted, nodes)
 
 	// Sort by distance to target
@@ -478,7 +622,7 @@ func (ls *LookupService) sortNodesByDistance(nodes []*node.Node, target node.ID)
 // LookupWithFilter performs a lookup with an ENR filter.
 //
 // Only nodes that pass the filter are included in the results.
-func (ls *LookupService) LookupWithFilter(ctx context.Context, target node.ID, k int, filter enr.ENRFilter) ([]*node.Node, error) {
+func (ls *LookupService) LookupWithFilter(ctx context.Context, target node.ID, k int, filter enr.ENRFilter) ([]*nodedb.Node, error) {
 	// Perform regular lookup
 	nodes, err := ls.Lookup(ctx, target, k*2) // Request more to account for filtering
 	if err != nil {
@@ -486,7 +630,7 @@ func (ls *LookupService) LookupWithFilter(ctx context.Context, target node.ID, k
 	}
 
 	// Apply filter
-	var filtered []*node.Node
+	var filtered []*nodedb.Node
 	for _, n := range nodes {
 		if filter == nil || filter(n.Record()) {
 			filtered = append(filtered, n)
@@ -502,7 +646,7 @@ func (ls *LookupService) LookupWithFilter(ctx context.Context, target node.ID, k
 // RandomWalk performs a random walk to discover new nodes.
 //
 // This is used for routing table maintenance and exploring the network.
-func (ls *LookupService) RandomWalk(ctx context.Context) ([]*node.Node, error) {
+func (ls *LookupService) RandomWalk(ctx context.Context) ([]*nodedb.Node, error) {
 	// Generate a completely random 256-bit target ID
 	// This ensures we explore diverse regions of the keyspace
 	var target node.ID
@@ -522,6 +666,8 @@ type LookupStats struct {
 	LookupsCompleted int
 	LookupsFailed    int
 	NodesDiscovered  int
+	LookupsV5        int // Lookups using discv5
+	LookupsV4        int // Lookups using discv4
 }
 
 // GetStats returns discovery statistics.
@@ -534,6 +680,8 @@ func (ls *LookupService) GetStats() LookupStats {
 		LookupsCompleted: ls.lookupsCompleted,
 		LookupsFailed:    ls.lookupsFailed,
 		NodesDiscovered:  ls.nodesDiscovered,
+		LookupsV5:        ls.lookupsV5,
+		LookupsV4:        ls.lookupsV4,
 	}
 }
 

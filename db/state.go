@@ -45,6 +45,22 @@ func (d *Database) SetState(tx *sqlx.Tx, key string, value []byte) error {
 	return err
 }
 
+// LoadLocalENR loads the stored local ENR from the database.
+//
+// Returns the ENR bytes if found, or an error if not found or on failure.
+// The local ENR is stored in the state table with key "local_enr".
+func (d *Database) LoadLocalENR() ([]byte, error) {
+	return d.GetState("local_enr")
+}
+
+// StoreLocalENR stores the local ENR to the database.
+//
+// This should be called whenever the local ENR is created or updated.
+// The ENR is stored in the state table for persistence across restarts.
+func (d *Database) StoreLocalENR(enrBytes []byte) error {
+	return d.SetState(nil, "local_enr", enrBytes)
+}
+
 // DeleteState removes a state entry by key.
 func (d *Database) DeleteState(tx *sqlx.Tx, key string) error {
 	if tx == nil {

@@ -43,11 +43,20 @@
                 <span class="nav-text">Overview</span>
               </a>
             </li>
+            {{if .HasEL}}
             <li class="nav-item">
-              <a class="nav-link{{ if eq .Active "nodes" }} active{{ end }}" href="/nodes">
-                <span class="nav-text">Nodes</span>
+              <a class="nav-link{{ if eq .Active "el-nodes" }} active{{ end }}" href="/el-nodes">
+                <span class="nav-text">EL Nodes</span>
               </a>
             </li>
+            {{end}}
+            {{if .HasCL}}
+            <li class="nav-item">
+              <a class="nav-link{{ if eq .Active "cl-nodes" }} active{{ end }}" href="/cl-nodes">
+                <span class="nav-text">CL Nodes</span>
+              </a>
+            </li>
+            {{end}}
             <li class="nav-item">
               <a class="nav-link" href="/metrics">
                 <span class="nav-text">Metrics</span>

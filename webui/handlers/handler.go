@@ -1,6 +1,6 @@
 package handlers
 
-import bootnode "github.com/ethpandaops/bootnodoor/beacon-bootnode"
+import "github.com/ethpandaops/bootnodoor/bootnode"
 
 type FrontendHandler struct {
 	bootnodeService *bootnode.Service

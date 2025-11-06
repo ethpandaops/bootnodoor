@@ -44,6 +44,10 @@ type Config struct {
 	// OnNodeSeen is called when we receive any valid packet from a node
 	// Useful for tracking last_seen timestamps in a database
 	OnNodeSeen protocol.OnNodeSeenCallback
+
+	// OnPongReceived is called when a PONG response is received
+	// Contains our external IP/port as seen by the remote peer
+	OnPongReceived protocol.OnPongReceivedCallback
 }
 
 // Validate checks if the configuration is valid.
@@ -154,6 +158,12 @@ func (b *ConfigBuilder) WithOnENRRequest(cb protocol.OnENRRequestCallback) *Conf
 // WithOnNodeSeen sets the OnNodeSeen callback.
 func (b *ConfigBuilder) WithOnNodeSeen(cb protocol.OnNodeSeenCallback) *ConfigBuilder {
 	b.config.OnNodeSeen = cb
+	return b
+}
+
+// WithOnPongReceived sets the OnPongReceived callback.
+func (b *ConfigBuilder) WithOnPongReceived(cb protocol.OnPongReceivedCallback) *ConfigBuilder {
+	b.config.OnPongReceived = cb
 	return b
 }
 

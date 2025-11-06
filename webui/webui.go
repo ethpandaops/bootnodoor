@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	bootnode "github.com/ethpandaops/bootnodoor/beacon-bootnode"
+	"github.com/ethpandaops/bootnodoor/bootnode"
 	"github.com/ethpandaops/bootnodoor/webui/handlers"
 	"github.com/ethpandaops/bootnodoor/webui/server"
 	"github.com/ethpandaops/bootnodoor/webui/types"
@@ -38,7 +38,8 @@ func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, bo
 	// register frontend routes
 	frontendHandler := handlers.NewFrontendHandler(bootnodeService)
 	router.HandleFunc("/", frontendHandler.Overview).Methods("GET")
-	router.HandleFunc("/nodes", frontendHandler.Nodes).Methods("GET")
+	router.HandleFunc("/el-nodes", frontendHandler.ELNodes).Methods("GET")
+	router.HandleFunc("/cl-nodes", frontendHandler.CLNodes).Methods("GET")
 	router.HandleFunc("/enr", frontendHandler.ENR).Methods("GET")
 
 	// metrics endpoint

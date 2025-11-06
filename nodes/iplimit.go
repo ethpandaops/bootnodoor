@@ -1,10 +1,9 @@
-package table
+package nodes
 
 import (
 	"net"
 	"sync"
 
-	"github.com/ethpandaops/bootnodoor/discv5/node"
 )
 
 // DefaultMaxNodesPerIP is the default maximum nodes per IP address.
@@ -22,7 +21,7 @@ type IPLimiter struct {
 	ipCounts map[string]int
 
 	// nodeToIP maps node ID to IP address
-	nodeToIP map[node.ID]string
+	nodeToIP map[[32]byte]string
 
 	// mu protects concurrent access
 	mu sync.RWMutex
@@ -43,18 +42,18 @@ func NewIPLimiter(maxNodesPerIP int) *IPLimiter {
 	return &IPLimiter{
 		maxNodesPerIP: maxNodesPerIP,
 		ipCounts:      make(map[string]int),
-		nodeToIP:      make(map[node.ID]string),
+		nodeToIP:      make(map[[32]byte]string),
 	}
 }
 
 // CanAdd checks if a node can be added without exceeding IP limits.
 //
 // Returns true if the node can be added, false if the IP limit is exceeded.
-func (l *IPLimiter) CanAdd(n *node.Node) bool {
+func (l *IPLimiter) CanAdd(n *Node) bool {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
-	ip := n.IP().String()
+	ip := n.Addr().IP.String()
 	nodeID := n.ID()
 
 	// Check if node already exists (updating is always allowed)
@@ -71,11 +70,11 @@ func (l *IPLimiter) CanAdd(n *node.Node) bool {
 //
 // This should be called when a node is added to the routing table.
 // Returns false if the IP limit is exceeded.
-func (l *IPLimiter) Add(n *node.Node) bool {
+func (l *IPLimiter) Add(n *Node) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	ip := n.IP().String()
+	ip := n.Addr().IP.String()
 	nodeID := n.ID()
 
 	// Check if node already exists
@@ -109,7 +108,7 @@ func (l *IPLimiter) Add(n *node.Node) bool {
 // Remove unregisters a node from the IP limiter.
 //
 // This should be called when a node is removed from the routing table.
-func (l *IPLimiter) Remove(nodeID node.ID) {
+func (l *IPLimiter) Remove(nodeID [32]byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

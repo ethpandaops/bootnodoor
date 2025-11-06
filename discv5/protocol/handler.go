@@ -54,15 +54,16 @@ type OnNodeUpdateCallback func(n *node.Node)
 type OnNodeSeenCallback func(n *node.Node, timestamp time.Time)
 
 // OnFindNodeCallback is called when a FINDNODE request is received.
+// The sourceNode parameter is the node that sent the request (may be nil if unknown).
 // The requester parameter provides the requesting node's address for context-aware filtering (e.g., LAN-aware filtering).
-type OnFindNodeCallback func(msg *FindNode, requester *net.UDPAddr) []*node.Node
+type OnFindNodeCallback func(msg *FindNode, sourceNode *node.Node, requester *net.UDPAddr) []*node.Node
 
 // OnTalkReqCallback is called when a TALKREQ request is received.
 type OnTalkReqCallback func(msg *TalkReq) []byte
 
 // OnPongReceivedCallback is called when a PONG response is received.
-// Parameters: remoteNodeID, reportedIP (our IP as seen by the remote peer), reportedPort (our port as seen by the remote peer)
-type OnPongReceivedCallback func(remoteNodeID node.ID, reportedIP net.IP, reportedPort uint16)
+// Parameters: remoteNodeID, sourceIP (remote peer's IP), reportedIP (our IP as seen by the remote peer), reportedPort (our port as seen by the remote peer)
+type OnPongReceivedCallback func(remoteNodeID node.ID, sourceIP net.IP, reportedIP net.IP, reportedPort uint16)
 
 // Handler handles incoming and outgoing protocol messages.
 //
@@ -173,7 +174,7 @@ type HandlerConfig struct {
 //	handler := NewHandler(HandlerConfig{
 //	    LocalNode: myNode,
 //	    Sessions: sessionCache,
-//	    OnFindNode: func(msg *FindNode, requester *net.UDPAddr) []*node.Node { ... },
+//	    OnFindNode: func(msg *FindNode, sourceNode *node.Node, requester *net.UDPAddr) []*node.Node { ... },
 //	})
 func NewHandler(ctx context.Context, cfg HandlerConfig) *Handler {
 	// Apply defaults for limits
@@ -984,11 +985,11 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, rem
 	// Match with pending request
 	h.requests.MatchResponse(msg.RequestID, remoteID, msg)
 
-	// Call OnPongReceived callback with the IP and port reported in the PONG
+	// Call OnPongReceived callback with the source IP and the IP/port reported in the PONG
 	// The IP and Port fields in PONG contain our address as seen by the remote peer
 	if h.config.OnPongReceived != nil && len(msg.IP) > 0 && msg.Port > 0 {
 		reportedIP := net.IP(msg.IP)
-		h.config.OnPongReceived(remoteID, reportedIP, msg.Port)
+		h.config.OnPongReceived(remoteID, from.IP, reportedIP, msg.Port)
 	}
 
 	// Update node's last seen time
@@ -1033,7 +1034,7 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 	} else {
 		// Use OnFindNode callback to get nodes (callback handles filtering)
 		if h.config.OnFindNode != nil {
-			nodes = h.config.OnFindNode(msg, from)
+			nodes = h.config.OnFindNode(msg, remoteNode, from)
 		}
 
 		h.config.Logger.WithFields(logrus.Fields{

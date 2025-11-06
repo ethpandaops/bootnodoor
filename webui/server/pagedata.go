@@ -32,6 +32,8 @@ type PageData struct {
 	DebugTemplates   []string
 	DisableTxMetrics bool
 	DisableAuditLogs bool
+	HasEL            bool // Whether EL bootnode is active
+	HasCL            bool // Whether CL bootnode is active
 }
 
 type Meta struct {
@@ -104,6 +106,13 @@ func InitPageData(r *http.Request, active, path, title string, mainTemplates []s
 	}
 
 	return data
+}
+
+// SetBootnodeStatus sets the HasEL and HasCL flags based on bootnode table availability.
+// This should be called by handlers that have access to the bootnode service.
+func (p *PageData) SetBootnodeStatus(hasEL, hasCL bool) {
+	p.HasEL = hasEL
+	p.HasCL = hasCL
 }
 
 // used to handle errors constructed by Template.ExecuteTemplate correctly

@@ -34,6 +34,10 @@ type OnENRRequestCallback func(from *node.Node) error
 // OnNodeSeenCallback is called when we receive any valid packet from a node.
 type OnNodeSeenCallback func(n *node.Node, timestamp time.Time)
 
+// OnPongReceivedCallback is called when a PONG response is received.
+// The ip and port parameters contain our external address as seen by the remote peer.
+type OnPongReceivedCallback func(from *node.Node, ip net.IP, port uint16)
+
 // Handler handles incoming and outgoing discv4 protocol messages.
 //
 // The handler is responsible for:
@@ -96,10 +100,11 @@ type HandlerConfig struct {
 	ExpirationWindow time.Duration
 
 	// Callbacks (all optional)
-	OnPing       OnPingCallback
-	OnFindnode   OnFindnodeCallback
-	OnENRRequest OnENRRequestCallback
-	OnNodeSeen   OnNodeSeenCallback
+	OnPing         OnPingCallback
+	OnPongReceived OnPongReceivedCallback
+	OnFindnode     OnFindnodeCallback
+	OnENRRequest   OnENRRequestCallback
+	OnNodeSeen     OnNodeSeenCallback
 }
 
 // PendingRequest tracks an outgoing request waiting for a response.
@@ -280,6 +285,12 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 
 	// Mark pong received (establishes bond)
 	fromNode.MarkPongReceived(h.config.BondExpiration)
+
+	// Call OnPongReceived callback with the IP and port reported in the PONG
+	// The To field in PONG contains our address as seen by the remote peer
+	if h.config.OnPongReceived != nil && pong.To.IP != nil && pong.To.UDP > 0 {
+		h.config.OnPongReceived(fromNode, pong.To.IP, pong.To.UDP)
+	}
 
 	// Match to pending request
 	req := h.getPendingRequest(string(pong.ReplyTok))

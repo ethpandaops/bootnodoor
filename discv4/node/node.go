@@ -12,8 +12,9 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/enode"
+	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/stats"
 )
 
 // ID represents a node identifier (32-byte Keccak256 hash of public key).
@@ -40,21 +41,22 @@ type Node struct {
 	enode *enode.Enode
 
 	// Bond tracking
-	bondMu         sync.RWMutex
-	bondStatus     BondStatus
-	lastPingSent   time.Time
-	lastPingRecv   time.Time
-	lastPongSent   time.Time
-	lastPongRecv   time.Time
-	bondExpiration time.Time
+	bondMu             sync.RWMutex
+	bondStatus         BondStatus
+	lastPingSent       time.Time
+	lastPingRecv       time.Time
+	lastPongSent       time.Time
+	lastPongRecv       time.Time
+	bondExpiration     time.Time
+	consecutiveTimeout uint32 // Bond-specific consecutive timeout counter
 
-	// Statistics
-	mu                 sync.RWMutex
-	lastSeen           time.Time
-	totalPacketsRecv   uint64
-	totalPacketsSent   uint64
-	failedPings        uint32
-	consecutiveTimeout uint32
+	// Statistics (shared with generic node wrapper)
+	stats *stats.SharedStats
+
+	// Packet counters (local, not part of shared stats)
+	packetMu         sync.RWMutex
+	totalPacketsRecv uint64
+	totalPacketsSent uint64
 }
 
 // BondStatus represents the bonding state of a node.
@@ -93,12 +95,13 @@ func (s BondStatus) String() string {
 // New creates a new discv4 node from a public key and UDP address.
 func New(pubKey *ecdsa.PublicKey, addr *net.UDPAddr) *Node {
 	id := PubkeyToID(pubKey)
+	now := time.Now()
 	return &Node{
 		id:         id,
 		pubKey:     pubKey,
 		addr:       addr,
 		bondStatus: BondStatusUnknown,
-		lastSeen:   time.Now(),
+		stats:      stats.NewSharedStats(now),
 	}
 }
 
@@ -229,21 +232,26 @@ func (n *Node) IsBonded() bool {
 
 // MarkPingSent records that we sent a PING to this node.
 func (n *Node) MarkPingSent() {
-	n.bondMu.Lock()
-	defer n.bondMu.Unlock()
+	now := time.Now()
 
-	n.lastPingSent = time.Now()
+	n.bondMu.Lock()
+	n.lastPingSent = now
 	if n.bondStatus == BondStatusUnknown {
 		n.bondStatus = BondStatusPingSent
 	}
+	n.bondMu.Unlock()
+
+	n.stats.SetLastPing(now)
 }
 
 // MarkPingReceived records that we received a PING from this node.
 func (n *Node) MarkPingReceived() {
-	n.bondMu.Lock()
-	defer n.bondMu.Unlock()
+	now := time.Now()
 
-	n.lastPingRecv = time.Now()
+	n.bondMu.Lock()
+	n.lastPingRecv = now
+	n.bondMu.Unlock()
+
 	n.UpdateLastSeen()
 }
 
@@ -259,23 +267,26 @@ func (n *Node) MarkPongSent() {
 //
 // This establishes or renews the bond.
 func (n *Node) MarkPongReceived(bondDuration time.Duration) {
-	n.bondMu.Lock()
-	defer n.bondMu.Unlock()
+	now := time.Now()
 
-	n.lastPongRecv = time.Now()
+	n.bondMu.Lock()
+	n.lastPongRecv = now
 	n.bondStatus = BondStatusBonded
-	n.bondExpiration = time.Now().Add(bondDuration)
+	n.bondExpiration = now.Add(bondDuration)
 	n.consecutiveTimeout = 0
+	n.bondMu.Unlock()
+
+	n.stats.ResetFailureCount()
 	n.UpdateLastSeen()
 }
 
 // MarkTimeout records a timeout (failed to receive expected response).
 func (n *Node) MarkTimeout() {
 	n.bondMu.Lock()
-	defer n.bondMu.Unlock()
-
 	n.consecutiveTimeout++
-	n.failedPings++
+	n.bondMu.Unlock()
+
+	n.stats.IncrementFailureCount()
 }
 
 // LastPingSent returns when we last sent a PING.
@@ -303,51 +314,45 @@ func (n *Node) BondExpiration() time.Time {
 
 // UpdateLastSeen updates the last seen timestamp.
 func (n *Node) UpdateLastSeen() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.lastSeen = time.Now()
+	n.stats.SetLastSeen(time.Now())
 }
 
 // LastSeen returns when we last saw a packet from this node.
 func (n *Node) LastSeen() time.Time {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.lastSeen
+	return n.stats.LastSeen()
+}
+
+// FailedPings returns the number of failed ping attempts.
+func (n *Node) FailedPings() uint32 {
+	return uint32(n.stats.FailureCount())
 }
 
 // IncrementPacketsReceived increments the received packet counter.
 func (n *Node) IncrementPacketsReceived() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.packetMu.Lock()
+	defer n.packetMu.Unlock()
 	n.totalPacketsRecv++
 }
 
 // IncrementPacketsSent increments the sent packet counter.
 func (n *Node) IncrementPacketsSent() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	n.packetMu.Lock()
+	defer n.packetMu.Unlock()
 	n.totalPacketsSent++
 }
 
 // TotalPacketsReceived returns the total packets received from this node.
 func (n *Node) TotalPacketsReceived() uint64 {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
+	n.packetMu.RLock()
+	defer n.packetMu.RUnlock()
 	return n.totalPacketsRecv
 }
 
 // TotalPacketsSent returns the total packets sent to this node.
 func (n *Node) TotalPacketsSent() uint64 {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
+	n.packetMu.RLock()
+	defer n.packetMu.RUnlock()
 	return n.totalPacketsSent
-}
-
-// FailedPings returns the number of failed ping attempts.
-func (n *Node) FailedPings() uint32 {
-	n.bondMu.RLock()
-	defer n.bondMu.RUnlock()
-	return n.failedPings
 }
 
 // ConsecutiveTimeouts returns the number of consecutive timeouts.
@@ -355,6 +360,14 @@ func (n *Node) ConsecutiveTimeouts() uint32 {
 	n.bondMu.RLock()
 	defer n.bondMu.RUnlock()
 	return n.consecutiveTimeout
+}
+
+// SetStats replaces the node's stats with a shared stats pointer.
+// This allows the node to update stats owned by a parent node.
+func (n *Node) SetStats(sharedStats *stats.SharedStats) {
+	if sharedStats != nil {
+		n.stats = sharedStats
+	}
 }
 
 // Utility Functions

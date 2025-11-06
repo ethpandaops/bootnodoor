@@ -18,6 +18,22 @@
     </div>
     {{ end }}
 
+    <!-- Enode Section -->
+    {{ if .LocalEnode }}
+    <div class="card mt-3">
+      <div class="card-body">
+        <h5 class="card-title">Bootnode Enode</h5>
+        <p class="text-muted mb-3">Enode URL derived from ENR for Execution Layer (EL) nodes.</p>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .LocalEnode }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .LocalEnode }}" data-bs-toggle="tooltip" title="Copy Enode to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+    {{ end }}
+
     <!-- Peer ID Section -->
     <div class="card mt-3">
       <div class="card-body">
@@ -81,16 +97,19 @@
         </div>
       </div>
 
-      <!-- Routing Table Card -->
+      <!-- EL Routing Table Card -->
       <div class="col-12 col-md-6 col-lg-4 mb-3">
         <div class="card h-100">
           <div class="card-body">
-            <h6 class="card-title">Routing Table</h6>
+            <h6 class="card-title">
+              Execution Layer (EL) Nodes
+              <a href="/el-nodes" class="btn btn-sm btn-outline-primary float-end" style="padding: 0.1rem 0.4rem; font-size: 0.75rem;">View</a>
+            </h6>
             <table class="table table-sm mb-0">
               <tbody>
                 <tr>
                   <td class="text-muted">Total Nodes</td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-primary fs-6" data-stat="table-size">{{ .TableSize }}</span></td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-primary fs-6" data-stat="el-total-nodes">{{ .ELTotalNodes }}</span></td>
                 </tr>
                 <tr>
                   <td class="text-muted">
@@ -102,10 +121,10 @@
                        data-bs-trigger="hover focus"
                        data-bs-placement="right"
                        data-bs-html="true"
-                       data-bs-title="Active Nodes"
-                       data-bs-content="Nodes actively monitored and shared with clients (max 500). These nodes are pinged regularly and rotated periodically based on performance scores."></i>
+                       data-bs-title="Active EL Nodes"
+                       data-bs-content="Execution Layer nodes actively monitored and shared with clients. These nodes are pinged regularly and rotated periodically based on performance scores."></i>
                   </td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-success fs-6" data-stat="active-nodes">{{ .ActiveNodes }}</span></td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-success fs-6" data-stat="el-active-nodes">{{ .ELActiveNodes }}</span></td>
                 </tr>
                 <tr>
                   <td class="text-muted">
@@ -117,10 +136,60 @@
                        data-bs-trigger="hover focus"
                        data-bs-placement="right"
                        data-bs-html="true"
-                       data-bs-title="Inactive Nodes"
-                       data-bs-content="Nodes stored in the database but not actively monitored. These nodes are periodically rotated into the active pool based on performance scores."></i>
+                       data-bs-title="Inactive EL Nodes"
+                       data-bs-content="EL nodes stored in the database but not actively monitored. These nodes are periodically rotated into the active pool."></i>
                   </td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary fs-6" data-stat="inactive-nodes">{{ .InactiveNodes }}</span></td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary fs-6" data-stat="el-inactive-nodes">{{ .ELTableStats.InactiveNodes }}</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- CL Routing Table Card -->
+      <div class="col-12 col-md-6 col-lg-4 mb-3">
+        <div class="card h-100">
+          <div class="card-body">
+            <h6 class="card-title">
+              Consensus Layer (CL) Nodes
+              <a href="/cl-nodes" class="btn btn-sm btn-outline-primary float-end" style="padding: 0.1rem 0.4rem; font-size: 0.75rem;">View</a>
+            </h6>
+            <table class="table table-sm mb-0">
+              <tbody>
+                <tr>
+                  <td class="text-muted">Total Nodes</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-primary fs-6" data-stat="cl-total-nodes">{{ .CLTotalNodes }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">
+                    Active Nodes
+                    <i class="fa fa-info-circle text-muted"
+                       style="font-size: 0.8em;"
+                       role="button"
+                       data-bs-toggle="popover"
+                       data-bs-trigger="hover focus"
+                       data-bs-placement="right"
+                       data-bs-html="true"
+                       data-bs-title="Active CL Nodes"
+                       data-bs-content="Consensus Layer nodes actively monitored and shared with clients. These nodes are pinged regularly and rotated periodically based on performance scores."></i>
+                  </td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-success fs-6" data-stat="cl-active-nodes">{{ .CLActiveNodes }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">
+                    Inactive Nodes
+                    <i class="fa fa-info-circle text-muted"
+                       style="font-size: 0.8em;"
+                       role="button"
+                       data-bs-toggle="popover"
+                       data-bs-trigger="hover focus"
+                       data-bs-placement="right"
+                       data-bs-html="true"
+                       data-bs-title="Inactive CL Nodes"
+                       data-bs-content="CL nodes stored in the database but not actively monitored. These nodes are periodically rotated into the active pool."></i>
+                  </td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary fs-6" data-stat="cl-inactive-nodes">{{ .CLTableStats.InactiveNodes }}</span></td>
                 </tr>
               </tbody>
             </table>
@@ -343,7 +412,7 @@
       <div class="col-12 col-md-6 col-lg-4 mb-3">
         <div class="card h-100">
           <div class="card-body">
-            <h6 class="card-title">Fork Info</h6>
+            <h6 class="card-title">CL Fork Info</h6>
             <table class="table table-sm mb-0">
               <tbody>
                 <tr>
@@ -432,6 +501,79 @@
       </div>
       {{ end }}
     </div>
+
+    <!-- Fork Lists Row -->
+    {{ if or .ELForks .CLForks }}
+    <div class="row mt-3">
+      <!-- EL Forks Card -->
+      {{ if .ELForks }}
+      <div class="col-12 col-lg-6 mb-3">
+        <div class="card h-100">
+          <div class="card-body">
+            <h6 class="card-title">Execution Layer (EL) Forks</h6>
+            <div class="table-responsive">
+              <table class="table table-sm mb-0">
+                <thead>
+                  <tr>
+                    <th class="text-muted" style="font-weight: 500; font-size: 0.8em;">Fork</th>
+                    <th class="text-muted" style="font-weight: 500; font-size: 0.8em;">Activation</th>
+                    <th class="text-muted text-end" style="font-weight: 500; font-size: 0.8em;">Digest</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {{ range .ELForks }}
+                  <tr>
+                    <td>{{ .Name }}</td>
+                    <td><code style="font-size: 0.75em;">{{ .Activation }}</code></td>
+                    <td class="text-end">
+                      <code style="font-size: 0.75em;">{{ .Digest }}</code>
+                      <i class="fa fa-copy text-muted ms-1" style="font-size: 0.85em;" role="button" data-bs-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="{{ .Digest }}"></i>
+                    </td>
+                  </tr>
+                  {{ end }}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+      {{ end }}
+
+      <!-- CL Forks Card -->
+      {{ if .CLForks }}
+      <div class="col-12 col-lg-6 mb-3">
+        <div class="card h-100">
+          <div class="card-body">
+            <h6 class="card-title">Consensus Layer (CL) Forks</h6>
+            <div class="table-responsive">
+              <table class="table table-sm mb-0">
+                <thead>
+                  <tr>
+                    <th class="text-muted" style="font-weight: 500; font-size: 0.8em;">Fork</th>
+                    <th class="text-muted" style="font-weight: 500; font-size: 0.8em;">Epoch</th>
+                    <th class="text-muted text-end" style="font-weight: 500; font-size: 0.8em;">Digest</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {{ range .CLForks }}
+                  <tr>
+                    <td>{{ .Name }}</td>
+                    <td><code style="font-size: 0.75em;">{{ .Activation }}</code></td>
+                    <td class="text-end">
+                      <code style="font-size: 0.75em;">{{ .Digest }}</code>
+                      <i class="fa fa-copy text-muted ms-1" style="font-size: 0.85em;" role="button" data-bs-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="{{ .Digest }}"></i>
+                    </td>
+                  </tr>
+                  {{ end }}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+      {{ end }}
+    </div>
+    {{ end }}
 
     <!-- Old Fork Digests Table (if present) -->
     {{ if .OldDigests }}
@@ -536,10 +678,24 @@
         updateValue('[data-stat="bind-address"]', data.BindAddress);
         if (data.LocalENRSeq) updateValue('[data-stat="enr-seq"]', data.LocalENRSeq);
 
-        /* Routing table */
+        /* Routing table (combined) */
         updateValue('[data-stat="table-size"]', data.TableSize);
         updateValue('[data-stat="active-nodes"]', data.ActiveNodes);
         updateValue('[data-stat="inactive-nodes"]', data.InactiveNodes);
+
+        /* EL table stats */
+        updateValue('[data-stat="el-total-nodes"]', data.ELTotalNodes);
+        updateValue('[data-stat="el-active-nodes"]', data.ELActiveNodes);
+        if (data.ELTableStats) {
+          updateValue('[data-stat="el-inactive-nodes"]', data.ELTableStats.InactiveNodes);
+        }
+
+        /* CL table stats */
+        updateValue('[data-stat="cl-total-nodes"]', data.CLTotalNodes);
+        updateValue('[data-stat="cl-active-nodes"]', data.CLActiveNodes);
+        if (data.CLTableStats) {
+          updateValue('[data-stat="cl-inactive-nodes"]', data.CLTableStats.InactiveNodes);
+        }
 
         /* Discovery stats */
         updateValue('[data-stat="lookups-started"]', data.LookupsStarted);
