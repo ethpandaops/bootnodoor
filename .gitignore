@@ -42,3 +42,7 @@ Thumbs.db
 tmp/
 temp/
 tmp-*
+
+# Devnet files
+.hack/devnet/custom-*
+.hack/devnet/generated-*

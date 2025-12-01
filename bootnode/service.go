@@ -226,7 +226,7 @@ func New(cfg *Config) (*Service, error) {
 			OnNodeFound: func(n *nodes.Node) bool {
 				// Filter by fork ID before adding to table
 				if n.Record() != nil && s.enrManager != nil {
-					if !s.enrManager.FilterELNode(n.Record()) {
+					if isEL, _ := s.enrManager.FilterELNode(n.Record()); !isEL {
 						// Mark as bad node
 						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
 							cfg.Logger.WithError(err).Debug("failed to store bad node")
@@ -776,9 +776,14 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 	}
 
 	// Filter by fork ID before adding
-	if s.enrManager != nil && !s.enrManager.FilterELNode(record) {
-		s.config.Logger.Warn("bootnode ENR has invalid fork ID, skipping")
-		return
+	if s.enrManager != nil {
+		if isEL, forkID := s.enrManager.FilterELNode(record); !isEL {
+			s.config.Logger.WithFields(logrus.Fields{
+				"nodeID": fmt.Sprintf("%x", v5.ID().Bytes()[:8]),
+				"eth":    forkID,
+			}).Warn("bootnode ENR has invalid fork ID, skipping")
+			return
+		}
 	}
 
 	// Create generic node and add to table
@@ -827,9 +832,14 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	v4Node.SetENR(enrRecord)
 
 	// Filter by fork ID before adding
-	if s.enrManager != nil && !s.enrManager.FilterELNode(enrRecord) {
-		s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("enode bootnode has invalid fork ID, skipping")
-		return
+	if s.enrManager != nil {
+		if isEL, forkID := s.enrManager.FilterELNode(enrRecord); !isEL {
+			s.config.Logger.WithFields(logrus.Fields{
+				"nodeID": fmt.Sprintf("%x", nodeID[:8]),
+				"eth":    forkID,
+			}).Warn("enode bootnode has invalid fork ID, skipping")
+			return
+		}
 	}
 
 	// Create generic node and add to table
@@ -940,7 +950,7 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 	if s.enrManager != nil {
 		nodeID := n.ID()
 
-		if s.enrManager.FilterELNode(n.Record()) && s.elTable != nil && s.elNodeDB != nil {
+		if isEL, _ := s.enrManager.FilterELNode(n.Record()); isEL && s.elTable != nil && s.elNodeDB != nil {
 			// Look up the generic node from the table
 			if genericNode := s.elTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
@@ -965,7 +975,7 @@ func (s *Service) onFindNodeV5(msg *v5protocol.FindNode, sourceNode *v5node.Node
 	if sourceNode != nil && s.enrManager != nil {
 		// Check source node's layer
 		sourceRecord := sourceNode.Record()
-		isEL := s.enrManager.FilterELNode(sourceRecord)
+		isEL, _ := s.enrManager.FilterELNode(sourceRecord)
 		isCL := s.enrManager.FilterCLNode(sourceRecord)
 
 		// Serve from appropriate table(s)
@@ -1140,11 +1150,16 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	}
 
 	// Filter the node using ENR manager (EL-only for discv4)
-	if s.enrManager != nil && !s.enrManager.FilterELNode(n.ENR()) {
-		s.config.Logger.WithFields(logrus.Fields{
-			"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
-		}).Debug("Discv4 node filtered out (wrong fork or not EL)")
-		return false
+	if s.enrManager != nil {
+		filter, forkID := s.enrManager.FilterELNode(n.ENR())
+		if !filter {
+			s.config.Logger.WithFields(logrus.Fields{
+				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
+				"remote": n.Addr().String(),
+				"eth":    forkID,
+			}).Debug("Discv4 node filtered out (wrong fork or not EL)")
+			return false
+		}
 	}
 
 	// Create generic node from v4 node
@@ -1165,7 +1180,7 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 // checkAndAddNode performs admission checks and adds node to appropriate table.
 func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	// Determine layer
-	isEL := s.enrManager.FilterELNode(n.Record())
+	isEL, _ := s.enrManager.FilterELNode(n.Record())
 	isCL := s.enrManager.FilterCLNode(n.Record())
 
 	// Add to appropriate table(s)

@@ -53,7 +53,7 @@ type Service struct {
 type Transport interface {
 	protocol.Transport
 	LocalAddr() *net.UDPAddr
-	AddHandler(handler func(data []byte, from *net.UDPAddr) bool)
+	AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
 }
 
 // New creates a new discv5 service.
@@ -176,14 +176,15 @@ func New(cfg *Config, transport Transport) (*Service, error) {
 
 // packetHandler is the packet handler function registered with the transport.
 // It wraps the protocol handler's HandleIncomingPacket method.
-func (s *Service) packetHandler(data []byte, from *net.UDPAddr) (accepted bool) {
+func (s *Service) packetHandler(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) (accepted bool) {
 	// Recover from panics
 	defer func() {
 		if r := recover(); r != nil {
 			s.config.Logger.WithFields(logrus.Fields{
-				"from":  from,
-				"panic": r,
-				"stack": fmt.Sprintf("%v", r),
+				"from":      from,
+				"localAddr": localAddr,
+				"panic":     r,
+				"stack":     fmt.Sprintf("%v", r),
 			}).Error("discv5: PANIC in packetHandler!")
 			accepted = false
 		}
@@ -194,7 +195,7 @@ func (s *Service) packetHandler(data []byte, from *net.UDPAddr) (accepted bool) 
 	// Note: While discv5 packets normally start with "discv5", we don't pre-filter
 	// because a discv4 packet could theoretically have a random hash collision.
 	// We rely on proper cryptographic validation in the handler.
-	err := s.handler.HandleIncomingPacket(data, from)
+	err := s.handler.HandleIncomingPacket(data, from, localAddr)
 	if err != nil {
 		// Could not handle as discv5, let other handlers try
 		return false

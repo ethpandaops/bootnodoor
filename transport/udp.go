@@ -18,6 +18,8 @@ import (
 
 	"github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -36,7 +38,8 @@ const (
 // The handler should process the packet and return quickly.
 // Long-running operations should be done in a separate goroutine.
 // Returns true if the packet was handled, false if not recognized.
-type PacketHandler func(data []byte, from *net.UDPAddr) bool
+// The localAddr parameter is the local address that received the packet (important for 0.0.0.0 bindings).
+type PacketHandler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool
 
 // UDPTransport manages UDP socket I/O for the discv5 protocol.
 //
@@ -49,6 +52,10 @@ type PacketHandler func(data []byte, from *net.UDPAddr) bool
 type UDPTransport struct {
 	// conn is the UDP connection
 	conn *net.UDPConn
+
+	// ipv4Conn and ipv6Conn provide access to IP-level socket options
+	ipv4Conn *ipv4.PacketConn
+	ipv6Conn *ipv6.PacketConn
 
 	// handlers is a list of packet handlers (tried in order)
 	handlers   []PacketHandler
@@ -191,6 +198,24 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		cancel:      cancel,
 	}
 
+	// Set up IP-level packet connections for control message support
+	// This allows us to read the destination IP that received the packet
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	if localAddr.IP.To4() != nil || localAddr.IP.IsUnspecified() {
+		// IPv4 or unspecified (0.0.0.0 / ::)
+		t.ipv4Conn = ipv4.NewPacketConn(conn)
+		if err := t.ipv4Conn.SetControlMessage(ipv4.FlagDst|ipv4.FlagInterface, true); err != nil {
+			logger.WithError(err).Warn("transport: failed to set IPv4 control message flags")
+		}
+	}
+	if localAddr.IP.To4() == nil || localAddr.IP.IsUnspecified() {
+		// IPv6 or unspecified
+		t.ipv6Conn = ipv6.NewPacketConn(conn)
+		if err := t.ipv6Conn.SetControlMessage(ipv6.FlagDst|ipv6.FlagInterface, true); err != nil {
+			logger.WithError(err).Warn("transport: failed to set IPv6 control message flags")
+		}
+	}
+
 	// Start receive goroutines
 	// Use multiple goroutines for better concurrency
 	numWorkers := 4
@@ -234,12 +259,12 @@ func (t *UDPTransport) Conn() *net.UDPConn {
 //
 // Example:
 //
-//	transport.AddHandler(func(data []byte, from *net.UDPAddr) bool {
+//	transport.AddHandler(func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool {
 //	    // Try to handle packet, return true if successful
-//	    err := myProtocol.HandlePacket(data, from)
+//	    err := myProtocol.HandlePacket(data, from, localAddr)
 //	    return err == nil
 //	})
-func (t *UDPTransport) AddHandler(handler func(data []byte, from *net.UDPAddr) bool) {
+func (t *UDPTransport) AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool) {
 	t.handlersMu.Lock()
 	defer t.handlersMu.Unlock()
 	t.handlers = append(t.handlers, PacketHandler(handler))
@@ -248,7 +273,7 @@ func (t *UDPTransport) AddHandler(handler func(data []byte, from *net.UDPAddr) b
 // SendTo sends a packet to the specified address.
 // This is the interface method required by protocol.Transport.
 func (t *UDPTransport) SendTo(data []byte, to *net.UDPAddr) error {
-	return t.Send(data, to)
+	return t.Send(data, to, nil)
 }
 
 // Send sends a packet to the specified address.
@@ -256,13 +281,17 @@ func (t *UDPTransport) SendTo(data []byte, to *net.UDPAddr) error {
 // This is thread-safe and can be called concurrently.
 // Returns an error if the transport is closed or if sending fails.
 //
+// The from parameter can optionally specify the source address to send from.
+// This is important when the socket is bound to 0.0.0.0 - the response should
+// be sent from the same address that received the request.
+//
 // Example:
 //
-//	err := transport.Send(packetData, remoteAddr)
+//	err := transport.Send(packetData, remoteAddr, localAddr)
 //	if err != nil {
 //	    log.Printf("Failed to send: %v", err)
 //	}
-func (t *UDPTransport) Send(data []byte, to *net.UDPAddr) error {
+func (t *UDPTransport) Send(data []byte, to *net.UDPAddr, from *net.UDPAddr) error {
 	if t.closed.Load() {
 		t.logger.Debug("transport: attempted to send on closed transport")
 		return fmt.Errorf("transport: closed")
@@ -287,11 +316,22 @@ func (t *UDPTransport) Send(data []byte, to *net.UDPAddr) error {
 		t.logger.WithError(err).Warn("transport: failed to set write deadline")
 	}
 
-	n, err := t.conn.WriteToUDP(data, to)
+	var n int
+	var err error
+
+	// If a source address is specified, use control messages to set it
+	if from != nil && from.IP != nil && !from.IP.IsUnspecified() {
+		n, err = t.sendWithSource(data, to, from)
+	} else {
+		// Standard send without source control
+		n, err = t.conn.WriteToUDP(data, to)
+	}
+
 	if err != nil {
 		t.metrics.IncrementSendErrors()
 		t.logger.WithFields(logrus.Fields{
 			"to":    to,
+			"from":  from,
 			"error": err,
 		}).Error("transport: write failed")
 		return fmt.Errorf("transport: write failed: %w", err)
@@ -309,22 +349,50 @@ func (t *UDPTransport) Send(data []byte, to *net.UDPAddr) error {
 	t.metrics.RecordSent(uint64(n))
 	t.logger.WithFields(logrus.Fields{
 		"to":   to,
+		"from": from,
 		"size": n,
 	}).Trace("transport: packet sent successfully")
 	return nil
 }
 
+// sendWithSource sends a packet with a specific source address using control messages.
+func (t *UDPTransport) sendWithSource(data []byte, to *net.UDPAddr, from *net.UDPAddr) (int, error) {
+	if to.IP.To4() != nil {
+		// IPv4
+		if t.ipv4Conn == nil {
+			return 0, fmt.Errorf("IPv4 packet connection not available")
+		}
+
+		cm := &ipv4.ControlMessage{
+			Src: from.IP,
+		}
+
+		return t.ipv4Conn.WriteTo(data, cm, to)
+	} else {
+		// IPv6
+		if t.ipv6Conn == nil {
+			return 0, fmt.Errorf("IPv6 packet connection not available")
+		}
+
+		cm := &ipv6.ControlMessage{
+			Src: from.IP,
+		}
+
+		return t.ipv6Conn.WriteTo(data, cm, to)
+	}
+}
+
 // dispatchPacket routes a packet to the registered handlers.
 //
 // Handlers are tried in order until one returns true.
-func (t *UDPTransport) dispatchPacket(data []byte, from *net.UDPAddr) {
+func (t *UDPTransport) dispatchPacket(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) {
 	t.handlersMu.RLock()
 	handlers := t.handlers
 	t.handlersMu.RUnlock()
 
 	// Try each handler in order
 	for _, handler := range handlers {
-		if handler(data, from) {
+		if handler(data, from, localAddr) {
 			// Handler accepted the packet
 			return
 		}
@@ -332,8 +400,9 @@ func (t *UDPTransport) dispatchPacket(data []byte, from *net.UDPAddr) {
 
 	// No handler recognized the packet
 	t.logger.WithFields(logrus.Fields{
-		"from": from,
-		"size": len(data),
+		"from":      from,
+		"localAddr": localAddr,
+		"size":      len(data),
 	}).Debug("transport: unrecognized packet (no handler accepted it)")
 }
 
@@ -345,6 +414,7 @@ func (t *UDPTransport) receiveLoop() {
 	defer t.wg.Done()
 
 	buffer := make([]byte, MaxPacketSize)
+	oob := make([]byte, 1024) // Buffer for out-of-band data (control messages)
 
 	for {
 		select {
@@ -360,8 +430,8 @@ func (t *UDPTransport) receiveLoop() {
 			return
 		}
 
-		// Try to read packet (this blocks until packet arrives or timeout)
-		n, from, err := t.conn.ReadFromUDP(buffer)
+		// Try to read packet with control messages (this blocks until packet arrives or timeout)
+		n, oobn, _, from, err := t.conn.ReadMsgUDP(buffer, oob)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Timeout is expected, continue
@@ -380,9 +450,13 @@ func (t *UDPTransport) receiveLoop() {
 			continue
 		}
 
+		// Extract the local destination address from control messages
+		localAddr := t.extractLocalAddr(from, oob[:oobn])
+
 		t.logger.WithFields(logrus.Fields{
-			"from": from,
-			"size": n,
+			"from":      from,
+			"localAddr": localAddr,
+			"size":      n,
 		}).Trace("transport: received packet")
 
 		// Validate source address
@@ -410,8 +484,36 @@ func (t *UDPTransport) receiveLoop() {
 		copy(dataCopy, buffer[:n])
 
 		// Call handlers (non-blocking)
-		go t.dispatchPacket(dataCopy, from)
+		go t.dispatchPacket(dataCopy, from, localAddr)
 	}
+}
+
+// extractLocalAddr extracts the local destination address from control messages.
+func (t *UDPTransport) extractLocalAddr(from *net.UDPAddr, oob []byte) *net.UDPAddr {
+	// Try IPv4 first
+	if from.IP.To4() != nil && t.ipv4Conn != nil {
+		var cm ipv4.ControlMessage
+		if err := cm.Parse(oob); err == nil && cm.Dst != nil {
+			return &net.UDPAddr{
+				IP:   cm.Dst,
+				Port: t.conn.LocalAddr().(*net.UDPAddr).Port,
+			}
+		}
+	}
+
+	// Try IPv6
+	if from.IP.To4() == nil && t.ipv6Conn != nil {
+		var cm ipv6.ControlMessage
+		if err := cm.Parse(oob); err == nil && cm.Dst != nil {
+			return &net.UDPAddr{
+				IP:   cm.Dst,
+				Port: t.conn.LocalAddr().(*net.UDPAddr).Port,
+			}
+		}
+	}
+
+	// Fallback to the socket's local address
+	return t.conn.LocalAddr().(*net.UDPAddr)
 }
 
 // Close gracefully shuts down the transport.

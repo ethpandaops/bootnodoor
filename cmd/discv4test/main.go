@@ -383,9 +383,8 @@ func runGetENR(cmd *cobra.Command, args []string) error {
 		}
 
 		// Add eth fork version if present
-		var ethField []byte
-		if err := record.Get("eth", &ethField); err == nil && len(ethField) >= 4 {
-			result["fork_version"] = hex.EncodeToString(ethField[:4])
+		if ethField, ok := record.Eth(); ok {
+			result["fork_version"] = hex.EncodeToString(ethField[0].ForkID[:])
 		}
 
 		printJSON(result)
@@ -422,9 +421,8 @@ func runGetENR(cmd *cobra.Command, args []string) error {
 		}
 
 		// Show eth fork version if present
-		var ethField []byte
-		if err := record.Get("eth", &ethField); err == nil && len(ethField) >= 4 {
-			fmt.Printf("Eth:     %s\n", hex.EncodeToString(ethField[:4]))
+		if ethField, ok := record.Eth(); ok {
+			fmt.Printf("Eth:     %s\n", hex.EncodeToString(ethField[0].ForkID[:]))
 		}
 	}
 

@@ -31,7 +31,7 @@ import (
 type Transport interface {
 	protocol.Transport
 	LocalAddr() *net.UDPAddr
-	AddHandler(handler func(data []byte, from *net.UDPAddr) bool)
+	AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
 }
 
 // Service represents a discv4 service instance.
@@ -132,14 +132,15 @@ func New(config *Config, transport Transport) (*Service, error) {
 
 // packetHandler is the packet handler function registered with the transport.
 // It wraps the protocol handler's HandlePacket method.
-func (s *Service) packetHandler(data []byte, from *net.UDPAddr) (accepted bool) {
+func (s *Service) packetHandler(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) (accepted bool) {
 	// Recover from panics
 	defer func() {
 		if r := recover(); r != nil {
 			logrus.WithFields(logrus.Fields{
-				"from":  from,
-				"panic": r,
-				"stack": fmt.Sprintf("%v", r),
+				"from":      from,
+				"localAddr": localAddr,
+				"panic":     r,
+				"stack":     fmt.Sprintf("%v", r),
 			}).Error("discv4: PANIC in packetHandler!")
 			accepted = false
 		}
@@ -150,7 +151,7 @@ func (s *Service) packetHandler(data []byte, from *net.UDPAddr) (accepted bool) 
 	// Note: We don't pre-filter based on magic strings because a discv4
 	// packet (which has a random hash) could theoretically start with
 	// the bytes "discv5". We rely on cryptographic validation.
-	err := s.handler.HandlePacket(data, from)
+	err := s.handler.HandlePacket(data, from, localAddr)
 
 	if err != nil {
 		// Could not handle as discv4, let other handlers try

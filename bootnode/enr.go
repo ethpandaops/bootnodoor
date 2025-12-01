@@ -106,57 +106,52 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 	}
 
 	// Update local node's ENR
-	// Note: discv5 node doesn't have UpdateENR, we'll need to recreate the node
-	// For now, just log - this will need proper implementation
-	// TODO: Implement proper ENR update mechanism
+	if !m.localNode.UpdateENR(newRecord) {
+		return fmt.Errorf("failed to update local node ENR (sequence number may be stale)")
+	}
 
-	m.config.Logger.WithField("seq", newRecord.Seq()).Info("updated local ENR")
+	m.config.Logger.WithField("seq", newRecord.Seq()).Info("updated local ENR with eth/eth2 fields")
 	return nil
 }
 
 // FilterELNode checks if an EL node's fork ID is valid.
 //
 // Returns true if the node should be accepted, false otherwise.
-func (m *ENRManager) FilterELNode(record *enr.Record) bool {
+func (m *ENRManager) FilterELNode(record *enr.Record) (bool, elconfig.ForkID) {
 	if !m.config.HasEL() {
-		return false
+		return false, elconfig.ForkID{}
 	}
 
 	// Extract 'eth' field - it's RLP-encoded as [[Hash, Next]]
 	// The eth field contains a list of fork IDs (typically just one)
 	// The record.Get() method automatically handles RLP decoding
-	var forkList []struct {
-		Hash []byte
-		Next uint64
-	}
-
-	if err := record.Get("eth", &forkList); err != nil {
-		// No eth field or decoding failed
-		return false
+	forkList, ok := record.Eth()
+	if !ok {
+		return false, elconfig.ForkID{}
 	}
 
 	// Check if we have at least one fork ID
 	if len(forkList) == 0 {
 		m.config.Logger.Debug("eth field is empty")
-		return false
+		return false, elconfig.ForkID{}
 	}
 
 	// Use the first (current) fork ID
 	forkData := forkList[0]
 
 	// Validate hash is 4 bytes
-	if len(forkData.Hash) != 4 {
-		m.config.Logger.WithField("hashLen", len(forkData.Hash)).Debug("invalid fork hash length in eth field")
-		return false
+	if len(forkData.ForkID) != 4 {
+		m.config.Logger.WithField("hashLen", len(forkData.ForkID)).Debug("invalid fork hash length in eth field")
+		return false, elconfig.ForkID{}
 	}
 
 	// Convert to ForkID struct
 	var forkID elconfig.ForkID
-	copy(forkID.Hash[:], forkData.Hash)
-	forkID.Next = forkData.Next
+	copy(forkID.Hash[:], forkData.ForkID[:])
+	forkID.Next = forkData.NextForkEpoch
 
 	// Validate fork ID
-	return m.elFilter.Filter(forkID)
+	return m.elFilter.Filter(forkID), forkID
 }
 
 // FilterCLNode checks if a CL node's fork digest is valid.

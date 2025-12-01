@@ -85,12 +85,6 @@ func (ndb *NodeDB) QueueUpdate(n *Node) error {
 		ndb.statsLock.Lock()
 		ndb.stats.MergedUpdates++
 		ndb.statsLock.Unlock()
-
-		ndb.logger.WithFields(logrus.Fields{
-			"nodeID":      fmt.Sprintf("%x", nodeID[:8]),
-			"dirtyFields": n.GetDirtyFlags(),
-		}).Debug("node already in queue, flags will accumulate")
-
 		return nil
 	}
 

@@ -36,3 +36,22 @@ fmt:
 	go fmt ./...
 
 check: fmt lint test
+
+devnet:
+	.hack/devnet/run.sh
+
+devnet-run: devnet
+	go run cmd/bootnodoor/main.go \
+		--private-key $$(cat .hack/devnet/generated-bootnodoor-key.txt) \
+		--el-config .hack/devnet/generated-el-genesis.json \
+		--el-genesis-hash $$(cat .hack/devnet/generated-el-hash.txt) \
+		--cl-config .hack/devnet/generated-cl-config.yaml \
+		--genesis-validators-root $$(cat .hack/devnet/generated-cl-gvr.txt) \
+		--nodedb .hack/devnet/generated-database.sqlite \
+		--enable-el=true \
+		--enable-cl=true \
+		--web-ui \
+		--log-level debug
+
+devnet-clean:
+	.hack/devnet/cleanup.sh

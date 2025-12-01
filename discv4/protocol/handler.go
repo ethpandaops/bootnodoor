@@ -17,6 +17,7 @@ import (
 // Transport interface for sending packets.
 type Transport interface {
 	SendTo(data []byte, to *net.UDPAddr) error
+	Send(data []byte, to *net.UDPAddr, from *net.UDPAddr) error
 }
 
 // Callbacks
@@ -188,7 +189,8 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 // HandlePacket processes an incoming UDP packet.
 //
 // This is called by the transport layer when a packet is received.
-func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) (err error) {
+// The localAddr parameter is the local address that received the packet.
+func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) (err error) {
 	// Recover from panics
 	defer func() {
 		if r := recover(); r != nil {
@@ -233,15 +235,15 @@ func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) (err error) {
 	// Dispatch by packet type
 	switch p := packet.(type) {
 	case *Ping:
-		return h.handlePing(fromNode, from, p, hash)
+		return h.handlePing(fromNode, from, localAddr, p, hash)
 	case *Pong:
 		return h.handlePong(fromNode, from, p)
 	case *Findnode:
-		return h.handleFindnode(fromNode, from, p)
+		return h.handleFindnode(fromNode, from, localAddr, p)
 	case *Neighbors:
 		return h.handleNeighbors(fromNode, from, p)
 	case *ENRRequest:
-		return h.handleENRRequest(fromNode, from, p, hash)
+		return h.handleENRRequest(fromNode, from, localAddr, p, hash)
 	case *ENRResponse:
 		return h.handleENRResponse(fromNode, from, p)
 	default:
@@ -251,7 +253,7 @@ func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) (err error) {
 }
 
 // handlePing processes a PING request.
-func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, ping *Ping, hash []byte) error {
+func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *net.UDPAddr, ping *Ping, hash []byte) error {
 	logrus.WithFields(logrus.Fields{
 		"from":    from.String(),
 		"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
@@ -276,7 +278,7 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, ping *Ping,
 	}
 
 	// Send PONG response
-	if err := h.sendPong(fromNode, from, hash); err != nil {
+	if err := h.sendPong(fromNode, from, localAddr, hash); err != nil {
 		return err
 	}
 
@@ -350,7 +352,7 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 }
 
 // handleFindnode processes a FINDNODE request.
-func (h *Handler) handleFindnode(fromNode *node.Node, from *net.UDPAddr, findnode *Findnode) error {
+func (h *Handler) handleFindnode(fromNode *node.Node, from *net.UDPAddr, localAddr *net.UDPAddr, findnode *Findnode) error {
 	logrus.WithFields(logrus.Fields{
 		"from":    from.String(),
 		"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
@@ -381,7 +383,7 @@ func (h *Handler) handleFindnode(fromNode *node.Node, from *net.UDPAddr, findnod
 	}
 
 	// Send NEIGHBORS response(s)
-	return h.sendNeighbors(fromNode, from, nodes)
+	return h.sendNeighbors(fromNode, from, localAddr, nodes)
 }
 
 // handleNeighbors processes a NEIGHBORS response.
@@ -470,7 +472,7 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 }
 
 // handleENRRequest processes an ENRREQUEST.
-func (h *Handler) handleENRRequest(fromNode *node.Node, from *net.UDPAddr, req *ENRRequest, hash []byte) error {
+func (h *Handler) handleENRRequest(fromNode *node.Node, from *net.UDPAddr, localAddr *net.UDPAddr, req *ENRRequest, hash []byte) error {
 	logrus.WithFields(logrus.Fields{
 		"from":    from.String(),
 		"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
@@ -503,7 +505,7 @@ func (h *Handler) handleENRRequest(fromNode *node.Node, from *net.UDPAddr, req *
 	}
 
 	// Send ENRResponse
-	return h.sendENRResponse(fromNode, from, hash)
+	return h.sendENRResponse(fromNode, from, localAddr, hash)
 }
 
 // handleENRResponse processes an ENRRESPONSE.
@@ -692,7 +694,7 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 }
 
 // sendPong sends a PONG response.
-func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, replyTok []byte) error {
+func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, replyTok []byte) error {
 	pong := &Pong{
 		To:         NewEndpoint(addr, uint16(addr.Port)),
 		ReplyTok:   replyTok,
@@ -709,7 +711,7 @@ func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, replyTok []byte) er
 		return err
 	}
 
-	if err := h.transport.SendTo(packet, addr); err != nil {
+	if err := h.transport.Send(packet, addr, localAddr); err != nil {
 		return err
 	}
 
@@ -721,7 +723,7 @@ func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, replyTok []byte) er
 }
 
 // sendNeighbors sends NEIGHBORS response(s).
-func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, nodes []*node.Node) error {
+func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, nodes []*node.Node) error {
 	// Split nodes into packets of MaxNeighbors
 	for i := 0; i < len(nodes); i += MaxNeighbors {
 		end := i + MaxNeighbors
@@ -751,7 +753,7 @@ func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, nodes []*node.
 			return err
 		}
 
-		if err := h.transport.SendTo(packet, addr); err != nil {
+		if err := h.transport.Send(packet, addr, localAddr); err != nil {
 			return err
 		}
 
@@ -763,7 +765,7 @@ func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, nodes []*node.
 }
 
 // sendENRResponse sends an ENRRESPONSE.
-func (h *Handler) sendENRResponse(to *node.Node, addr *net.UDPAddr, replyTok []byte) error {
+func (h *Handler) sendENRResponse(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, replyTok []byte) error {
 	if h.config.LocalENR == nil {
 		return fmt.Errorf("no local ENR configured")
 	}
@@ -778,7 +780,7 @@ func (h *Handler) sendENRResponse(to *node.Node, addr *net.UDPAddr, replyTok []b
 		return err
 	}
 
-	if err := h.transport.SendTo(packet, addr); err != nil {
+	if err := h.transport.Send(packet, addr, localAddr); err != nil {
 		return err
 	}
 

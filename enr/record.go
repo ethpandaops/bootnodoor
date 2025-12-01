@@ -393,6 +393,28 @@ func (r *Record) Eth2() (*Eth2ENRData, bool) {
 	return &eth2Data, true
 }
 
+// Eth returns the Ethereum metadata from the record.
+//
+// Returns nil and false if no "eth" key is present or if decoding fails.
+func (r *Record) Eth() (EthENRData, bool) {
+	if !r.Has("eth") {
+		return nil, false
+	}
+
+	var forkList EthENRData
+	if err := r.Get("eth", &forkList); err != nil {
+		// No eth field or decoding failed
+		return nil, false
+	}
+
+	// Check if we have at least one fork ID
+	if len(forkList) == 0 {
+		return nil, false
+	}
+
+	return forkList, true
+}
+
 // Sign signs the record with the provided private key.
 //
 // This updates the signature field and invalidates any cached encoding.

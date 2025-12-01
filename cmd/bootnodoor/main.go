@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/webui"
 	"github.com/ethpandaops/bootnodoor/webui/types"
 )
@@ -57,9 +59,9 @@ var (
 	maxActiveNodes int
 	maxNodesPerIP  int
 
-	// Protocol selection
-	enableDiscv4 bool
-	enableDiscv5 bool
+	// Layer selection
+	enableEL bool
+	enableCL bool
 
 	// WebUI flags
 	enableWebUI bool
@@ -68,6 +70,9 @@ var (
 	webUISite   string
 	webUIPprof  bool
 	webUIDebug  bool
+
+	// Devnet shim mode
+	devnetShim string
 
 	// Root command
 	rootCmd = &cobra.Command{
@@ -121,9 +126,9 @@ func init() {
 	rootCmd.Flags().IntVar(&maxActiveNodes, "max-active-nodes", 500, "Maximum number of active nodes per table")
 	rootCmd.Flags().IntVar(&maxNodesPerIP, "max-nodes-per-ip", 10, "Maximum number of nodes per IP address")
 
-	// Protocol selection
-	rootCmd.Flags().BoolVar(&enableDiscv4, "enable-discv4", true, "Enable Discovery v4 protocol")
-	rootCmd.Flags().BoolVar(&enableDiscv5, "enable-discv5", true, "Enable Discovery v5 protocol")
+	// Layer selection
+	rootCmd.Flags().BoolVar(&enableEL, "enable-el", true, "Enable Execution Layer support (discv4 + discv5)")
+	rootCmd.Flags().BoolVar(&enableCL, "enable-cl", true, "Enable Consensus Layer support (discv5)")
 
 	// WebUI
 	rootCmd.Flags().BoolVar(&enableWebUI, "web-ui", false, "Enable web UI")
@@ -131,6 +136,9 @@ func init() {
 	rootCmd.Flags().IntVar(&webUIPort, "web-port", 8080, "Web UI port")
 	rootCmd.Flags().StringVar(&webUISite, "web-sitename", "bootnodoor", "Web UI site name")
 	rootCmd.Flags().BoolVar(&webUIPprof, "pprof", false, "Enable pprof endpoints")
+
+	// Devnet shim mode
+	rootCmd.Flags().StringVar(&devnetShim, "devnet-shim", "", "Run in devnet shim mode, only serve ENR/enode with given IP:port (e.g., 172.17.0.1:9000)")
 }
 
 func main() {
@@ -154,18 +162,13 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Parse private key
+	// Parse private key (supports file paths)
 	privKey, err := parsePrivateKey(privateKeyHex)
 	if err != nil {
 		return fmt.Errorf("invalid private key: %w", err)
 	}
 
-	// Validate: at least one layer must be configured
-	if elConfigPath == "" && clConfigPath == "" {
-		return fmt.Errorf("at least one of --el-config or --cl-config must be provided")
-	}
-
-	// Parse EL config if provided
+	// Parse EL config if provided (needed for both shim and normal mode)
 	var elConfig *elconfig.ChainConfig
 	var elGenesisHashBytes [32]byte
 	var elGenesisTime uint64
@@ -187,8 +190,12 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		elGenesisTime = genesis.GetTimestamp()
 		logger.WithField("timestamp", elGenesisTime).Debug("extracted genesis time from genesis file")
 
-		// Parse genesis hash
-		genesisHashHex := strings.TrimPrefix(elGenesisHash, "0x")
+		// Parse genesis hash (supports file paths)
+		genesisHashValue, err := parseValueOrFile(elGenesisHash)
+		if err != nil {
+			return fmt.Errorf("failed to parse genesis hash: %w", err)
+		}
+		genesisHashHex := strings.TrimPrefix(genesisHashValue, "0x")
 		genesisHashBytes, err := hex.DecodeString(genesisHashHex)
 		if err != nil {
 			return fmt.Errorf("invalid genesis hash: %w", err)
@@ -277,8 +284,12 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to load CL config: %w", err)
 		}
 
-		// Set genesis validators root
-		if err := clConfig.SetGenesisValidatorsRoot(genesisValidatorsRoot); err != nil {
+		// Parse and set genesis validators root (supports file paths)
+		genesisValidatorsRootValue, err := parseValueOrFile(genesisValidatorsRoot)
+		if err != nil {
+			return fmt.Errorf("failed to parse genesis validators root: %w", err)
+		}
+		if err := clConfig.SetGenesisValidatorsRoot(genesisValidatorsRootValue); err != nil {
 			return fmt.Errorf("failed to set genesis validators root: %w", err)
 		}
 
@@ -312,6 +323,16 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 				}).Info("  - fork")
 			}
 		}
+	}
+
+	// Check if running in devnet shim mode (after parsing configs)
+	if devnetShim != "" {
+		return runDevnetShim(logger, privKey, devnetShim, elConfig, elGenesisHashBytes, elGenesisTime, clConfig, clGenesisTime, gracePeriod)
+	}
+
+	// Validate: at least one layer must be configured (only for normal mode)
+	if elConfigPath == "" && clConfigPath == "" {
+		return fmt.Errorf("at least one of --el-config or --cl-config must be provided")
 	}
 
 	// Create SQLite database
@@ -400,6 +421,12 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		logger.WithField("count", len(clBootnodes)).Info("loaded CL bootnodes")
 	}
 
+	// Determine which discovery protocols to enable based on layer selection
+	// EL (Execution Layer) needs both discv4 and discv5
+	// CL (Consensus Layer) only needs discv5
+	enableDiscv4 := enableEL
+	enableDiscv5 := enableEL || enableCL
+
 	// Create bootnode service config
 	config := bootnode.DefaultConfig()
 	config.PrivateKey = privKey
@@ -416,7 +443,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.Logger = logger
 
 	// Set EL config if provided
-	if elConfig != nil {
+	if enableEL && elConfig != nil {
 		config.ELConfig = elConfig
 		config.ELGenesisHash = elGenesisHashBytes
 		config.ELGenesisTime = elGenesisTime
@@ -424,7 +451,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set CL config if provided
-	if clConfig != nil {
+	if enableCL && clConfig != nil {
 		config.CLConfig = clConfig
 		config.CLBootnodes = clBootnodes
 	}
@@ -517,7 +544,189 @@ func getLocalIP() net.IP {
 }
 
 // parsePrivateKey parses a hex-encoded private key.
+func runDevnetShim(
+	logger *logrus.Logger,
+	privKey *ecdsa.PrivateKey,
+	shimEndpoint string,
+	elConfig *elconfig.ChainConfig,
+	elGenesisHash [32]byte,
+	elGenesisTime uint64,
+	clConfig *clconfig.Config,
+	clGenesisTime uint64,
+	gracePeriod time.Duration,
+) error {
+	// Parse the endpoint
+	parts := strings.Split(shimEndpoint, ":")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid devnet-shim format, expected IP:port, got: %s", shimEndpoint)
+	}
+
+	shimIP := parts[0]
+	shimPort := parts[1]
+
+	// Get public key and node ID
+	pubKey := privKey.Public().(*ecdsa.PublicKey)
+	nodeID := ethcrypto.PubkeyToAddress(*pubKey)
+
+	// Generate enode URL (for EL)
+	enode := fmt.Sprintf("enode://%x@%s:%s", ethcrypto.FromECDSAPub(pubKey)[1:], shimIP, shimPort)
+
+	// Generate ENR using the exact same logic as buildENR in bootnode/localnode.go
+	record := enr.New()
+
+	// Set identity scheme (v4) and public key
+	record.Set(enr.WithIdentityScheme("v4"))
+	record.Set(enr.WithPublicKey(pubKey))
+
+	// Set IP address
+	if ipAddr := net.ParseIP(shimIP); ipAddr != nil {
+		if ipv4 := ipAddr.To4(); ipv4 != nil {
+			record.Set("ip", ipv4)
+		}
+	}
+
+	// Set UDP and TCP ports
+	portNum := 0
+	fmt.Sscanf(shimPort, "%d", &portNum)
+	if portNum > 0 {
+		record.Set("udp", uint16(portNum))
+		record.Set("tcp", uint16(portNum)) // TCP same as UDP
+	}
+
+	// Add EL 'eth' field if config provided
+	if elConfig != nil {
+		// Gather fork data for computing fork IDs
+		forksByBlock, forksByTime := elconfig.GatherForks(elConfig, elGenesisTime)
+		// Compute all fork IDs
+		allForkIDs := elconfig.ComputeAllForkIDs(elGenesisHash, forksByBlock, forksByTime)
+		// Use current fork ID (last one in the list)
+		currentForkID := allForkIDs[len(allForkIDs)-1]
+
+		ethField := []struct {
+			Hash []byte
+			Next uint64
+		}{
+			{
+				Hash: currentForkID.Hash[:],
+				Next: currentForkID.Next,
+			},
+		}
+		record.Set("eth", ethField)
+		logger.WithField("forkID", currentForkID.String()).Debug("added eth field to shim ENR")
+	}
+
+	// Add CL 'eth2' field if config provided
+	if clConfig != nil {
+		// Create fork digest filter to compute eth2 field
+		clFilter := clconfig.NewForkDigestFilter(clConfig, gracePeriod)
+		eth2Field := clFilter.ComputeEth2Field()
+		record.Set("eth2", eth2Field)
+
+		// Extract fork digest for logging
+		var forkDigest [4]byte
+		if len(eth2Field) >= 4 {
+			copy(forkDigest[:], eth2Field[0:4])
+		}
+		logger.WithField("forkDigest", fmt.Sprintf("%#x", forkDigest)).Debug("added eth2 field to shim ENR")
+	}
+
+	// Set sequence number to 1
+	record.SetSeq(1)
+
+	// Sign the record
+	if err := record.Sign(privKey); err != nil {
+		return fmt.Errorf("failed to sign ENR: %w", err)
+	}
+
+	// Get the ENR string using proper base64 encoding
+	enrString, err := record.EncodeBase64()
+	if err != nil {
+		return fmt.Errorf("failed to encode ENR: %w", err)
+	}
+
+	logger.Info("Running in devnet shim mode")
+	logger.Infof("Private key: %s...%s", privateKeyHex[:10], privateKeyHex[len(privateKeyHex)-6:])
+	logger.Infof("Node ID: %s", nodeID.Hex())
+	logger.Infof("Enode: %s", enode)
+	logger.Infof("ENR: %s", enrString)
+	logger.Infof("Shim endpoint: %s", shimEndpoint)
+
+	// Output to stdout for easy capture
+	fmt.Println("=== BOOTNODE INFO ===")
+	fmt.Printf("ENODE=%s\n", enode)
+	fmt.Printf("ENR=%s\n", enrString)
+	fmt.Printf("NODE_ID=%s\n", nodeID.Hex())
+	fmt.Printf("PRIVKEY=%s\n", privateKeyHex)
+	fmt.Println("=== END ===")
+
+	// Start a simple HTTP server to serve the bootnode info
+	http.HandleFunc("/privkey", func(w http.ResponseWriter, r *http.Request) {
+		logger.Infof("Serving private key to %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", privateKeyHex)
+	})
+
+	http.HandleFunc("/enode", func(w http.ResponseWriter, r *http.Request) {
+		logger.Infof("Serving enode to %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", enode)
+	})
+
+	http.HandleFunc("/enr", func(w http.ResponseWriter, r *http.Request) {
+		logger.Infof("Serving ENR to %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", enrString)
+	})
+
+	http.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"enode":"%s","enr":"%s","node_id":"%s","privkey":"%s"}`, enode, enrString, nodeID.Hex(), privateKeyHex)
+	})
+
+	// Start HTTP server in background
+	go func() {
+		logger.Infof("Starting HTTP server on :8080 for shim mode endpoints")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			logger.Errorf("HTTP server error: %v", err)
+		}
+	}()
+
+	// Keep the container running
+	logger.Info("Devnet shim mode active. Container will stay running...")
+	logger.Info("Private key available at http://localhost:8080/privkey")
+	logger.Info("Full info available at http://localhost:8080/info")
+
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	logger.Info("Shutting down devnet shim")
+	return nil
+}
+
+// parseValueOrFile reads a value directly or from a file if it's a file path
+func parseValueOrFile(value string) (string, error) {
+	// Check if it's a file path
+	if _, err := os.Stat(value); err == nil {
+		// It's a file, read it
+		data, err := os.ReadFile(value)
+		if err != nil {
+			return "", fmt.Errorf("failed to read file: %w", err)
+		}
+		return strings.TrimSpace(string(data)), nil
+	}
+	// It's a direct value
+	return value, nil
+}
+
 func parsePrivateKey(hexKey string) (*ecdsa.PrivateKey, error) {
+	// Parse value or file
+	hexKey, err := parseValueOrFile(hexKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+
 	// Remove 0x prefix if present
 	if len(hexKey) >= 2 && hexKey[0:2] == "0x" {
 		hexKey = hexKey[2:]

@@ -175,6 +175,16 @@ type Eth2ENRData struct {
 	NextForkEpoch   uint64
 }
 
+// EthENRData represents the eth field in an ENR record.
+//
+// This field contains Ethereum specific metadata including:
+//   - ForkID: 4-byte identifier for the current fork
+//   - NextForkEpoch: Epoch when the next fork activates
+type EthENRData []struct {
+	ForkID        [4]byte
+	NextForkEpoch uint64
+}
+
 // Eth2ForkFilter creates a filter that checks for a specific eth2 fork digest.
 //
 // The fork digest identifies which Ethereum 2.0 network and fork the node

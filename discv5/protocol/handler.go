@@ -20,6 +20,7 @@ import (
 // Transport interface for sending packets.
 type Transport interface {
 	SendTo(data []byte, to *net.UDPAddr) error
+	Send(data []byte, to *net.UDPAddr, from *net.UDPAddr) error
 }
 
 // PendingHandshake tracks a message waiting for handshake completion
@@ -369,13 +370,15 @@ func (h *Handler) evictOldestChallenge() {
 // HandleIncomingPacket processes an incoming UDP packet.
 //
 // This is called by the UDP transport layer when a packet arrives.
-func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr) error {
+// The localAddr parameter is the local address that received the packet.
+func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) error {
 	h.mu.Lock()
 	h.packetsReceived++
 	h.mu.Unlock()
 
 	h.config.Logger.WithFields(logrus.Fields{
 		"from":      from,
+		"localAddr": localAddr,
 		"size":      len(data),
 		"packetHex": fmt.Sprintf("%x", data[:min(100, len(data))]),
 	}).Trace("handler: incoming packet")
@@ -397,11 +400,11 @@ func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr) error {
 	// Handle based on packet type
 	switch packet.PacketType {
 	case OrdinaryPacket:
-		return h.handleOrdinaryPacket(packet, from)
+		return h.handleOrdinaryPacket(packet, from, localAddr)
 	case WHOAREYOUPacket:
-		return h.handleWHOAREYOUPacket(packet, from)
+		return h.handleWHOAREYOUPacket(packet, from, localAddr)
 	case HandshakePacket:
-		return h.handleHandshakePacket(packet, from)
+		return h.handleHandshakePacket(packet, from, localAddr)
 	default:
 		h.mu.Lock()
 		h.invalidPackets++
@@ -415,7 +418,7 @@ func (h *Handler) HandleIncomingPacket(data []byte, from *net.UDPAddr) error {
 }
 
 // handleOrdinaryPacket handles an ordinary encrypted packet.
-func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error {
+func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr, localAddr *net.UDPAddr) error {
 	// Extract source node ID from packet
 	if len(packet.SrcID) != 32 {
 		return fmt.Errorf("no source node ID in packet")
@@ -450,7 +453,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 			"from":   from,
 			"nodeID": srcNodeID.String()[:16],
 		}).Debug("handler: no session, sending WHOAREYOU")
-		return h.sendWHOAREYOU(from, srcNodeID, packet.Header.Nonce)
+		return h.sendWHOAREYOU(from, srcNodeID, packet.Header.Nonce, localAddr)
 	}
 
 	// Decrypt message using session key
@@ -477,7 +480,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 		}
 		var destNodeID node.ID
 		copy(destNodeID[:], packet.SrcID)
-		return h.sendWHOAREYOU(from, destNodeID, packet.Header.Nonce)
+		return h.sendWHOAREYOU(from, destNodeID, packet.Header.Nonce, localAddr)
 	}
 
 	// Decode message from plaintext
@@ -511,11 +514,11 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr) error 
 	}
 
 	// Handle message based on type
-	return h.handleMessage(msg, sess.RemoteID, from, sess.GetNode())
+	return h.handleMessage(msg, sess.RemoteID, from, sess.GetNode(), localAddr)
 }
 
 // handleWHOAREYOUPacket handles a WHOAREYOU challenge.
-func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error {
+func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, localAddr *net.UDPAddr) error {
 	// We need to find which node this is for - extract from pending handshakes
 	// Since we don't know the nodeID yet from WHOAREYOU, we need to match by address
 	// and find the pending handshake
@@ -722,7 +725,7 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr) error
 		return fmt.Errorf("transport not initialized")
 	}
 
-	if err := transport.SendTo(packetBytes, from); err != nil {
+	if err := transport.Send(packetBytes, from, localAddr); err != nil {
 		return fmt.Errorf("failed to send handshake packet: %w", err)
 	}
 
@@ -766,7 +769,7 @@ func BuildWHOAREYOUChallengeData(maskingIV, nonce []byte, challenge *WHOAREYOUCh
 }
 
 // handleHandshakePacket handles a handshake packet.
-func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error {
+func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr, localAddr *net.UDPAddr) error {
 	h.config.Logger.WithFields(logrus.Fields{
 		"from": from,
 	}).Debug("handler: received HANDSHAKE packet")
@@ -906,11 +909,11 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr) error
 	}
 
 	// Handle the message
-	return h.handleMessage(msg, sourceNodeID, from, sess.GetNode())
+	return h.handleMessage(msg, sourceNodeID, from, sess.GetNode(), localAddr)
 }
 
 // handleMessage dispatches a decoded message to the appropriate handler.
-func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node, localAddr *net.UDPAddr) error {
 	if remoteNode != nil {
 		now := time.Now()
 		remoteNode.SetLastSeen(now)
@@ -924,15 +927,15 @@ func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr
 
 	switch msg.Type() {
 	case PingMsg:
-		return h.handlePing(msg.(*Ping), remoteID, from, remoteNode)
+		return h.handlePing(msg.(*Ping), remoteID, from, remoteNode, localAddr)
 	case PongMsg:
 		return h.handlePong(msg.(*Pong), remoteID, from, remoteNode)
 	case FindNodeMsg:
-		return h.handleFindNode(msg.(*FindNode), remoteID, from, remoteNode)
+		return h.handleFindNode(msg.(*FindNode), remoteID, from, remoteNode, localAddr)
 	case NodesMsg:
 		return h.handleNodes(msg.(*Nodes), remoteID, from)
 	case TalkReqMsg:
-		return h.handleTalkReq(msg.(*TalkReq), remoteID, from, remoteNode)
+		return h.handleTalkReq(msg.(*TalkReq), remoteID, from, remoteNode, localAddr)
 	case TalkRespMsg:
 		return h.handleTalkResp(msg.(*TalkResp), remoteID, from)
 	default:
@@ -945,7 +948,7 @@ func (h *Handler) handleMessage(msg Message, remoteID node.ID, from *net.UDPAddr
 }
 
 // handlePing handles a PING message.
-func (h *Handler) handlePing(msg *Ping, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+func (h *Handler) handlePing(msg *Ping, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node, localAddr *net.UDPAddr) error {
 	h.config.Logger.WithFields(logrus.Fields{
 		"from":   from,
 		"nodeID": remoteID,
@@ -972,7 +975,7 @@ func (h *Handler) handlePing(msg *Ping, remoteID node.ID, from *net.UDPAddr, rem
 	}
 
 	// Send PONG
-	return h.SendMessage(pong, remoteID, from, nil)
+	return h.SendMessageFrom(pong, remoteID, from, nil, localAddr)
 }
 
 // handlePong handles a PONG message.
@@ -1010,7 +1013,7 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, rem
 }
 
 // handleFindNode handles a FINDNODE message.
-func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node, localAddr *net.UDPAddr) error {
 	h.mu.Lock()
 	h.findNodeReceived++
 	h.mu.Unlock()
@@ -1075,7 +1078,7 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 			Records:   records,
 		}
 
-		if err := h.SendMessage(nodesMsg, remoteID, from, remoteNode); err != nil {
+		if err := h.SendMessageFrom(nodesMsg, remoteID, from, remoteNode, localAddr); err != nil {
 			return err
 		}
 	}
@@ -1102,7 +1105,7 @@ func (h *Handler) handleNodes(msg *Nodes, remoteID node.ID, from *net.UDPAddr) e
 }
 
 // handleTalkReq handles a TALKREQ message.
-func (h *Handler) handleTalkReq(msg *TalkReq, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node) error {
+func (h *Handler) handleTalkReq(msg *TalkReq, remoteID node.ID, from *net.UDPAddr, remoteNode *node.Node, localAddr *net.UDPAddr) error {
 	h.config.Logger.WithFields(logrus.Fields{
 		"from":     from,
 		"nodeID":   remoteID,
@@ -1120,7 +1123,7 @@ func (h *Handler) handleTalkReq(msg *TalkReq, remoteID node.ID, from *net.UDPAdd
 		Response:  respData,
 	}
 
-	return h.SendMessage(resp, remoteID, from, remoteNode)
+	return h.SendMessageFrom(resp, remoteID, from, remoteNode, localAddr)
 }
 
 // handleTalkResp handles a TALKRESP message.
@@ -1260,9 +1263,135 @@ func (h *Handler) SendMessage(msg Message, remoteID node.ID, to *net.UDPAddr, re
 	return nil
 }
 
+// SendMessageFrom sends a message to a remote node from a specific local address.
+//
+// This is similar to SendMessage but allows specifying the local address to send from.
+// This ensures IP address consistency when binding to 0.0.0.0 - the response is sent
+// from the same address that received the request.
+// remoteNode is optional - if provided, it will be stored in pending handshakes for WHOAREYOU responses.
+func (h *Handler) SendMessageFrom(msg Message, remoteID node.ID, to *net.UDPAddr, remoteNode *node.Node, from *net.UDPAddr) error {
+	// Look up session
+	sess := h.config.Sessions.Get(remoteID)
+
+	var packetBytes []byte
+	var err error
+
+	if sess == nil {
+		// No session - send random packet to trigger WHOAREYOU from receiver
+
+		// Store pending message for handshake completion
+		// Include the node object if we have it (needed for handshake)
+		handshakeKey := makeHandshakeKey(remoteID, to)
+		now := time.Now()
+		pending := &PendingHandshake{
+			Message:    msg,
+			ToNode:     remoteNode,
+			ToAddr:     to,
+			ToNodeID:   remoteID,
+			CreatedAt:  now,
+			LastRetry:  now,
+			RetryCount: 0,
+			MaxRetries: 3, // Retry up to 3 times before giving up
+		}
+
+		h.mu.Lock()
+		accepted := h.addPendingHandshake(handshakeKey, pending)
+		h.mu.Unlock()
+
+		if !accepted {
+			return fmt.Errorf("pending handshake limit reached")
+		}
+
+		// Log if we don't have node info for potential handshake
+		if remoteNode == nil {
+			h.config.Logger.WithField("remoteID", remoteID).Debug("handler: sending random packet without node info, may fail handshake if WHOAREYOU received")
+		}
+
+		// Encode random packet (go-ethereum style)
+		// This will be 91 bytes: IV(16) + header(23) + authdata(32) + random(20)
+		packetBytes, err = EncodeRandomPacket(h.config.LocalNode.ID(), remoteID)
+		if err != nil {
+			return fmt.Errorf("failed to encode random packet: %w", err)
+		}
+	} else {
+		// Have session - encrypt and send normally
+
+		// Encode message plaintext: message-type (1 byte) + RLP-encoded message
+		msgBytes, err := msg.Encode()
+		if err != nil {
+			return fmt.Errorf("failed to encode message: %w", err)
+		}
+
+		// Build plaintext: message type + message data
+		plaintext := make([]byte, 1+len(msgBytes))
+		plaintext[0] = msg.Type()
+		copy(plaintext[1:], msgBytes)
+
+		// Generate nonce
+		nonce, err := crypto.GenerateRandomBytes(12)
+		if err != nil {
+			return fmt.Errorf("failed to generate nonce: %w", err)
+		}
+
+		// Get local node ID
+		localNodeID := h.config.LocalNode.ID()
+
+		// Authdata for ordinary message with session: srcID (32 bytes)
+		authdata := localNodeID[:]
+
+		// Build unmasked header data for GCM authentication
+		// This returns: maskingIV, unmasked headerData (IV || header || authdata)
+		maskingIV, headerData, err := BuildOrdinaryHeaderData(localNodeID, nonce, authdata)
+		if err != nil {
+			return fmt.Errorf("failed to build header data: %w", err)
+		}
+
+		// Encrypt message using session key
+		// GCM uses unmasked headerData as additional authenticated data
+		ciphertext, err := session.EncryptMessage(sess.EncryptionKey(), nonce, headerData, plaintext)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt message: %w", err)
+		}
+
+		// Now encode the full packet with the encrypted message
+		// This uses the same maskingIV to ensure consistency
+		packetBytes, err = EncodeOrdinaryPacket(localNodeID, remoteID, maskingIV, nonce, authdata, ciphertext)
+		if err != nil {
+			return fmt.Errorf("failed to encode ordinary packet: %w", err)
+		}
+	}
+
+	// Send via UDP transport from the specified local address
+	h.mu.RLock()
+	transport := h.transport
+	h.mu.RUnlock()
+
+	if transport == nil {
+		return fmt.Errorf("transport not initialized")
+	}
+
+	if err := transport.Send(packetBytes, to, from); err != nil {
+		return fmt.Errorf("failed to send packet: %w", err)
+	}
+
+	h.mu.Lock()
+	h.packetsSent++
+	h.mu.Unlock()
+
+	h.config.Logger.WithFields(logrus.Fields{
+		"type":   msg.Type(),
+		"to":     to,
+		"from":   from,
+		"nodeID": remoteID,
+		"size":   len(packetBytes),
+	}).Trace("sent message from specific local address")
+
+	return nil
+}
+
 // sendWHOAREYOU sends a WHOAREYOU challenge.
 // The nonce parameter must be the nonce from the client's original packet.
-func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID, nonce []byte) error {
+func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID, nonce []byte, localAddr *net.UDPAddr) error {
 	// Generate random ID nonce for the challenge (16 bytes)
 	idNonce, err := crypto.GenerateRandomBytes(16)
 	if err != nil {
@@ -1330,7 +1459,7 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID, nonce []byt
 				return fmt.Errorf("transport not initialized")
 			}
 
-			if err := transport.SendTo(existing.PacketBytes, to); err != nil {
+			if err := transport.Send(existing.PacketBytes, to, localAddr); err != nil {
 				return fmt.Errorf("failed to resend WHOAREYOU packet: %w", err)
 			}
 
@@ -1353,7 +1482,7 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID, nonce []byt
 		return fmt.Errorf("transport not initialized")
 	}
 
-	if err := transport.SendTo(packetBytes, to); err != nil {
+	if err := transport.Send(packetBytes, to, localAddr); err != nil {
 		return fmt.Errorf("failed to send WHOAREYOU packet: %w", err)
 	}
 
