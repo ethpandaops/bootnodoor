@@ -104,9 +104,7 @@ go build -o bootnodoor ./cmd/bootnodoor
   --cl-config ./config-mainnet-cl.yaml \
   --genesis-validators-root 0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95 \
   --nodedb ./data/mainnet.db \
-  --web-ui \
-  --enable-discv4 \
-  --enable-discv5
+  --web-ui
 ```
 
 #### Execution Layer Only (e.g., for Ethereum mainnet/testnets)
@@ -121,9 +119,7 @@ go build -o bootnodoor ./cmd/bootnodoor
   --el-genesis-time 1438269988 \
   --el-bootnodes "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303" \
   --nodedb ./data/mainnet-el.db \
-  --web-ui \
-  --enable-discv4 \
-  --enable-discv5
+  --web-ui
 ```
 
 #### Consensus Layer Only (e.g., for Beacon chain)
@@ -137,8 +133,7 @@ go build -o bootnodoor ./cmd/bootnodoor
   --genesis-validators-root 0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95 \
   --cl-bootnodes "enr:-Ku4QImhMc1z8yCiNJ1TyUxdcfNucje3BGwEHzodEZUan8PherEo4sF7pPHPSIB1NNuSg5fZy7qFsjmUKs2ea1Whi0EBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQOVphkDqal4QzPMksc5wnpuC3gvSC8AfbFOnZY_On34wIN1ZHCCIyg" \
   --nodedb ./data/mainnet-cl.db \
-  --web-ui \
-  --enable-discv5
+  --web-ui
 ```
 
 ### Configuration Parameters
@@ -185,8 +180,8 @@ go build -o bootnodoor ./cmd/bootnodoor
 
 #### Protocol Selection
 
-- `--enable-discv4`: Enable Discovery v4 protocol (default: `true`, requires EL config)
-- `--enable-discv5`: Enable Discovery v5 protocol (default: `true`)
+- `--enable-el`: Enable execution bootnode (default: `true`)
+- `--enable-cl`: Enable consensus bootnode (default: `true`)
 
 #### Node Database
 
@@ -248,9 +243,7 @@ go build -o bootnodoor ./cmd/bootnodoor
   --genesis-validators-root 0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95 \
   --nodedb ./data/mainnet.db \
   --web-ui \
-  --web-port 8080 \
-  --enable-discv4 \
-  --enable-discv5
+  --web-port 8080
 ```
 
 ### Sepolia Testnet CL Bootnode
@@ -263,8 +256,7 @@ go build -o bootnodoor ./cmd/bootnodoor
   --bind-port 9000 \
   --enr-ip $(curl -s ifconfig.me) \
   --nodedb ./data/sepolia-cl.db \
-  --web-ui \
-  --enable-discv5
+  --web-ui
 ```
 
 ### Holesky Testnet EL Bootnode
@@ -278,9 +270,7 @@ go build -o bootnodoor ./cmd/bootnodoor
   --bind-port 30303 \
   --enr-ip $(curl -s ifconfig.me) \
   --nodedb ./data/holesky-el.db \
-  --web-ui \
-  --enable-discv4 \
-  --enable-discv5
+  --web-ui
 ```
 
 ### Development Setup (No Persistence, Localhost)
@@ -293,8 +283,7 @@ go build -o bootnodoor ./cmd/bootnodoor
   --bind-addr 127.0.0.1 \
   --bind-port 9000 \
   --enr-ip 127.0.0.1 \
-  --log-level debug \
-  --enable-discv5
+  --log-level debug
 ```
 
 ## Using the discv5 Library

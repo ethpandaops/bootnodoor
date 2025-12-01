@@ -28,9 +28,16 @@ cat >> "${__dir}/generated-kurtosis-config.yaml" <<EOF
 bootnode: bootnodoor
 bootnodoor_params:
   image: pk910/dev-images:bootnodoor
+EOF
+
+WITHOUT_SHIM="${WITHOUT_SHIM:-false}"
+if [ "$WITHOUT_SHIM" == "false" ]; then
+  # Add bootnode configuration to the generated config
+  cat >> "${__dir}/generated-kurtosis-config.yaml" <<EOF
   extra_args:
     - --devnet-shim=${HOST_IP}:9000
 EOF
+fi
 
 config_file="${__dir}/generated-kurtosis-config.yaml"
 

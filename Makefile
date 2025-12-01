@@ -51,7 +51,7 @@ devnet-run: devnet
 		--enable-el=true \
 		--enable-cl=true \
 		--web-ui \
-		--log-level debug
+		--log-level info
 
 devnet-clean:
 	.hack/devnet/cleanup.sh
