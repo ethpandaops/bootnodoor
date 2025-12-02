@@ -3,7 +3,7 @@ module github.com/ethpandaops/bootnodoor
 go 1.24.0
 
 require (
-	github.com/ethereum/go-ethereum v1.16.6
+	github.com/ethereum/go-ethereum v1.16.7
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/gorilla/mux v1.8.1
 	github.com/jmoiron/sqlx v1.4.0
@@ -16,7 +16,7 @@ require (
 	github.com/spf13/cobra v1.10.1
 	github.com/tdewolff/minify v2.3.6+incompatible
 	github.com/urfave/negroni v1.0.0
-	golang.org/x/crypto v0.44.0
+	golang.org/x/crypto v0.45.0
 	golang.org/x/net v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 )
