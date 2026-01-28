@@ -49,6 +49,7 @@ type Config struct {
 
 	// Parsed values (not in YAML)
 	customGenesisTime     uint64
+	customSlotsPerEpoch   uint64
 	genesisValidatorsRoot [32]byte
 	genesisForkVersion    [4]byte
 
@@ -162,6 +163,12 @@ func (c *Config) SetGenesisTime(unixTime uint64) error {
 	return nil
 }
 
+// SetSlotsPerEpoch overrides slots-per-epoch used for epoch calculations.
+func (c *Config) SetSlotsPerEpoch(slots uint64) error {
+	c.customSlotsPerEpoch = slots
+	return nil
+}
+
 // GetGenesisTime calculates the genesis time from MinGenesisTime and GenesisDelay.
 // Returns 0 if not configured.
 func (c *Config) GetGenesisTime() uint64 {
@@ -172,6 +179,17 @@ func (c *Config) GetGenesisTime() uint64 {
 		return 0
 	}
 	return c.MinGenesisTime + c.GenesisDelay
+}
+
+// GetSlotsPerEpoch returns the slots-per-epoch used for epoch calculations.
+func (c *Config) GetSlotsPerEpoch() uint64 {
+	if c.customSlotsPerEpoch != 0 {
+		return c.customSlotsPerEpoch
+	}
+	if c.PresetBase == "minimal" {
+		return 8
+	}
+	return 32
 }
 
 // extractForkData dynamically extracts fork information from the raw YAML map.
@@ -519,15 +537,7 @@ func (c *Config) GetCurrentForkDigest() ForkDigest {
 
 	// Calculate current epoch
 	currentTime := uint64(time.Now().Unix())
-
-	// Determine SLOTS_PER_EPOCH based on preset
-	// Minimal preset: 8 slots per epoch (for testing)
-	// Mainnet preset: 32 slots per epoch (default)
-	slotsPerEpoch := uint64(32)
-	if c.PresetBase == "minimal" {
-		slotsPerEpoch = 8
-	}
-
+	slotsPerEpoch := c.GetSlotsPerEpoch()
 	secondsPerSlot := c.SecondsPerSlot
 	if secondsPerSlot == 0 {
 		secondsPerSlot = 12 // Default
@@ -556,10 +566,7 @@ func (c *Config) GetPreviousForkDigest() ForkDigest {
 
 	// Calculate current epoch
 	currentTime := uint64(time.Now().Unix())
-	slotsPerEpoch := uint64(32)
-	if c.PresetBase == "minimal" {
-		slotsPerEpoch = 8
-	}
+	slotsPerEpoch := c.GetSlotsPerEpoch()
 	secondsPerSlot := c.SecondsPerSlot
 	if secondsPerSlot == 0 {
 		secondsPerSlot = 12
@@ -599,10 +606,7 @@ func (c *Config) GetPreviousForkName() string {
 
 	// Calculate current epoch
 	currentTime := uint64(time.Now().Unix())
-	slotsPerEpoch := uint64(32)
-	if c.PresetBase == "minimal" {
-		slotsPerEpoch = 8
-	}
+	slotsPerEpoch := c.GetSlotsPerEpoch()
 	secondsPerSlot := c.SecondsPerSlot
 	if secondsPerSlot == 0 {
 		secondsPerSlot = 12
