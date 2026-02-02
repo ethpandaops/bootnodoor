@@ -369,10 +369,7 @@ func (f *ForkDigestFilter) GetCurrentFork() string {
 
 	// Calculate current epoch
 	currentTime := uint64(time.Now().Unix())
-	slotsPerEpoch := uint64(32)
-	if f.config.PresetBase == "minimal" {
-		slotsPerEpoch = 8
-	}
+	slotsPerEpoch := f.config.GetSlotsPerEpoch()
 	secondsPerSlot := f.config.SecondsPerSlot
 	if secondsPerSlot == 0 {
 		secondsPerSlot = 12

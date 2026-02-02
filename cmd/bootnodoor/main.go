@@ -40,6 +40,7 @@ var (
 	clConfigPath          string
 	genesisValidatorsRoot string
 	clGenesisTime         uint64
+	clSlotsPerEpoch       uint64
 	gracePeriod           time.Duration
 	clBootnodesFlag       string
 
@@ -107,6 +108,7 @@ func init() {
 	rootCmd.Flags().StringVar(&clConfigPath, "cl-config", "", "Path to CL config file (optional)")
 	rootCmd.Flags().StringVar(&genesisValidatorsRoot, "genesis-validators-root", "", "Genesis validators root (hex, required if cl-config provided)")
 	rootCmd.Flags().Uint64Var(&clGenesisTime, "cl-genesis-time", 0, "CL genesis time (Unix timestamp, 0 = calculate from config)")
+	rootCmd.Flags().Uint64Var(&clSlotsPerEpoch, "cl-slots-per-epoch", 0, "CL slots per epoch override (0 = use preset/default)")
 	rootCmd.Flags().DurationVar(&gracePeriod, "grace-period", 60*time.Minute, "Grace period for old fork digests")
 	rootCmd.Flags().StringVar(&clBootnodesFlag, "cl-bootnodes", "", "Comma-separated list of CL bootnode ENRs")
 
@@ -291,6 +293,14 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		}
 		if err := clConfig.SetGenesisValidatorsRoot(genesisValidatorsRootValue); err != nil {
 			return fmt.Errorf("failed to set genesis validators root: %w", err)
+		}
+
+		// Optional override: slots per epoch
+		if clSlotsPerEpoch != 0 {
+			if err := clConfig.SetSlotsPerEpoch(clSlotsPerEpoch); err != nil {
+				return fmt.Errorf("failed to set CL slots per epoch: %w", err)
+			}
+			logger.WithField("slotsPerEpoch", clSlotsPerEpoch).Info("using CL slots-per-epoch override")
 		}
 
 		// Calculate or use provided genesis time
