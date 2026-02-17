@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // TestRecordCreation tests basic record creation and signing
@@ -242,6 +243,44 @@ func TestUpdateRecord(t *testing.T) {
 
 	if !updated.IP().Equal(net.IPv4(192, 168, 1, 2)) {
 		t.Errorf("IP not updated: got %v, want %v", updated.IP(), net.IPv4(192, 168, 1, 2))
+	}
+}
+
+func TestEthFieldDecodeFromRLPBytes(t *testing.T) {
+	record := New()
+
+	ethField := []struct {
+		Hash []byte
+		Next uint64
+	}{
+		{
+			Hash: []byte{0xaa, 0xbb, 0xcc, 0xdd},
+			Next: 12345,
+		},
+	}
+
+	encoded, err := rlp.EncodeToBytes(ethField)
+	if err != nil {
+		t.Fatalf("failed to encode eth field: %v", err)
+	}
+
+	record.Set("eth", encoded)
+
+	decoded, ok := record.Eth()
+	if !ok {
+		t.Fatal("failed to decode eth field from RLP bytes")
+	}
+
+	if len(decoded) != 1 {
+		t.Fatalf("unexpected eth fork list length: got %d", len(decoded))
+	}
+
+	if decoded[0].ForkID != [4]byte{0xaa, 0xbb, 0xcc, 0xdd} {
+		t.Fatalf("unexpected fork id: got %x", decoded[0].ForkID)
+	}
+
+	if decoded[0].NextForkEpoch != 12345 {
+		t.Fatalf("unexpected next fork epoch: got %d", decoded[0].NextForkEpoch)
 	}
 }
 

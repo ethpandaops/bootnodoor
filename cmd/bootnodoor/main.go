@@ -14,6 +14,7 @@ import (
 	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
@@ -621,7 +622,11 @@ func runDevnetShim(
 				Next: currentForkID.Next,
 			},
 		}
-		record.Set("eth", ethField)
+		ethFieldEncoded, err := rlp.EncodeToBytes(ethField)
+		if err != nil {
+			return fmt.Errorf("failed to encode eth field: %w", err)
+		}
+		record.Set("eth", ethFieldEncoded)
 		logger.WithField("forkID", currentForkID.String()).Debug("added eth field to shim ENR")
 	}
 
