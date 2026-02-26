@@ -13,10 +13,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"fmt"
-	"math/big"
 	"net"
 	"time"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -216,14 +216,18 @@ func EncodePubkey(key *ecdsa.PublicKey) Pubkey {
 
 // DecodePubkey decodes a wire-format public key to ECDSA format.
 func DecodePubkey(curve elliptic.Curve, p Pubkey) (*ecdsa.PublicKey, error) {
-	pubkey := &ecdsa.PublicKey{Curve: curve, X: new(big.Int), Y: new(big.Int)}
-	half := len(p) / 2
-	pubkey.X.SetBytes(p[:half])
-	pubkey.Y.SetBytes(p[half:])
-	if !pubkey.Curve.IsOnCurve(pubkey.X, pubkey.Y) {
-		return nil, fmt.Errorf("invalid curve point")
+	// Build uncompressed public key: 0x04 || X (32 bytes) || Y (32 bytes)
+	uncompressed := make([]byte, 65)
+	uncompressed[0] = 0x04
+	copy(uncompressed[1:33], p[:32])
+	copy(uncompressed[33:65], p[32:])
+
+	// Validate the point is on the secp256k1 curve by parsing it
+	if _, err := secp256k1.ParsePubKey(uncompressed); err != nil {
+		return nil, fmt.Errorf("invalid curve point: %w", err)
 	}
-	return pubkey, nil
+
+	return crypto.UnmarshalPubkey(uncompressed)
 }
 
 // NodeRecord represents information about a node in the DHT.
