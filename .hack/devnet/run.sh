@@ -21,22 +21,34 @@ fi
 # Create generated config by adding bootnode parameters to base config
 cp "$base_config" "${__dir}/generated-kurtosis-config.yaml"
 
-# Add bootnode configuration to the generated config
-cat >> "${__dir}/generated-kurtosis-config.yaml" <<EOF
+# Ensure 'bootnodoor' is in additional_services and set default bootnodoor_params, preserving user values.
+yq_docker() {
+  docker run --rm -i -v "${__dir}":"${__dir}" -w "${__dir}" mikefarah/yq "$@"
+}
 
-# Bootnode configuration for local bootnodoor
-bootnode: bootnodoor
-bootnodoor_params:
-  image: pk910/dev-images:bootnodoor
-EOF
+# Add "bootnodoor" to additional_services if it's not present
+yq_docker -oy '
+  .additional_services |= ((. // []) + ["bootnodoor"] | (sort | unique))
+' generated-kurtosis-config.yaml > "${__dir}/generated-kurtosis-config.yaml.tmp" && mv "${__dir}/generated-kurtosis-config.yaml.tmp" "${__dir}/generated-kurtosis-config.yaml"
+
+# Ensure 'bootnodoor_params' exists and set a default image if not set
+yq_docker -oy '
+  .bootnodoor_params = (.bootnodoor_params // {})
+  | .bootnodoor_params.image = (.bootnodoor_params.image // "pk910/dev-images:bootnodoor")
+' generated-kurtosis-config.yaml > "${__dir}/generated-kurtosis-config.yaml.tmp" && mv "${__dir}/generated-kurtosis-config.yaml.tmp" "${__dir}/generated-kurtosis-config.yaml"
 
 WITHOUT_SHIM="${WITHOUT_SHIM:-false}"
-if [ "$WITHOUT_SHIM" == "false" ]; then
-  # Add bootnode configuration to the generated config
-  cat >> "${__dir}/generated-kurtosis-config.yaml" <<EOF
-  extra_args:
-    - --devnet-shim=${HOST_IP}:9000
-EOF
+if [ "$WITHOUT_SHIM" = "false" ]; then
+  # Add or update the --devnet-shim argument for bootnodoor_params.extra_args, ensuring only one instance with latest HOST_IP:9000 value exists
+  yq_docker -oy '
+    .bootnodoor_params = (.bootnodoor_params // {})
+    | .bootnodoor_params.extra_args = (
+        (
+          (.bootnodoor_params.extra_args // [])
+          | map(select(test("^--devnet-shim=") | not))
+        ) + ["--devnet-shim='"${HOST_IP}"':9000"]
+      )
+  ' generated-kurtosis-config.yaml > "${__dir}/generated-kurtosis-config.yaml.tmp" && mv "${__dir}/generated-kurtosis-config.yaml.tmp" "${__dir}/generated-kurtosis-config.yaml"
 fi
 
 config_file="${__dir}/generated-kurtosis-config.yaml"
