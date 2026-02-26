@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
@@ -41,12 +42,26 @@ func ECDH(privKey *ecdsa.PrivateKey, pubKey *ecdsa.PublicKey) ([]byte, error) {
 		return nil, fmt.Errorf("crypto: nil public key")
 	}
 
-	// Perform scalar multiplication: privKey * pubKey
-	x, _ := pubKey.Curve.ScalarMult(pubKey.X, pubKey.Y, privKey.D.Bytes())
+	// Convert to secp256k1 types for scalar multiplication
+	var scalar secp256k1.ModNScalar
+	scalar.SetByteSlice(privKey.D.Bytes())
+
+	pubBytes := crypto.CompressPubkey(pubKey)
+
+	pubKeyS, err := secp256k1.ParsePubKey(pubBytes)
+	if err != nil {
+		return nil, fmt.Errorf("crypto: invalid public key: %w", err)
+	}
+
+	var point, result secp256k1.JacobianPoint
+
+	pubKeyS.AsJacobian(&point)
+	secp256k1.ScalarMultNonConst(&scalar, &point, &result)
+	result.ToAffine()
 
 	// Return the X coordinate as the shared secret
 	secret := make([]byte, 32)
-	x.FillBytes(secret)
+	result.X.PutBytesUnchecked(secret)
 
 	return secret, nil
 }
@@ -62,14 +77,16 @@ func ValidatePublicKey(pubKey *ecdsa.PublicKey) error {
 		return fmt.Errorf("crypto: nil public key")
 	}
 
-	// Check that the point is on the curve
-	if !pubKey.Curve.IsOnCurve(pubKey.X, pubKey.Y) {
-		return fmt.Errorf("crypto: public key point is not on curve")
-	}
+	// Build uncompressed representation manually to avoid panic from
+	// CompressPubkey on invalid points. Format: 0x04 || X (32 bytes) || Y (32 bytes)
+	uncompressed := make([]byte, 65)
+	uncompressed[0] = 0x04
+	pubKey.X.FillBytes(uncompressed[1:33])
+	pubKey.Y.FillBytes(uncompressed[33:65])
 
-	// Check that the point is not the identity (point at infinity)
-	if pubKey.X.Sign() == 0 && pubKey.Y.Sign() == 0 {
-		return fmt.Errorf("crypto: public key is the point at infinity")
+	// ParsePubKey performs on-curve and infinity checks.
+	if _, err := secp256k1.ParsePubKey(uncompressed); err != nil {
+		return fmt.Errorf("crypto: invalid public key: %w", err)
 	}
 
 	return nil
