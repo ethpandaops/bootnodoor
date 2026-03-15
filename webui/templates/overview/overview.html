@@ -2,15 +2,31 @@
   <div class="container mt-2">
     <h3 class="py-2">Bootnode Overview</h3>
 
-    <!-- ENR Header Section -->
-    {{ if .LocalENR }}
+    <!-- EL ENR Section -->
+    {{ if .ELENR }}
     <div class="card mt-3">
       <div class="card-body">
-        <h5 class="card-title">Bootnode ENR</h5>
-        <p class="text-muted mb-3">Share this Ethereum Node Record (ENR) with peers to allow them to discover and connect to this bootnode.</p>
+        <h5 class="card-title">EL Bootnode ENR</h5>
+        <p class="text-muted mb-3">Execution Layer ENR (contains <code>eth</code> field). Share with EL clients for peer discovery.</p>
         <div class="input-group">
-          <input type="text" class="form-control font-monospace" value="{{ .LocalENR }}" readonly>
-          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .LocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
+          <input type="text" class="form-control font-monospace" value="{{ .ELENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELENR }}" data-bs-toggle="tooltip" title="Copy EL ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+    {{ end }}
+
+    <!-- CL ENR Section -->
+    {{ if .CLENR }}
+    <div class="card mt-3">
+      <div class="card-body">
+        <h5 class="card-title">CL Bootnode ENR</h5>
+        <p class="text-muted mb-3">Consensus Layer ENR (contains <code>eth2</code> field). Share with CL clients for peer discovery.</p>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLENR }}" data-bs-toggle="tooltip" title="Copy CL ENR to clipboard">
             <i class="fa fa-copy"></i>
           </button>
         </div>
@@ -19,14 +35,14 @@
     {{ end }}
 
     <!-- Enode Section -->
-    {{ if .LocalEnode }}
+    {{ if .ELEnode }}
     <div class="card mt-3">
       <div class="card-body">
-        <h5 class="card-title">Bootnode Enode</h5>
-        <p class="text-muted mb-3">Enode URL derived from ENR for Execution Layer (EL) nodes.</p>
+        <h5 class="card-title">EL Bootnode Enode</h5>
+        <p class="text-muted mb-3">Enode URL derived from EL ENR for Execution Layer nodes.</p>
         <div class="input-group">
-          <input type="text" class="form-control font-monospace" value="{{ .LocalEnode }}" readonly>
-          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .LocalEnode }}" data-bs-toggle="tooltip" title="Copy Enode to clipboard">
+          <input type="text" class="form-control font-monospace" value="{{ .ELEnode }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELEnode }}" data-bs-toggle="tooltip" title="Copy Enode to clipboard">
             <i class="fa fa-copy"></i>
           </button>
         </div>
@@ -70,25 +86,28 @@
                   <td class="text-muted">Uptime</td>
                   <td class="text-end" data-stat="uptime">{{ formatTimeDiff .StartTime }}</td>
                 </tr>
+                {{ if .ELBindAddr }}
                 <tr>
-                  <td class="text-muted">Bind Address</td>
-                  <td class="text-end"><code style="font-size: 0.85em;" data-stat="bind-address">{{ .BindAddress }}</code></td>
+                  <td class="text-muted">EL Bind Address</td>
+                  <td class="text-end"><code style="font-size: 0.85em;" data-stat="el-bind-address">{{ .ELBindAddr }}</code></td>
                 </tr>
-                {{ if .LocalENR }}
+                {{ end }}
+                {{ if .CLBindAddr }}
                 <tr>
-                  <td class="text-muted">
-                    ENR Seq
-                    <i class="fa fa-info-circle text-muted"
-                       style="font-size: 0.8em;"
-                       role="button"
-                       data-bs-toggle="popover"
-                       data-bs-trigger="hover focus"
-                       data-bs-placement="right"
-                       data-bs-html="true"
-                       data-bs-title="ENR Sequence Number"
-                       data-bs-content="The sequence number of this node's Ethereum Node Record (ENR). This number increments each time the ENR is updated with new information."></i>
-                  </td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-info" data-stat="enr-seq">{{ .LocalENRSeq }}</span></td>
+                  <td class="text-muted">CL Bind Address</td>
+                  <td class="text-end"><code style="font-size: 0.85em;" data-stat="cl-bind-address">{{ .CLBindAddr }}</code></td>
+                </tr>
+                {{ end }}
+                {{ if .ELENR }}
+                <tr>
+                  <td class="text-muted">EL ENR Seq</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info" data-stat="el-enr-seq">{{ .ELENRSeq }}</span></td>
+                </tr>
+                {{ end }}
+                {{ if .CLENR }}
+                <tr>
+                  <td class="text-muted">CL ENR Seq</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info" data-stat="cl-enr-seq">{{ .CLENRSeq }}</span></td>
                 </tr>
                 {{ end }}
               </tbody>
@@ -675,8 +694,10 @@
         updateValue('[data-stat="status"]', data.Status);
         if (data.NetworkName) updateValue('[data-stat="network"]', data.NetworkName);
         updateValue('[data-stat="uptime"]', formatTimeDiff(data.StartTime));
-        updateValue('[data-stat="bind-address"]', data.BindAddress);
-        if (data.LocalENRSeq) updateValue('[data-stat="enr-seq"]', data.LocalENRSeq);
+        if (data.ELBindAddr) updateValue('[data-stat="el-bind-address"]', data.ELBindAddr);
+        if (data.CLBindAddr) updateValue('[data-stat="cl-bind-address"]', data.CLBindAddr);
+        if (data.ELENRSeq) updateValue('[data-stat="el-enr-seq"]', data.ELENRSeq);
+        if (data.CLENRSeq) updateValue('[data-stat="cl-enr-seq"]', data.CLENRSeq);
 
         /* Routing table (combined) */
         updateValue('[data-stat="table-size"]', data.TableSize);
