@@ -61,6 +61,26 @@ func (d *Database) StoreLocalENR(enrBytes []byte) error {
 	return d.SetState(nil, "local_enr", enrBytes)
 }
 
+// LoadLocalELENR loads the stored EL local ENR from the database.
+func (d *Database) LoadLocalELENR() ([]byte, error) {
+	return d.GetState("local_enr_el")
+}
+
+// StoreLocalELENR stores the EL local ENR to the database.
+func (d *Database) StoreLocalELENR(enrBytes []byte) error {
+	return d.SetState(nil, "local_enr_el", enrBytes)
+}
+
+// LoadLocalCLENR loads the stored CL local ENR from the database.
+func (d *Database) LoadLocalCLENR() ([]byte, error) {
+	return d.GetState("local_enr_cl")
+}
+
+// StoreLocalCLENR stores the CL local ENR to the database.
+func (d *Database) StoreLocalCLENR(enrBytes []byte) error {
+	return d.SetState(nil, "local_enr_cl", enrBytes)
+}
+
 // DeleteState removes a state entry by key.
 func (d *Database) DeleteState(tx *sqlx.Tx, key string) error {
 	if tx == nil {

@@ -41,6 +41,8 @@ func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, bo
 	router.HandleFunc("/el-nodes", frontendHandler.ELNodes).Methods("GET")
 	router.HandleFunc("/cl-nodes", frontendHandler.CLNodes).Methods("GET")
 	router.HandleFunc("/enr", frontendHandler.ENR).Methods("GET")
+	router.HandleFunc("/el-enr", frontendHandler.ELENR).Methods("GET")
+	router.HandleFunc("/cl-enr", frontendHandler.CLENR).Methods("GET")
 	router.HandleFunc("/enode", frontendHandler.Enode).Methods("GET")
 
 	// metrics endpoint

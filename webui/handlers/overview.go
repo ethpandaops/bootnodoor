@@ -27,9 +27,16 @@ type OverviewPageData struct {
 	StartTime      time.Time
 	PeerID         string
 	BindAddress    string
-	LocalENR       string
-	LocalEnode     string // NEW: Enode derived from ENR
-	LocalENRSeq    uint64
+	LocalENR       string // EL ENR for backward compat
+	LocalEnode     string // EL Enode
+	LocalENRSeq    uint64 // EL ENR seq for backward compat
+	ELENR          string
+	CLENR          string
+	ELEnode        string
+	ELENRSeq       uint64
+	CLENRSeq       uint64
+	ELBindAddr     string
+	CLBindAddr     string
 	CurrentFork    string
 	CurrentDigest  string
 	PreviousFork   string
@@ -114,9 +121,18 @@ type OldDigestInfo struct {
 	Remaining time.Duration
 }
 
-// ENR serves the local ENR as plain text
+// ENR serves the EL local ENR as plain text (backward compat).
 func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.bootnodeService.LocalNode()
+	fh.ELENR(w, r)
+}
+
+// ELENR serves the EL local ENR as plain text.
+func (fh *FrontendHandler) ELENR(w http.ResponseWriter, r *http.Request) {
+	localNode := fh.bootnodeService.ELLocalNode()
+	if localNode == nil {
+		http.Error(w, "EL not enabled", http.StatusNotFound)
+		return
+	}
 	localENR, err := localNode.Record().EncodeBase64()
 	if err != nil {
 		http.Error(w, "Failed to encode ENR", http.StatusInternalServerError)
@@ -127,9 +143,30 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(localENR))
 }
 
-// Enode serves the local enode URL as plain text
+// CLENR serves the CL local ENR as plain text.
+func (fh *FrontendHandler) CLENR(w http.ResponseWriter, r *http.Request) {
+	localNode := fh.bootnodeService.CLLocalNode()
+	if localNode == nil {
+		http.Error(w, "CL not enabled", http.StatusNotFound)
+		return
+	}
+	localENR, err := localNode.Record().EncodeBase64()
+	if err != nil {
+		http.Error(w, "Failed to encode ENR", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(localENR))
+}
+
+// Enode serves the EL local enode URL as plain text.
 func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.bootnodeService.LocalNode()
+	localNode := fh.bootnodeService.ELLocalNode()
+	if localNode == nil {
+		http.Error(w, "EL not enabled", http.StatusNotFound)
+		return
+	}
 
 	// Get TCP port from ENR, fallback to UDP port if not available
 	tcpPort := localNode.TCPPort()
@@ -185,34 +222,50 @@ func (fh *FrontendHandler) Overview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
-	// Get local node ENR
-	localNode := fh.bootnodeService.LocalNode()
-	localENR, err := localNode.Record().EncodeBase64()
-	if err != nil {
-		localENR = "" // Fallback to empty string on error
-	}
-
-	// Derive Enode from ENR
-	localEnode := deriveEnodeFromENR(localNode.Record())
-
-	// Get PeerID
-	peerID := localNode.ID().String()
-
-	// Get bind address
-	bindAddr := "N/A"
-	if addr := localNode.Addr(); addr != nil {
-		bindAddr = addr.String()
-	}
-
-	// Initialize page data with basic info
+	// Initialize page data
 	pageData := &OverviewPageData{
-		Status:      "Online",
-		StartTime:   time.Now(), // TODO: Track actual start time in service
-		PeerID:      peerID,
-		BindAddress: bindAddr,
-		LocalENR:    localENR,
-		LocalEnode:  localEnode,
-		LocalENRSeq: localNode.Record().Seq(),
+		Status:    "Online",
+		StartTime: time.Now(),
+	}
+
+	// Get EL local node info
+	if elNode := fh.bootnodeService.ELLocalNode(); elNode != nil {
+		elENR, err := elNode.Record().EncodeBase64()
+		if err != nil {
+			elENR = ""
+		}
+		pageData.ELENR = elENR
+		pageData.ELEnode = deriveEnodeFromENR(elNode.Record())
+		pageData.ELENRSeq = elNode.Record().Seq()
+		if addr := elNode.Addr(); addr != nil {
+			pageData.ELBindAddr = addr.String()
+		}
+
+		// Backward compat fields
+		pageData.LocalENR = elENR
+		pageData.LocalEnode = pageData.ELEnode
+		pageData.LocalENRSeq = pageData.ELENRSeq
+		pageData.PeerID = elNode.ID().String()
+		pageData.BindAddress = pageData.ELBindAddr
+	}
+
+	// Get CL local node info
+	if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
+		clENR, err := clNode.Record().EncodeBase64()
+		if err != nil {
+			clENR = ""
+		}
+		pageData.CLENR = clENR
+		pageData.CLENRSeq = clNode.Record().Seq()
+		if addr := clNode.Addr(); addr != nil {
+			pageData.CLBindAddr = addr.String()
+		}
+
+		// If EL not available, use CL for backward compat fields
+		if pageData.PeerID == "" {
+			pageData.PeerID = clNode.ID().String()
+			pageData.BindAddress = pageData.CLBindAddr
+		}
 	}
 
 	// Get EL table stats if available

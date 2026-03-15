@@ -48,8 +48,6 @@ devnet-run: devnet
 		--cl-config .hack/devnet/generated-cl-config.yaml \
 		--genesis-validators-root $$(cat .hack/devnet/generated-cl-gvr.txt) \
 		--nodedb .hack/devnet/generated-database.sqlite \
-		--enable-el=true \
-		--enable-cl=true \
 		--web-ui \
 		--log-level info
 

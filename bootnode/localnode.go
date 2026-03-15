@@ -7,28 +7,28 @@ import (
 	"github.com/ethpandaops/bootnodoor/enr"
 )
 
-// createLocalNode creates the local node with ENR.
+// createLocalNode creates a local node with the given UDP port.
 //
-// This generates the local node that will be shared across both discv4 and discv5.
-// The ENR will contain all network information and will be updated with eth/eth2 fields later.
-func createLocalNode(cfg *Config, storedENR *enr.Record) (*v5node.Node, error) {
+// The storedENR is used as a baseline if it matches the private key and port.
+// Otherwise a fresh ENR is built from the config.
+func createLocalNode(cfg *Config, storedENR *enr.Record, udpPort uint16) (*v5node.Node, error) {
 	var localENR *enr.Record
 	var err error
 
 	if storedENR != nil {
-		// Use stored ENR as baseline, but verify it matches our private key
+		// Use stored ENR as baseline, but verify it matches our private key and port
 		pubKey := storedENR.PublicKey()
-		if pubKey != nil && pubKey.Equal(&cfg.PrivateKey.PublicKey) {
+		if pubKey != nil && pubKey.Equal(&cfg.PrivateKey.PublicKey) && storedENR.UDP() == udpPort {
 			localENR = storedENR
-			cfg.Logger.Debug("using stored ENR as baseline")
+			cfg.Logger.WithField("udpPort", udpPort).Debug("using stored ENR as baseline")
 		} else {
-			cfg.Logger.Warn("stored ENR doesn't match private key, creating new one")
+			cfg.Logger.WithField("udpPort", udpPort).Warn("stored ENR doesn't match private key or port, creating new one")
 		}
 	}
 
 	// Create new ENR if we don't have a valid one
 	if localENR == nil {
-		localENR, err = buildENR(cfg)
+		localENR, err = buildENR(cfg, udpPort)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build ENR: %w", err)
 		}
@@ -40,13 +40,13 @@ func createLocalNode(cfg *Config, storedENR *enr.Record) (*v5node.Node, error) {
 		return nil, fmt.Errorf("failed to create local node: %w", err)
 	}
 
-	cfg.Logger.WithField("nodeID", node.ID().String()[:16]+"...").Info("created local node")
+	cfg.Logger.WithField("nodeID", node.ID().String()[:16]+"...").WithField("udpPort", udpPort).Info("created local node")
 
 	return node, nil
 }
 
-// buildENR builds a new ENR record from configuration.
-func buildENR(cfg *Config) (*enr.Record, error) {
+// buildENR builds a new ENR record from configuration with the specified port.
+func buildENR(cfg *Config, udpPort uint16) (*enr.Record, error) {
 	record := enr.New()
 
 	// Set identity scheme (v4) and public key
@@ -66,17 +66,13 @@ func buildENR(cfg *Config) (*enr.Record, error) {
 	}
 
 	// Set UDP port
-	if cfg.ENRPort > 0 {
-		record.Set("udp", cfg.ENRPort)
-	} else if cfg.BindPort > 0 {
-		record.Set("udp", cfg.BindPort)
+	if udpPort > 0 {
+		record.Set("udp", udpPort)
 	}
 
-	// Set TCP port (same as UDP for now)
-	if cfg.ENRPort > 0 {
-		record.Set("tcp", cfg.ENRPort)
-	} else if cfg.BindPort > 0 {
-		record.Set("tcp", cfg.BindPort)
+	// Set TCP port (same as UDP)
+	if udpPort > 0 {
+		record.Set("tcp", udpPort)
 	}
 
 	// Set sequence number to 1
