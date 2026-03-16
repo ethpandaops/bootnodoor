@@ -3,22 +3,22 @@ module github.com/ethpandaops/bootnodoor
 go 1.25.0
 
 require (
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1
-	github.com/ethereum/go-ethereum v1.17.0
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
+	github.com/ethereum/go-ethereum v1.17.1
 	github.com/glebarez/go-sqlite v1.22.0
 	github.com/gorilla/mux v1.8.1
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/mr-tron/base58 v1.2.0
 	github.com/multiformats/go-multihash v0.2.3
-	github.com/pk910/dynamic-ssz v1.2.1
+	github.com/pk910/dynamic-ssz v1.2.2
 	github.com/pressly/goose/v3 v3.27.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/cobra v1.10.2
 	github.com/tdewolff/minify v2.3.6+incompatible
 	github.com/urfave/negroni v1.0.0
-	golang.org/x/crypto v0.48.0
-	golang.org/x/net v0.50.0
+	golang.org/x/crypto v0.49.0
+	golang.org/x/net v0.51.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -54,7 +54,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/exp v0.0.0-20260218203240-3dfff04db8fa // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 	modernc.org/libc v1.68.0 // indirect
