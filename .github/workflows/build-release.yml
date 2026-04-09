@@ -66,14 +66,35 @@ jobs:
     - name: "Download build artifacts"
       uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
 
+    # generate release artifacts
+    - name: "Generate release package: bootnodoor_${{ inputs.version }}_windows_amd64.zip"
+      run: |
+        cd bootnodoor_windows_amd64
+        zip -r -q ../bootnodoor_${{ inputs.version }}_windows_amd64.zip .
+    - name: "Generate release package: bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz"
+      run: |
+        cd bootnodoor_linux_amd64
+        tar -czf ../bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz .
+    - name: "Generate release package: bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz"
+      run: |
+        cd bootnodoor_linux_arm64
+        tar -czf ../bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz .
+    - name: "Generate release package: bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz"
+      run: |
+        cd bootnodoor_darwin_amd64
+        tar -czf ../bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz .
+    - name: "Generate release package: bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz"
+      run: |
+        cd bootnodoor_darwin_arm64
+        tar -czf ../bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz .
+
     # create draft release
     - name: Create latest release
-      uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e # v1.1.4
-      id: create_release
+      uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
       with:
         draft: true
         prerelease: false
-        release_name: "v${{ inputs.version }}"
+        name: "v${{ inputs.version }}"
         tag_name: "v${{ inputs.version }}"
         body: |
           ### Major Changes
@@ -94,76 +115,9 @@ jobs:
           | [bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz) | bootnodoor executables for linux/arm64 |
           | [bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz) | bootnodoor executable for macos/amd64 |
           | [bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz) | bootnodoor executable for macos/arm64 |
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-
-    # generate & upload release artifacts
-    - name: "Generate release package: bootnodoor_${{ inputs.version }}_windows_amd64.zip"
-      run: |
-        cd bootnodoor_windows_amd64
-        zip -r -q ../bootnodoor_${{ inputs.version }}_windows_amd64.zip .
-    - name: "Upload release artifact: bootnodoor_${{ inputs.version }}_windows_amd64.zip"
-      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./bootnodoor_${{ inputs.version }}_windows_amd64.zip
-        asset_name: bootnodoor_${{ inputs.version }}_windows_amd64.zip
-        asset_content_type: application/octet-stream
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    
-    - name: "Generate release package: bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz"
-      run: |
-        cd bootnodoor_linux_amd64
-        tar -czf ../bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz .
-    - name: "Upload release artifact: bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz"
-      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz
-        asset_name: bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz
-        asset_content_type: application/octet-stream
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    
-    - name: "Generate release package: bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz"
-      run: |
-        cd bootnodoor_linux_arm64
-        tar -czf ../bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz .
-    - name: "Upload release artifact: bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz"
-      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz
-        asset_name: bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz
-        asset_content_type: application/octet-stream
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-    
-    - name: "Generate release package: bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz"
-      run: |
-        cd bootnodoor_darwin_amd64
-        tar -czf ../bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz .
-    - name: "Upload release artifact: bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz"
-      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz
-        asset_name: bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz
-        asset_content_type: application/octet-stream
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-
-    - name: "Generate release package: bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz"
-      run: |
-        cd bootnodoor_darwin_arm64
-        tar -czf ../bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz .
-    - name: "Upload release artifact: bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz"
-      uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz
-        asset_name: bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz
-        asset_content_type: application/octet-stream
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
+        files: |
+          bootnodoor_${{ inputs.version }}_windows_amd64.zip
+          bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz
+          bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz
+          bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz
+          bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz
