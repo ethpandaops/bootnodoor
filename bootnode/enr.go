@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
@@ -68,8 +69,7 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 	// Add EL 'eth' field if enabled
 	if m.config.HasEL() {
 		forkID := m.elFilter.GetCurrentForkID(currentBlock, currentTime)
-		// Set eth field as a list of fork IDs - ENR.Set() will handle RLP encoding
-		// The eth field format is [[Hash, Next]] - a list containing fork IDs
+		// The eth field format is RLP-encoded [[Hash, Next]]  - a list containing fork IDs
 		ethField := []struct {
 			Hash []byte
 			Next uint64
@@ -79,8 +79,12 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 				Next: forkID.Next,
 			},
 		}
-		newRecord.Set("eth", ethField)
 
+		ethFieldEncoded, err := rlp.EncodeToBytes(ethField)
+		if err != nil {
+			return fmt.Errorf("failed to encode eth field: %w", err)
+		}
+		newRecord.Set("eth", ethFieldEncoded)
 		m.config.Logger.WithField("forkID", forkID.String()).Debug("updated ENR with eth field")
 	}
 
