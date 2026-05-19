@@ -147,39 +147,6 @@ jobs:
         path: ./bin/*
         name: bootnodoor_windows_amd64
 
-  build_darwin_amd64_binary:
-    name: Build macos/amd64 binary
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      with:
-        ref: ${{ inputs.ref }}
-
-    # setup global dependencies
-    - name: Set up go
-      uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
-      with:
-        go-version: 1.25.x
-
-    # setup project dependencies
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
-
-    # build binaries
-    - name: Build macos amd64 binary
-      run: |
-        make build
-      env:
-        RELEASE: ${{ inputs.release }}
-
-    # upload artifacts
-    - name: "Upload artifact: bootnodoor_darwin_amd64"
-      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-      with:
-        path: ./bin/*
-        name: bootnodoor_darwin_amd64
-
   build_darwin_arm64_binary:
     name: Build macos/arm64 binary
     runs-on: macos-latest

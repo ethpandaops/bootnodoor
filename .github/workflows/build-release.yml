@@ -79,10 +79,6 @@ jobs:
       run: |
         cd bootnodoor_linux_arm64
         tar -czf ../bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz .
-    - name: "Generate release package: bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz"
-      run: |
-        cd bootnodoor_darwin_amd64
-        tar -czf ../bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz .
     - name: "Generate release package: bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz"
       run: |
         cd bootnodoor_darwin_arm64
@@ -113,11 +109,9 @@ jobs:
           | [bootnodoor_${{ inputs.version }}_windows_amd64.zip](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_windows_amd64.zip) | bootnodoor executables for windows/amd64 |
           | [bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz) | bootnodoor executables for linux/amd64 |
           | [bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz) | bootnodoor executables for linux/arm64 |
-          | [bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz) | bootnodoor executable for macos/amd64 |
           | [bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz](https://github.com/ethpandaops/bootnodoor/releases/download/v${{ inputs.version }}/bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz) | bootnodoor executable for macos/arm64 |
         files: |
           bootnodoor_${{ inputs.version }}_windows_amd64.zip
           bootnodoor_${{ inputs.version }}_linux_amd64.tar.gz
           bootnodoor_${{ inputs.version }}_linux_arm64.tar.gz
-          bootnodoor_${{ inputs.version }}_darwin_amd64.tar.gz
           bootnodoor_${{ inputs.version }}_darwin_arm64.tar.gz
