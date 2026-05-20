@@ -27,26 +27,31 @@ import (
 //
 // It provides:
 //   - Dual protocol support (discv4 + discv5)
-//   - Dual layer support (EL + CL)
+//   - Dual layer support (EL + CL) on separate ports
 //   - Separate routing tables for each layer
+//   - Separate ENRs for each layer (EL has eth field, CL has eth2 field)
 //   - Fork-aware filtering
 type Service struct {
 	// Configuration
 	config *Config
 
-	// Local node (shared across protocols)
-	localNode *v5node.Node
+	// EL stack (nil if EL disabled)
+	elLocalNode     *v5node.Node
+	elTransport     *transport.UDPTransport
+	elDiscv5Service *discv5.Service
+	discv4Service   *discv4.Service // discv4 is EL-only
 
-	// Network components
-	transport     *transport.UDPTransport
-	discv4Service *discv4.Service // May be nil if discv4 disabled
-	discv5Service *discv5.Service // May be nil if discv5 disabled
+	// CL stack (nil if CL disabled)
+	clLocalNode     *v5node.Node
+	clTransport     *transport.UDPTransport
+	clDiscv5Service *discv5.Service
 
 	// ENR management
 	enrManager *ENRManager
 
-	// IP discovery
-	ipDiscovery *services.IPDiscovery
+	// IP discovery (per-layer)
+	elIPDiscovery *services.IPDiscovery
+	clIPDiscovery *services.IPDiscovery
 
 	// Node databases (layer-specific)
 	elNodeDB *nodes.NodeDB // May be nil if EL disabled
@@ -56,12 +61,13 @@ type Service struct {
 	elTable *nodes.FlatTable // May be nil if EL disabled
 	clTable *nodes.FlatTable // May be nil if CL disabled
 
-	// Discovery services
-	pingService     *services.PingService   // Handles PING/PONG for aliveness checks
+	// Discovery services (per-layer)
+	elPingService   *services.PingService   // May be nil if EL disabled
+	clPingService   *services.PingService   // May be nil if CL disabled
 	elLookupService *services.LookupService // EL lookup service (may be nil if EL disabled)
 	clLookupService *services.LookupService // CL lookup service (may be nil if CL disabled)
 
-	// ENR request tracking (prevents duplicate requests)
+	// ENR request tracking (prevents duplicate requests, discv4/EL only)
 	pendingENRRequestsV4 sync.Map // map[node.ID]time.Time
 
 	// Lifecycle
@@ -107,76 +113,92 @@ func New(cfg *Config) (*Service, error) {
 		cancel: cancel,
 	}
 
-	// Create UDP transport (shared by both protocols)
-	listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), cfg.BindPort)
-	transportConfig := &transport.Config{
-		ListenAddr: listenAddr,
-		Logger:     cfg.Logger,
-	}
-	udpTransport, err := transport.NewUDPTransport(transportConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create UDP transport: %w", err)
-	}
-	s.transport = udpTransport
-
-	// Load stored ENR
-	storedENR, err := s.loadStoredENR()
-	if err != nil {
-		cfg.Logger.WithError(err).Debug("no stored ENR, will create new one")
-	}
-
-	// Create local node (shared across both protocols)
-	localNode, err := createLocalNode(cfg, storedENR)
-	if err != nil {
-		udpTransport.Close()
-		return nil, fmt.Errorf("failed to create local node: %w", err)
-	}
-	s.localNode = localNode
-
-	// Store the ENR
-	if err := s.storeENR(localNode.Record()); err != nil {
-		cfg.Logger.WithError(err).Warn("failed to store initial ENR")
-	}
-
-	// Create ENR manager and update ENR with eth/eth2 fields
-	s.enrManager = NewENRManager(cfg, localNode)
-	if err := s.enrManager.UpdateENR(0, 0); err != nil {
-		cfg.Logger.WithError(err).Warn("failed to update ENR with eth/eth2 fields")
-	} else {
-		// Store updated ENR with eth/eth2 fields
-		if err := s.storeENR(localNode.Record()); err != nil {
-			cfg.Logger.WithError(err).Warn("failed to store updated ENR")
+	// --- EL stack ---
+	if cfg.HasEL() {
+		if err := s.initELStack(ctx); err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to initialize EL stack: %w", err)
 		}
 	}
 
-	// Create IP discovery service
-	ipDiscoveryCfg := services.IPDiscoveryConfig{
-		MinReports:     5, // Require 5 reports
-		MinDistinctIPs: 3, // From at least 3 distinct IPs
-		Logger:         cfg.Logger,
-		OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
-			// Update local node's ENR with discovered IP
-			s.updateENRWithDiscoveredIP(ip, port, isIPv6)
-		},
-	}
-	s.ipDiscovery = services.NewIPDiscovery(ipDiscoveryCfg)
-
-	// Create discv5 service (if enabled) - pass the local node
-	if cfg.EnableDiscv5 {
-		if err := s.initDiscv5(udpTransport, localNode); err != nil {
-			udpTransport.Close()
-			return nil, fmt.Errorf("failed to initialize discv5: %w", err)
+	// --- CL stack ---
+	if cfg.HasCL() {
+		if err := s.initCLStack(ctx); err != nil {
+			s.closeELTransport()
+			cancel()
+			return nil, fmt.Errorf("failed to initialize CL stack: %w", err)
 		}
 	}
 
-	// Create discv4 service (if enabled) - pass the local node's ENR
-	if cfg.EnableDiscv4 {
-		if err := s.initDiscv4(udpTransport, localNode.Record()); err != nil {
-			if s.discv5Service != nil {
-				s.discv5Service.Stop()
+	// Create ENR manager and update each ENR with its layer-specific field
+	s.enrManager = NewENRManager(cfg, s.elLocalNode, s.clLocalNode)
+
+	// Update EL ENR with eth field only
+	if cfg.HasEL() {
+		if err := s.enrManager.UpdateELENR(0, 0); err != nil {
+			cfg.Logger.WithError(err).Warn("failed to update EL ENR with eth field")
+		} else {
+			// Store updated ENR with eth field
+			if err := s.storeELENR(s.elLocalNode.Record()); err != nil {
+				cfg.Logger.WithError(err).Warn("failed to store updated EL ENR")
 			}
-			udpTransport.Close()
+		}
+	}
+
+	// Update CL ENR with eth2 field only
+	if cfg.HasCL() {
+		if err := s.enrManager.UpdateCLENR(); err != nil {
+			cfg.Logger.WithError(err).Warn("failed to update CL ENR with eth2 field")
+		} else {
+			// Store updated ENR with eth2 field
+			if err := s.storeCLENR(s.clLocalNode.Record()); err != nil {
+				cfg.Logger.WithError(err).Warn("failed to store updated CL ENR")
+			}
+		}
+	}
+
+	// Create per-layer IP discovery services
+	if cfg.HasEL() {
+		s.elIPDiscovery = services.NewIPDiscovery(services.IPDiscoveryConfig{
+			MinReports:     5, // Require 5 reports
+			MinDistinctIPs: 3, // From at least 3 distinct IPs
+			Logger:         cfg.Logger.WithField("layer", "EL"),
+			OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
+				s.updateELENRWithDiscoveredIP(ip, port, isIPv6)
+			},
+		})
+	}
+	if cfg.HasCL() {
+		s.clIPDiscovery = services.NewIPDiscovery(services.IPDiscoveryConfig{
+			MinReports:     5, // Require 5 reports
+			MinDistinctIPs: 3, // From at least 3 distinct IPs
+			Logger:         cfg.Logger.WithField("layer", "CL"),
+			OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
+				s.updateCLENRWithDiscoveredIP(ip, port, isIPv6)
+			},
+		})
+	}
+
+	// Initialize EL discovery services on EL transport
+	if cfg.HasEL() {
+		if err := s.initELDiscv5(s.elTransport, s.elLocalNode); err != nil {
+			s.closeTransports()
+			cancel()
+			return nil, fmt.Errorf("failed to initialize EL discv5: %w", err)
+		}
+		if err := s.initDiscv4(s.elTransport, s.elLocalNode.Record()); err != nil {
+			s.closeTransports()
+			cancel()
 			return nil, fmt.Errorf("failed to initialize discv4: %w", err)
+		}
+	}
+
+	// Initialize CL discovery service on CL transport
+	if cfg.HasCL() {
+		if err := s.initCLDiscv5(s.clTransport, s.clLocalNode); err != nil {
+			s.closeTransports()
+			cancel()
+			return nil, fmt.Errorf("failed to initialize CL discv5: %w", err)
 		}
 	}
 
@@ -189,7 +211,15 @@ func New(cfg *Config) (*Service, error) {
 	}
 
 	// Create routing tables for enabled layers
-	localID := localNode.ID()
+	// Both local nodes have the same ID (same private key)
+	var localID [32]byte
+	if s.elLocalNode != nil {
+		localID = s.elLocalNode.ID()
+	} else if s.clLocalNode != nil {
+		localID = s.clLocalNode.ID()
+	}
+
+	var err error
 	if cfg.HasEL() {
 		s.elTable, err = s.createTable(localID, s.elNodeDB, "EL")
 		if err != nil {
@@ -203,157 +233,166 @@ func New(cfg *Config) (*Service, error) {
 		}
 	}
 
-	// Create ping service (shared across protocols)
-	s.pingService = services.NewPingService(
-		s.getV5Handler(),
-		s.getV4Service(),
-		cfg.Logger.WithField("service", "ping"),
-	)
+	// Create per-layer ping services
+	if cfg.HasEL() {
+		s.elPingService = services.NewPingService(
+			s.getELV5Handler(),
+			s.getV4Service(),
+			cfg.Logger.WithField("service", "el-ping"),
+		)
+	}
+	if cfg.HasCL() {
+		s.clPingService = services.NewPingService(
+			s.getCLV5Handler(),
+			nil, // CL has no v4
+			cfg.Logger.WithField("service", "cl-ping"),
+		)
+	}
 
 	// Create lookup services for enabled layers
 	if cfg.HasEL() && s.elTable != nil {
-		localNode := nodes.NewFromV5(s.localNode, s.elNodeDB)
-		s.elLookupService = services.NewLookupService(services.Config{
-			LocalNode:     localNode,
-			NodeDB:        s.elNodeDB,
-			Table:         s.elTable,
-			V5Handler:     s.getV5Handler(),
-			V4Service:     s.getV4Service(),
-			Database:      cfg.Database,
-			Layer:         db.LayerEL,
-			Alpha:         3,
-			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) bool {
-				// Filter by fork ID before adding to table
-				if n.Record() != nil && s.enrManager != nil {
-					if isEL, _ := s.enrManager.FilterELNode(n.Record()); !isEL {
-						// Mark as bad node
-						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
-							cfg.Logger.WithError(err).Debug("failed to store bad node")
-						}
-						return false
-					}
-				}
-
-				// If node was discovered via v4 (only has v4 support), immediately test for v5 support
-				if n.HasV4() && !n.HasV5() && s.pingService != nil {
-					record := n.Record()
-					if record != nil {
-						// Try to create v5 node from ENR
-						v5Node, err := nodes.NewV5NodeFromRecord(record)
-						if err == nil && s.getV5Handler() != nil {
-							// Ping on v5 to test support
-							start := time.Now()
-							respChan, err := s.getV5Handler().SendPing(v5Node)
-							if err == nil {
-								resp := <-respChan
-								rtt := time.Since(start)
-								if resp.Error == nil {
-									// v5 ping succeeded - add v5 support
-									n.SetV5(v5Node)
-									cfg.Logger.WithFields(logrus.Fields{
-										"peerID": n.PeerID(),
-										"addr":   n.Addr(),
-										"rtt":    rtt,
-									}).Debug("discovered v5 support on v4-discovered node")
-
-									// Queue protocol support update (SetV5 already marked it dirty)
-									if s.elNodeDB != nil {
-										if err := s.elNodeDB.QueueUpdate(n); err != nil {
-											cfg.Logger.WithError(err).Debug("failed to queue node for protocol support update")
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-
-				// Attempt to add to EL table
-				added := s.elTable.Add(n)
-				if added {
-					// Remove from bad nodes list if it was previously bad
-					if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
-						cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-					}
-				}
-				return added
-			},
-			Logger: cfg.Logger.WithField("service", "el-lookup"),
-		})
+		s.createELLookupService(cfg)
 	}
-
 	if cfg.HasCL() && s.clTable != nil {
-		localNode := nodes.NewFromV5(s.localNode, s.clNodeDB)
-		s.clLookupService = services.NewLookupService(services.Config{
-			LocalNode:     localNode,
-			NodeDB:        s.clNodeDB,
-			Table:         s.clTable,
-			V5Handler:     s.getV5Handler(),
-			V4Service:     s.getV4Service(),
-			Database:      cfg.Database,
-			Layer:         db.LayerCL,
-			Alpha:         3,
-			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) bool {
-				// Filter by fork digest before adding to table
-				if n.Record() != nil && s.enrManager != nil {
-					if !s.enrManager.FilterCLNode(n.Record()) {
-						// Mark as bad node
-						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
-							cfg.Logger.WithError(err).Debug("failed to store bad node")
-						}
-						return false
-					}
-				}
-				// Attempt to add to CL table
-				added := s.clTable.Add(n)
-				if added {
-					// Remove from bad nodes list if it was previously bad
-					if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
-						cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-					}
-				}
-				return added
-			},
-			Logger: cfg.Logger.WithField("service", "cl-lookup"),
-		})
+		s.createCLLookupService(cfg)
 	}
 
 	return s, nil
 }
 
-// initDiscv5 initializes the discv5 service.
-func (s *Service) initDiscv5(udpTransport *transport.UDPTransport, localNode *v5node.Node) error {
+// initELStack creates the EL transport and local node.
+func (s *Service) initELStack(ctx context.Context) error {
+	cfg := s.config
+
+	// Create EL UDP transport
+	listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), cfg.ELBindPort)
+	elTransport, err := transport.NewUDPTransport(&transport.Config{
+		ListenAddr: listenAddr,
+		Logger:     cfg.Logger.WithField("transport", "EL"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create EL UDP transport on %s: %w", listenAddr, err)
+	}
+	s.elTransport = elTransport
+
+	// Load stored EL ENR
+	storedENR, err := s.loadStoredELENR()
+	if err != nil {
+		cfg.Logger.WithError(err).Debug("no stored EL ENR, will create new one")
+	}
+
+	// Create EL local node
+	elLocalNode, err := createLocalNode(cfg, storedENR, cfg.ELENRPort)
+	if err != nil {
+		elTransport.Close()
+		return fmt.Errorf("failed to create EL local node: %w", err)
+	}
+	s.elLocalNode = elLocalNode
+
+	// Store the initial EL ENR
+	if err := s.storeELENR(elLocalNode.Record()); err != nil {
+		cfg.Logger.WithError(err).Warn("failed to store initial EL ENR")
+	}
+
+	return nil
+}
+
+// initCLStack creates the CL transport and local node.
+func (s *Service) initCLStack(ctx context.Context) error {
+	cfg := s.config
+
+	// Create CL UDP transport
+	listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), cfg.CLBindPort)
+	clTransport, err := transport.NewUDPTransport(&transport.Config{
+		ListenAddr: listenAddr,
+		Logger:     cfg.Logger.WithField("transport", "CL"),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create CL UDP transport on %s: %w", listenAddr, err)
+	}
+	s.clTransport = clTransport
+
+	// Load stored CL ENR
+	storedENR, err := s.loadStoredCLENR()
+	if err != nil {
+		cfg.Logger.WithError(err).Debug("no stored CL ENR, will create new one")
+	}
+
+	// Create CL local node
+	clLocalNode, err := createLocalNode(cfg, storedENR, cfg.CLENRPort)
+	if err != nil {
+		clTransport.Close()
+		return fmt.Errorf("failed to create CL local node: %w", err)
+	}
+	s.clLocalNode = clLocalNode
+
+	// Store the initial CL ENR
+	if err := s.storeCLENR(clLocalNode.Record()); err != nil {
+		cfg.Logger.WithError(err).Warn("failed to store initial CL ENR")
+	}
+
+	return nil
+}
+
+// initELDiscv5 initializes the EL discv5 service with EL-specific callbacks.
+func (s *Service) initELDiscv5(udpTransport *transport.UDPTransport, localNode *v5node.Node) error {
 	discv5Config := discv5.DefaultConfig()
-	discv5Config.LocalNode = localNode // Pass the pre-created local node
+	discv5Config.LocalNode = localNode
 	discv5Config.Context = s.ctx
 	discv5Config.PrivateKey = s.config.PrivateKey
 	discv5Config.SessionLifetime = s.config.SessionLifetime
 	discv5Config.MaxSessions = s.config.MaxSessions
-	discv5Config.Logger = s.config.Logger
+	discv5Config.Logger = s.config.Logger.WithField("layer", "EL")
 
-	// Set callbacks
-	discv5Config.OnHandshakeComplete = s.onHandshakeComplete
-	discv5Config.OnNodeUpdate = s.onNodeUpdate
-	discv5Config.OnNodeSeen = s.onNodeSeen
-	discv5Config.OnFindNode = s.onFindNodeV5
-	discv5Config.OnTalkReq = nil // No TALKREQ support
+	// EL-specific callbacks
+	discv5Config.OnHandshakeComplete = s.onHandshakeCompleteEL
+	discv5Config.OnNodeUpdate = s.onNodeUpdateEL
+	discv5Config.OnNodeSeen = s.onNodeSeenEL
+	discv5Config.OnFindNode = s.onFindNodeV5EL
+	discv5Config.OnTalkReq = nil
 	discv5Config.OnPongReceived = func(remoteID v5node.ID, sourceIP net.IP, reportedIP net.IP, reportedPort uint16) {
-		s.onPongReceived(remoteID[:], sourceIP, reportedIP, reportedPort)
+		s.onPongReceivedEL(remoteID[:], sourceIP, reportedIP, reportedPort)
 	}
 
-	// Create service
 	service, err := discv5.New(discv5Config, udpTransport)
 	if err != nil {
 		return err
 	}
 
-	s.discv5Service = service
+	s.elDiscv5Service = service
 	return nil
 }
 
-// initDiscv4 initializes the discv4 service.
+// initCLDiscv5 initializes the CL discv5 service with CL-specific callbacks.
+func (s *Service) initCLDiscv5(udpTransport *transport.UDPTransport, localNode *v5node.Node) error {
+	discv5Config := discv5.DefaultConfig()
+	discv5Config.LocalNode = localNode
+	discv5Config.Context = s.ctx
+	discv5Config.PrivateKey = s.config.PrivateKey
+	discv5Config.SessionLifetime = s.config.SessionLifetime
+	discv5Config.MaxSessions = s.config.MaxSessions
+	discv5Config.Logger = s.config.Logger.WithField("layer", "CL")
+
+	// CL-specific callbacks
+	discv5Config.OnHandshakeComplete = s.onHandshakeCompleteCL
+	discv5Config.OnNodeUpdate = s.onNodeUpdateCL
+	discv5Config.OnNodeSeen = s.onNodeSeenCL
+	discv5Config.OnFindNode = s.onFindNodeV5CL
+	discv5Config.OnTalkReq = nil
+	discv5Config.OnPongReceived = func(remoteID v5node.ID, sourceIP net.IP, reportedIP net.IP, reportedPort uint16) {
+		s.onPongReceivedCL(remoteID[:], sourceIP, reportedIP, reportedPort)
+	}
+
+	service, err := discv5.New(discv5Config, udpTransport)
+	if err != nil {
+		return err
+	}
+
+	s.clDiscv5Service = service
+	return nil
+}
+
+// initDiscv4 initializes the discv4 service (EL-only, on EL transport).
 func (s *Service) initDiscv4(udpTransport *transport.UDPTransport, localENR *enr.Record) error {
 	discv4Config := discv4.DefaultConfig()
 	discv4Config.PrivateKey = s.config.PrivateKey
@@ -368,12 +407,11 @@ func (s *Service) initDiscv4(udpTransport *transport.UDPTransport, localENR *enr
 	}
 	discv4Config.OnPongReceived = func(from *v4node.Node, ip net.IP, port uint16) {
 		sourceIP := from.Addr().IP
-		s.onPongReceived(from.IDBytes(), sourceIP, ip, port)
+		s.onPongReceivedEL(from.IDBytes(), sourceIP, ip, port)
 	}
 	// OnENRRequest: discv4 service handles this internally using LocalENR from config
 	// No callback needed - it will automatically respond with the ENR
 
-	// Create service
 	service, err := discv4.New(discv4Config, udpTransport)
 	if err != nil {
 		return err
@@ -407,9 +445,115 @@ func (s *Service) createTable(localID [32]byte, nodeDB *nodes.NodeDB, layerName 
 	return table, nil
 }
 
-// getLocalID returns the local node ID.
-func (s *Service) getLocalID() [32]byte {
-	return s.localNode.ID()
+// createELLookupService creates the EL lookup service.
+func (s *Service) createELLookupService(cfg *Config) {
+	localNode := nodes.NewFromV5(s.elLocalNode, s.elNodeDB)
+	s.elLookupService = services.NewLookupService(services.Config{
+		LocalNode:     localNode,
+		NodeDB:        s.elNodeDB,
+		Table:         s.elTable,
+		V5Handler:     s.getELV5Handler(),
+		V4Service:     s.getV4Service(),
+		Database:      cfg.Database,
+		Layer:         db.LayerEL,
+		Alpha:         3,
+		LookupTimeout: 30 * time.Second,
+		OnNodeFound: func(n *nodes.Node) bool {
+			// Filter by fork ID before adding to table
+			if n.Record() != nil && s.enrManager != nil {
+				if isEL, _ := s.enrManager.FilterELNode(n.Record()); !isEL {
+					// Mark as bad node
+					if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
+						cfg.Logger.WithError(err).Debug("failed to store bad node")
+					}
+					return false
+				}
+			}
+
+			// If node was discovered via v4 (only has v4 support), immediately test for v5 support
+			if n.HasV4() && !n.HasV5() && s.elPingService != nil {
+				record := n.Record()
+				if record != nil {
+					// Try to create v5 node from ENR
+					v5Node, err := nodes.NewV5NodeFromRecord(record)
+					if err == nil && s.getELV5Handler() != nil {
+						// Ping on v5 to test support
+						start := time.Now()
+						respChan, err := s.getELV5Handler().SendPing(v5Node)
+						if err == nil {
+							resp := <-respChan
+							rtt := time.Since(start)
+							if resp.Error == nil {
+								// v5 ping succeeded - add v5 support
+								n.SetV5(v5Node)
+								cfg.Logger.WithFields(logrus.Fields{
+									"peerID": n.PeerID(),
+									"addr":   n.Addr(),
+									"rtt":    rtt,
+								}).Debug("discovered v5 support on v4-discovered node")
+
+								// Queue protocol support update (SetV5 already marked it dirty)
+								if s.elNodeDB != nil {
+									if err := s.elNodeDB.QueueUpdate(n); err != nil {
+										cfg.Logger.WithError(err).Debug("failed to queue node for protocol support update")
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Attempt to add to EL table
+			added := s.elTable.Add(n)
+			if added {
+				// Remove from bad nodes list if it was previously bad
+				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
+					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
+				}
+			}
+			return added
+		},
+		Logger: cfg.Logger.WithField("service", "el-lookup"),
+	})
+}
+
+// createCLLookupService creates the CL lookup service.
+func (s *Service) createCLLookupService(cfg *Config) {
+	localNode := nodes.NewFromV5(s.clLocalNode, s.clNodeDB)
+	s.clLookupService = services.NewLookupService(services.Config{
+		LocalNode:     localNode,
+		NodeDB:        s.clNodeDB,
+		Table:         s.clTable,
+		V5Handler:     s.getCLV5Handler(),
+		V4Service:     nil, // CL has no v4
+		Database:      cfg.Database,
+		Layer:         db.LayerCL,
+		Alpha:         3,
+		LookupTimeout: 30 * time.Second,
+		OnNodeFound: func(n *nodes.Node) bool {
+			// Filter by fork digest before adding to table
+			if n.Record() != nil && s.enrManager != nil {
+				if !s.enrManager.FilterCLNode(n.Record()) {
+					// Mark as bad node
+					if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
+						cfg.Logger.WithError(err).Debug("failed to store bad node")
+					}
+					return false
+				}
+			}
+			// Attempt to add to CL table
+			added := s.clTable.Add(n)
+			if added {
+				// Remove from bad nodes list if it was previously bad
+				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
+					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
+				}
+			}
+			return added
+		},
+		Logger: cfg.Logger.WithField("service", "cl-lookup"),
+	})
 }
 
 // Start starts the bootnode service.
@@ -436,9 +580,14 @@ func (s *Service) Start() error {
 	}
 
 	// Start protocol services
-	if s.discv5Service != nil {
-		if err := s.discv5Service.Start(); err != nil {
-			return fmt.Errorf("failed to start discv5: %w", err)
+	if s.elDiscv5Service != nil {
+		if err := s.elDiscv5Service.Start(); err != nil {
+			return fmt.Errorf("failed to start EL discv5: %w", err)
+		}
+	}
+	if s.clDiscv5Service != nil {
+		if err := s.clDiscv5Service.Start(); err != nil {
+			return fmt.Errorf("failed to start CL discv5: %w", err)
 		}
 	}
 	if s.discv4Service != nil {
@@ -470,17 +619,18 @@ func (s *Service) Stop() error {
 	s.mu.Unlock()
 
 	// Stop protocol services
-	if s.discv5Service != nil {
-		s.discv5Service.Stop()
+	if s.elDiscv5Service != nil {
+		s.elDiscv5Service.Stop()
+	}
+	if s.clDiscv5Service != nil {
+		s.clDiscv5Service.Stop()
 	}
 	if s.discv4Service != nil {
 		s.discv4Service.Stop()
 	}
 
-	// Close transport
-	if s.transport != nil {
-		s.transport.Close()
-	}
+	// Close transports
+	s.closeTransports()
 
 	// Cancel context to stop background tasks
 	s.cancel()
@@ -495,6 +645,21 @@ func (s *Service) Stop() error {
 
 	s.config.Logger.Info("bootnode service stopped")
 	return nil
+}
+
+func (s *Service) closeELTransport() {
+	if s.elTransport != nil {
+		s.elTransport.Close()
+	}
+}
+
+func (s *Service) closeTransports() {
+	if s.elTransport != nil {
+		s.elTransport.Close()
+	}
+	if s.clTransport != nil {
+		s.clTransport.Close()
+	}
 }
 
 // maintenanceLoop runs periodic maintenance tasks.
@@ -551,15 +716,11 @@ func (s *Service) performTableMaintenance() {
 
 // performAlivenessCheck checks node aliveness by pinging a sample of nodes.
 func (s *Service) performAlivenessCheck() {
-	if s.pingService == nil {
-		return
-	}
-
 	// Ping a sample from each table
 	const sampleSize = 10 // Ping 10 nodes per table per check
 
 	// Ping EL nodes
-	if s.elTable != nil {
+	if s.elTable != nil && s.elPingService != nil {
 		elNodes := s.elTable.GetActiveNodes()
 		if len(elNodes) > sampleSize {
 			// Shuffle and take sample
@@ -579,11 +740,11 @@ func (s *Service) performAlivenessCheck() {
 		}
 
 		s.config.Logger.WithField("count", len(elNodes)).WithField("layer", "EL").Debug("pinging nodes")
-		s.pingService.PingMultiple(elNodes)
+		s.elPingService.PingMultiple(elNodes)
 	}
 
 	// Ping CL nodes
-	if s.clTable != nil {
+	if s.clTable != nil && s.clPingService != nil {
 		clNodes := s.clTable.GetActiveNodes()
 		if len(clNodes) > sampleSize {
 			// Shuffle and take sample
@@ -603,7 +764,7 @@ func (s *Service) performAlivenessCheck() {
 		}
 
 		s.config.Logger.WithField("count", len(clNodes)).WithField("layer", "CL").Debug("pinging nodes")
-		s.pingService.PingMultiple(clNodes)
+		s.clPingService.PingMultiple(clNodes)
 	}
 }
 
@@ -643,7 +804,7 @@ func (s *Service) performRandomWalk() {
 //
 // Note: Only checks EL nodes. CL nodes only support discv5, so checking for v4 is wasteful.
 func (s *Service) performProtocolSupportCheck() {
-	if s.pingService == nil {
+	if s.elPingService == nil {
 		return
 	}
 
@@ -656,7 +817,7 @@ func (s *Service) performProtocolSupportCheck() {
 		elNodes := s.elTable.GetRandomActiveNodes(sampleSize)
 		if len(elNodes) > 0 {
 			s.config.Logger.WithField("count", len(elNodes)).WithField("layer", "EL").Debug("checking protocol support")
-			s.pingService.CheckProtocolSupportMultiple(elNodes)
+			s.elPingService.CheckProtocolSupportMultiple(elNodes)
 
 			// Queue protocol support updates for all checked nodes (SetV4/SetV5 already marked them dirty)
 			for _, n := range elNodes {
@@ -915,97 +1076,70 @@ func (s *Service) connectCLBootnodes() {
 	}
 }
 
-// loadStoredENR loads the stored ENR from database.
-func (s *Service) loadStoredENR() (*enr.Record, error) {
-	data, err := s.config.Database.LoadLocalENR()
+// ENR storage helpers
+
+func (s *Service) loadStoredELENR() (*enr.Record, error) {
+	data, err := s.config.Database.LoadLocalELENR()
 	if err != nil {
 		return nil, err
 	}
-
 	return enr.Load(data)
 }
 
-// storeENR stores the ENR to database.
-func (s *Service) storeENR(record *enr.Record) error {
+func (s *Service) storeELENR(record *enr.Record) error {
 	data, err := record.EncodeRLP()
 	if err != nil {
 		return err
 	}
+	return s.config.Database.StoreLocalELENR(data)
+}
 
-	return s.config.Database.StoreLocalENR(data)
+func (s *Service) loadStoredCLENR() (*enr.Record, error) {
+	data, err := s.config.Database.LoadLocalCLENR()
+	if err != nil {
+		return nil, err
+	}
+	return enr.Load(data)
+}
+
+func (s *Service) storeCLENR(record *enr.Record) error {
+	data, err := record.EncodeRLP()
+	if err != nil {
+		return err
+	}
+	return s.config.Database.StoreLocalCLENR(data)
 }
 
 // Callbacks for discv5
 
-func (s *Service) onHandshakeComplete(n *v5node.Node, incoming bool) {
-	s.checkAndAddNode(n)
+func (s *Service) onHandshakeCompleteEL(n *v5node.Node, incoming bool) {
+	s.checkAndAddELNode(n)
 }
 
-func (s *Service) onNodeUpdate(n *v5node.Node) {
-	s.checkAndAddNode(n)
+func (s *Service) onNodeUpdateEL(n *v5node.Node) {
+	s.checkAndAddELNode(n)
 }
 
-func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
-	// Determine layer and update appropriate database
-	if s.enrManager != nil {
+func (s *Service) onNodeSeenEL(n *v5node.Node, timestamp time.Time) {
+	if s.elTable != nil && s.elNodeDB != nil {
 		nodeID := n.ID()
-
-		if isEL, _ := s.enrManager.FilterELNode(n.Record()); isEL && s.elTable != nil && s.elNodeDB != nil {
-			// Look up the generic node from the table
-			if genericNode := s.elTable.Get(nodeID); genericNode != nil {
-				genericNode.SetLastSeen(timestamp) // This marks it dirty
-				s.elNodeDB.QueueUpdate(genericNode)
-			}
-		} else if s.enrManager.FilterCLNode(n.Record()) && s.clTable != nil && s.clNodeDB != nil {
-			// Look up the generic node from the table
-			if genericNode := s.clTable.Get(nodeID); genericNode != nil {
-				genericNode.SetLastSeen(timestamp) // This marks it dirty
-				s.clNodeDB.QueueUpdate(genericNode)
-			}
+		if genericNode := s.elTable.Get(nodeID); genericNode != nil {
+			genericNode.SetLastSeen(timestamp)
+			s.elNodeDB.QueueUpdate(genericNode)
 		}
 	}
 }
 
-func (s *Service) onFindNodeV5(msg *v5protocol.FindNode, sourceNode *v5node.Node, requester *net.UDPAddr) []*v5node.Node {
-	// Determine which table to serve from based on source node's layer
-	// If source node is unknown, serve from both tables
-	var allNodes []*nodes.Node
-	localID := s.getLocalID()
-
-	if sourceNode != nil && s.enrManager != nil {
-		// Check source node's layer
-		sourceRecord := sourceNode.Record()
-		isEL, _ := s.enrManager.FilterELNode(sourceRecord)
-		isCL := s.enrManager.FilterCLNode(sourceRecord)
-
-		// Serve from appropriate table(s)
-		if isEL && s.elTable != nil {
-			elNodes := s.elTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, elNodes...)
-			s.config.Logger.WithField("sourceNodeID", sourceNode.ID().String()[:16]+"...").Debug("serving EL nodes to EL source")
-		}
-		if isCL && s.clTable != nil {
-			clNodes := s.clTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, clNodes...)
-			s.config.Logger.WithField("sourceNodeID", sourceNode.ID().String()[:16]+"...").Debug("serving CL nodes to CL source")
-		}
-	} else {
-		// Source unknown or no ENR manager - serve from both tables
-		if s.elTable != nil {
-			elNodes := s.elTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, elNodes...)
-		}
-		if s.clTable != nil {
-			clNodes := s.clTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, clNodes...)
-		}
+func (s *Service) onFindNodeV5EL(msg *v5protocol.FindNode, sourceNode *v5node.Node, requester *net.UDPAddr) []*v5node.Node {
+	if s.elTable == nil {
+		return nil
 	}
 
-	// Filter nodes based on protocol support (only return v5-capable nodes)
-	// and apply LAN-aware filtering
+	localID := s.elLocalNode.ID()
+	allNodes := s.elTable.GetNodesByDistance(localID, msg.Distances, 8)
+
 	filteredNodes := s.filterNodesForRequester(allNodes, requester, true)
 
-	// Convert to v5 nodes
 	v5Nodes := make([]*v5node.Node, 0, len(filteredNodes))
 	for _, n := range filteredNodes {
 		if v5 := n.V5(); v5 != nil {
@@ -1014,6 +1148,69 @@ func (s *Service) onFindNodeV5(msg *v5protocol.FindNode, sourceNode *v5node.Node
 	}
 
 	return v5Nodes
+}
+
+func (s *Service) checkAndAddELNode(n *v5node.Node) bool {
+	if s.elTable == nil || s.enrManager == nil {
+		return false
+	}
+	isEL, _ := s.enrManager.FilterELNode(n.Record())
+	if !isEL {
+		return false
+	}
+	genericNode := nodes.NewFromV5(n, s.elNodeDB)
+	return s.elTable.Add(genericNode)
+}
+
+// CL discv5 callbacks
+
+func (s *Service) onHandshakeCompleteCL(n *v5node.Node, incoming bool) {
+	s.checkAndAddCLNode(n)
+}
+
+func (s *Service) onNodeUpdateCL(n *v5node.Node) {
+	s.checkAndAddCLNode(n)
+}
+
+func (s *Service) onNodeSeenCL(n *v5node.Node, timestamp time.Time) {
+	if s.clTable != nil && s.clNodeDB != nil {
+		nodeID := n.ID()
+		if genericNode := s.clTable.Get(nodeID); genericNode != nil {
+			genericNode.SetLastSeen(timestamp)
+			s.clNodeDB.QueueUpdate(genericNode)
+		}
+	}
+}
+
+func (s *Service) onFindNodeV5CL(msg *v5protocol.FindNode, sourceNode *v5node.Node, requester *net.UDPAddr) []*v5node.Node {
+	if s.clTable == nil {
+		return nil
+	}
+
+	localID := s.clLocalNode.ID()
+	allNodes := s.clTable.GetNodesByDistance(localID, msg.Distances, 8)
+
+	filteredNodes := s.filterNodesForRequester(allNodes, requester, true)
+
+	v5Nodes := make([]*v5node.Node, 0, len(filteredNodes))
+	for _, n := range filteredNodes {
+		if v5 := n.V5(); v5 != nil {
+			v5Nodes = append(v5Nodes, v5)
+		}
+	}
+
+	return v5Nodes
+}
+
+func (s *Service) checkAndAddCLNode(n *v5node.Node) bool {
+	if s.clTable == nil || s.enrManager == nil {
+		return false
+	}
+	if !s.enrManager.FilterCLNode(n.Record()) {
+		return false
+	}
+	genericNode := nodes.NewFromV5(n, s.clNodeDB)
+	return s.clTable.Add(genericNode)
 }
 
 // Callbacks for discv4
@@ -1177,28 +1374,122 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	return false
 }
 
-// checkAndAddNode performs admission checks and adds node to appropriate table.
-func (s *Service) checkAndAddNode(n *v5node.Node) bool {
-	// Determine layer
-	isEL, _ := s.enrManager.FilterELNode(n.Record())
-	isCL := s.enrManager.FilterCLNode(n.Record())
+// PONG callbacks (per-layer)
 
-	// Add to appropriate table(s)
-	added := false
-	if isEL && s.elTable != nil {
-		genericNode := nodes.NewFromV5(n, s.elNodeDB)
-		if s.elTable.Add(genericNode) {
-			added = true
-		}
+func (s *Service) onPongReceivedEL(remoteID []byte, sourceIP net.IP, reportedIP net.IP, reportedPort uint16) {
+	if s.elIPDiscovery == nil {
+		return
 	}
-	if isCL && s.clTable != nil {
-		genericNode := nodes.NewFromV5(n, s.clNodeDB)
-		if s.clTable.Add(genericNode) {
-			added = true
-		}
+	// Report to IP discovery service with source IP
+	reporterIDStr := fmt.Sprintf("%x", remoteID[:8])
+	s.elIPDiscovery.ReportIP(reportedIP, reportedPort, reporterIDStr, sourceIP)
+}
+
+func (s *Service) onPongReceivedCL(remoteID []byte, sourceIP net.IP, reportedIP net.IP, reportedPort uint16) {
+	if s.clIPDiscovery == nil {
+		return
+	}
+	// Report to IP discovery service with source IP
+	reporterIDStr := fmt.Sprintf("%x", remoteID[:8])
+	s.clIPDiscovery.ReportIP(reportedIP, reportedPort, reporterIDStr, sourceIP)
+}
+
+// IP discovery callbacks (per-layer)
+
+func (s *Service) updateELENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.elLocalNode == nil {
+		return
 	}
 
-	return added
+	// Get current ENR
+	currentENR := s.elLocalNode.Record()
+
+	// Check if IP/port has actually changed
+	currentIP := currentENR.IP()
+	currentPort := currentENR.UDP()
+	if currentIP != nil && currentIP.Equal(ip) && currentPort == port {
+		s.config.Logger.Debug("EL IP discovery: no change in external IP")
+		return
+	}
+
+	s.config.Logger.WithFields(map[string]interface{}{
+		"ip":     ip.String(),
+		"port":   port,
+		"isIPv6": isIPv6,
+		"layer":  "EL",
+	}).Info("IP discovery: consensus reached, updating EL ENR")
+
+	// Update the ENR with the new IP/port
+	// The ENR manager will handle signing and incrementing the sequence number
+	var err error
+	if isIPv6 {
+		err = s.enrManager.UpdateELENRWithIP6(ip, port)
+	} else {
+		err = s.enrManager.UpdateELENRWithIP(ip, port)
+	}
+
+	if err != nil {
+		s.config.Logger.WithError(err).Error("failed to update EL ENR with discovered IP")
+		return
+	}
+
+	// Store the updated ENR
+	if err := s.storeELENR(s.elLocalNode.Record()); err != nil {
+		s.config.Logger.WithError(err).Warn("failed to store updated EL ENR")
+	}
+
+	// Update discv4 service's local ENR
+	if s.discv4Service != nil {
+		s.discv4Service.SetLocalENR(s.elLocalNode.Record())
+	}
+}
+
+func (s *Service) updateCLENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.clLocalNode == nil {
+		return
+	}
+
+	// Get current ENR
+	currentENR := s.clLocalNode.Record()
+
+	// Check if IP/port has actually changed
+	currentIP := currentENR.IP()
+	currentPort := currentENR.UDP()
+	if currentIP != nil && currentIP.Equal(ip) && currentPort == port {
+		s.config.Logger.Debug("CL IP discovery: no change in external IP")
+		return
+	}
+
+	s.config.Logger.WithFields(map[string]interface{}{
+		"ip":     ip.String(),
+		"port":   port,
+		"isIPv6": isIPv6,
+		"layer":  "CL",
+	}).Info("IP discovery: consensus reached, updating CL ENR")
+
+	// Update the ENR with the new IP/port
+	var err error
+	if isIPv6 {
+		err = s.enrManager.UpdateCLENRWithIP6(ip, port)
+	} else {
+		err = s.enrManager.UpdateCLENRWithIP(ip, port)
+	}
+
+	if err != nil {
+		s.config.Logger.WithError(err).Error("failed to update CL ENR with discovered IP")
+		return
+	}
+
+	// Store the updated ENR
+	if err := s.storeCLENR(s.clLocalNode.Record()); err != nil {
+		s.config.Logger.WithError(err).Warn("failed to store updated CL ENR")
+	}
 }
 
 // filterNodesForRequester applies LAN-aware and protocol filtering.
@@ -1235,9 +1526,16 @@ func (s *Service) filterNodesForRequester(nodeList []*nodes.Node, requester *net
 	return filtered
 }
 
-// LocalNode returns the local node.
-func (s *Service) LocalNode() *v5node.Node {
-	return s.localNode
+// Public accessors
+
+// ELLocalNode returns the EL local node (may be nil if EL disabled).
+func (s *Service) ELLocalNode() *v5node.Node {
+	return s.elLocalNode
+}
+
+// CLLocalNode returns the CL local node (may be nil if CL disabled).
+func (s *Service) CLLocalNode() *v5node.Node {
+	return s.clLocalNode
 }
 
 // ELTable returns the EL routing table (may be nil if EL disabled).
@@ -1281,10 +1579,18 @@ func (s *Service) ENRManager() *ENRManager {
 	return s.enrManager
 }
 
-// getV5Handler returns the discv5 protocol handler (may be nil).
-func (s *Service) getV5Handler() *v5protocol.Handler {
-	if s.discv5Service != nil {
-		return s.discv5Service.Handler()
+// getELV5Handler returns the EL discv5 protocol handler (may be nil).
+func (s *Service) getELV5Handler() *v5protocol.Handler {
+	if s.elDiscv5Service != nil {
+		return s.elDiscv5Service.Handler()
+	}
+	return nil
+}
+
+// getCLV5Handler returns the CL discv5 protocol handler (may be nil).
+func (s *Service) getCLV5Handler() *v5protocol.Handler {
+	if s.clDiscv5Service != nil {
+		return s.clDiscv5Service.Handler()
 	}
 	return nil
 }
@@ -1292,67 +1598,4 @@ func (s *Service) getV5Handler() *v5protocol.Handler {
 // getV4Service returns the discv4 service (may be nil).
 func (s *Service) getV4Service() *discv4.Service {
 	return s.discv4Service
-}
-
-// onPongReceived handles PONG responses from both discv4 and discv5.
-// It reports the external IP/port to the IP discovery service.
-func (s *Service) onPongReceived(remoteID []byte, sourceIP net.IP, reportedIP net.IP, reportedPort uint16) {
-	if s.ipDiscovery == nil {
-		return
-	}
-
-	// Report to IP discovery service with source IP
-	reporterIDStr := fmt.Sprintf("%x", remoteID[:8])
-	s.ipDiscovery.ReportIP(reportedIP, reportedPort, reporterIDStr, sourceIP)
-}
-
-// updateENRWithDiscoveredIP updates the local ENR with the discovered external IP.
-func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.localNode == nil {
-		return
-	}
-
-	// Get current ENR
-	currentENR := s.localNode.Record()
-
-	// Check if IP/port has actually changed
-	currentIP := currentENR.IP()
-	currentPort := currentENR.UDP()
-	if currentIP != nil && currentIP.Equal(ip) && currentPort == port {
-		s.config.Logger.Debug("IP discovery: no change in external IP")
-		return
-	}
-
-	s.config.Logger.WithFields(map[string]interface{}{
-		"ip":     ip.String(),
-		"port":   port,
-		"isIPv6": isIPv6,
-	}).Info("IP discovery: consensus reached, updating ENR")
-
-	// Update the ENR with the new IP/port
-	// The ENR manager will handle signing and incrementing the sequence number
-	var err error
-	if isIPv6 {
-		err = s.enrManager.UpdateENRWithIP6(ip, port)
-	} else {
-		err = s.enrManager.UpdateENRWithIP(ip, port)
-	}
-
-	if err != nil {
-		s.config.Logger.WithError(err).Error("failed to update ENR with discovered IP")
-		return
-	}
-
-	// Store the updated ENR
-	if err := s.storeENR(s.localNode.Record()); err != nil {
-		s.config.Logger.WithError(err).Warn("failed to store updated ENR")
-	}
-
-	// Update discv4 service's local ENR if enabled
-	if s.discv4Service != nil {
-		s.discv4Service.SetLocalENR(s.localNode.Record())
-	}
 }

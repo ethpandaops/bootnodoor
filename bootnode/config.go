@@ -6,7 +6,7 @@
 //   - Discovery v5 (discv5) for both EL and CL nodes
 //   - Dual routing tables (separate for EL and CL)
 //   - Fork-aware filtering
-//   - Protocol multiplexing (both protocols on same UDP port)
+//   - Separate ports for EL and CL (each with its own ENR)
 package bootnode
 
 import (
@@ -34,8 +34,11 @@ type Config struct {
 	// BindIP is the IP address to bind to (default: 0.0.0.0)
 	BindIP net.IP
 
-	// BindPort is the UDP port to bind to (default: 30303)
-	BindPort uint16
+	// ELBindPort is the UDP port for EL discovery (discv4 + discv5) (default: 30303)
+	ELBindPort uint16
+
+	// CLBindPort is the UDP port for CL discovery (discv5 only) (default: 9000)
+	CLBindPort uint16
 
 	// ENR configuration
 
@@ -45,8 +48,11 @@ type Config struct {
 	// ENRIP6 is the IPv6 address to advertise in ENR (optional)
 	ENRIP6 net.IP
 
-	// ENRPort is the UDP port to advertise in ENR (default: same as BindPort)
-	ENRPort uint16
+	// ELENRPort is the UDP port to advertise in EL ENR (default: same as ELBindPort)
+	ELENRPort uint16
+
+	// CLENRPort is the UDP port to advertise in CL ENR (default: same as CLBindPort)
+	CLENRPort uint16
 
 	// Execution Layer configuration
 
@@ -89,12 +95,6 @@ type Config struct {
 
 	// Protocol configuration
 
-	// EnableDiscv4 enables Discovery v4 protocol (default: true)
-	EnableDiscv4 bool
-
-	// EnableDiscv5 enables Discovery v5 protocol (default: true)
-	EnableDiscv5 bool
-
 	// SessionLifetime is the discv5 session lifetime (default: 12 hours)
 	SessionLifetime time.Duration
 
@@ -123,19 +123,17 @@ type Config struct {
 //   - One of: ELConfig or CLConfig (or both)
 func DefaultConfig() *Config {
 	return &Config{
-		BindIP:            net.IPv4zero,
-		BindPort:          30303,
-		MaxActiveNodes:    500,
-		MaxNodesPerIP:     10,
-		PingInterval:      30 * time.Second,
-		MaxNodeAge:        24 * time.Hour,
-		MaxFailures:       3,
-		EnableDiscv4:      true,
-		EnableDiscv5:      true,
-		SessionLifetime:   12 * time.Hour,
-		MaxSessions:       1024,
-		EnableIPDiscovery: false,
-		GracePeriod:       60 * time.Minute,
+		BindIP:          net.IPv4zero,
+		ELBindPort:      30303,
+		CLBindPort:      9000,
+		MaxActiveNodes:  500,
+		MaxNodesPerIP:   10,
+		PingInterval:    30 * time.Second,
+		MaxNodeAge:      24 * time.Hour,
+		MaxFailures:     3,
+		SessionLifetime: 12 * time.Hour,
+		MaxSessions:     1024,
+		GracePeriod:     60 * time.Minute,
 	}
 }
 
@@ -162,16 +160,19 @@ func (c *Config) Validate() error {
 		if c.ELGenesisTime == 0 {
 			return fmt.Errorf("ELGenesisTime is required when ELConfig is set")
 		}
+		if c.ELBindPort == 0 {
+			return fmt.Errorf("ELBindPort is required when ELConfig is set")
+		}
 	}
 
-	// Must have at least one protocol enabled
-	if !c.EnableDiscv4 && !c.EnableDiscv5 {
-		return fmt.Errorf("at least one of EnableDiscv4 or EnableDiscv5 must be true")
+	// Validate CL config if provided
+	if c.CLConfig != nil && c.CLBindPort == 0 {
+		return fmt.Errorf("CLBindPort is required when CLConfig is set")
 	}
 
-	// Discv4 requires EL config (CL nodes don't use discv4)
-	if c.EnableDiscv4 && c.ELConfig == nil {
-		return fmt.Errorf("EnableDiscv4 requires ELConfig to be set (discv4 is EL-only)")
+	// Ensure ports don't collide when both layers are enabled
+	if c.ELConfig != nil && c.CLConfig != nil && c.ELBindPort == c.CLBindPort {
+		return fmt.Errorf("ELBindPort and CLBindPort must be different when both layers are enabled (both set to %d)", c.ELBindPort)
 	}
 
 	if c.MaxActiveNodes <= 0 {
@@ -191,12 +192,20 @@ func (c *Config) ApplyDefaults() {
 		c.BindIP = net.IPv4zero
 	}
 
-	if c.BindPort == 0 {
-		c.BindPort = 30303
+	if c.ELBindPort == 0 {
+		c.ELBindPort = 30303
 	}
 
-	if c.ENRPort == 0 {
-		c.ENRPort = c.BindPort
+	if c.CLBindPort == 0 {
+		c.CLBindPort = 9000
+	}
+
+	if c.ELENRPort == 0 {
+		c.ELENRPort = c.ELBindPort
+	}
+
+	if c.CLENRPort == 0 {
+		c.CLENRPort = c.CLBindPort
 	}
 
 	if c.MaxActiveNodes == 0 {

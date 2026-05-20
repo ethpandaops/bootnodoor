@@ -39,14 +39,14 @@ yq_docker -oy '
 
 WITHOUT_SHIM="${WITHOUT_SHIM:-false}"
 if [ "$WITHOUT_SHIM" = "false" ]; then
-  # Add or update the --devnet-shim argument for bootnodoor_params.extra_args, ensuring only one instance with latest HOST_IP:9000 value exists
+  # Add or update the --devnet-shim argument for bootnodoor_params.extra_args, ensuring only one instance with latest HOST_IP value exists
   yq_docker -oy '
     .bootnodoor_params = (.bootnodoor_params // {})
     | .bootnodoor_params.extra_args = (
         (
           (.bootnodoor_params.extra_args // [])
           | map(select(test("^--devnet-shim=") | not))
-        ) + ["--devnet-shim='"${HOST_IP}"':9000"]
+        ) + ["--devnet-shim='"${HOST_IP}"'"]
       )
   ' generated-kurtosis-config.yaml > "${__dir}/generated-kurtosis-config.yaml.tmp" && mv "${__dir}/generated-kurtosis-config.yaml.tmp" "${__dir}/generated-kurtosis-config.yaml"
 fi

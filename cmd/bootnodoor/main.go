@@ -45,13 +45,15 @@ var (
 	clBootnodesFlag       string
 
 	// Network binding
-	bindAddr string
-	bindPort int
+	bindAddr   string
+	elBindPort int
+	clBindPort int
 
 	// ENR configuration
-	enrIP   string
-	enrIP6  string
-	enrPort int
+	enrIP     string
+	enrIP6    string
+	elEnrPort int
+	clEnrPort int
 
 	// Logging
 	logLevel string
@@ -59,10 +61,6 @@ var (
 	// Routing table
 	maxActiveNodes int
 	maxNodesPerIP  int
-
-	// Layer selection
-	enableEL bool
-	enableCL bool
 
 	// WebUI flags
 	enableWebUI bool
@@ -84,7 +82,8 @@ var (
 It provides peer discovery services for both Execution Layer (EL) and
 Consensus Layer (CL) clients, with support for:
   - Dual protocol support (discv4 + discv5)
-  - Dual layer support (EL + CL)
+  - Dual layer support (EL + CL) on separate ports
+  - Separate ENRs per layer (EL has eth field, CL has eth2 field)
   - Fork-aware filtering (EIP-2124 fork IDs + fork digests)
   - Separate routing tables for each layer`,
 		RunE: runBootnode,
@@ -114,12 +113,14 @@ func init() {
 
 	// Network binding
 	rootCmd.Flags().StringVar(&bindAddr, "bind-addr", "0.0.0.0", "IP address to bind to")
-	rootCmd.Flags().IntVar(&bindPort, "bind-port", 9000, "UDP port to bind to")
+	rootCmd.Flags().IntVar(&elBindPort, "el-bind-port", 30303, "UDP port for EL discovery (discv4 + discv5)")
+	rootCmd.Flags().IntVar(&clBindPort, "cl-bind-port", 9000, "UDP port for CL discovery (discv5 only)")
 
 	// ENR configuration
 	rootCmd.Flags().StringVar(&enrIP, "enr-ip", "", "IPv4 address to advertise in ENR (auto-detected if not specified)")
 	rootCmd.Flags().StringVar(&enrIP6, "enr-ip6", "", "IPv6 address to advertise in ENR (optional)")
-	rootCmd.Flags().IntVar(&enrPort, "enr-port", 0, "UDP port to advertise in ENR (0 = use bind-port)")
+	rootCmd.Flags().IntVar(&elEnrPort, "el-enr-port", 0, "UDP port to advertise in EL ENR (0 = use el-bind-port)")
+	rootCmd.Flags().IntVar(&clEnrPort, "cl-enr-port", 0, "UDP port to advertise in CL ENR (0 = use cl-bind-port)")
 
 	// Logging
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
@@ -127,10 +128,6 @@ func init() {
 	// Routing table
 	rootCmd.Flags().IntVar(&maxActiveNodes, "max-active-nodes", 500, "Maximum number of active nodes per table")
 	rootCmd.Flags().IntVar(&maxNodesPerIP, "max-nodes-per-ip", 10, "Maximum number of nodes per IP address")
-
-	// Layer selection
-	rootCmd.Flags().BoolVar(&enableEL, "enable-el", true, "Enable Execution Layer support (discv4 + discv5)")
-	rootCmd.Flags().BoolVar(&enableCL, "enable-cl", true, "Enable Consensus Layer support (discv5)")
 
 	// WebUI
 	rootCmd.Flags().BoolVar(&enableWebUI, "web-ui", false, "Enable web UI")
@@ -140,7 +137,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&webUIPprof, "pprof", false, "Enable pprof endpoints")
 
 	// Devnet shim mode
-	rootCmd.Flags().StringVar(&devnetShim, "devnet-shim", "", "Run in devnet shim mode, only serve ENR/enode with given IP:port (e.g., 172.17.0.1:9000)")
+	rootCmd.Flags().StringVar(&devnetShim, "devnet-shim", "", "Run in devnet shim mode, only serve ENR/enode with given IP (e.g., 172.17.0.1)")
 }
 
 func main() {
@@ -249,7 +246,6 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 					if *fork.Block == 0 {
 						continue
 					}
-
 					forkID := forkIDMap[*fork.Block]
 					logger.WithFields(logrus.Fields{
 						"fork":   fork.Name,
@@ -261,7 +257,6 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 					if *fork.Timestamp == 0 || *fork.Timestamp == elGenesisTime {
 						continue
 					}
-
 					forkID := forkIDMap[*fork.Timestamp]
 					logger.WithFields(logrus.Fields{
 						"fork":   fork.Name,
@@ -405,12 +400,6 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Use ENR port or default to bind port
-	enrUDPPort := uint16(enrPort)
-	if enrUDPPort == 0 {
-		enrUDPPort = uint16(bindPort)
-	}
-
 	// Parse EL bootnodes
 	var elBootnodes []string
 	if elBootnodesFlag != "" {
@@ -431,29 +420,23 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		logger.WithField("count", len(clBootnodes)).Info("loaded CL bootnodes")
 	}
 
-	// Determine which discovery protocols to enable based on layer selection
-	// EL (Execution Layer) needs both discv4 and discv5
-	// CL (Consensus Layer) only needs discv5
-	enableDiscv4 := enableEL
-	enableDiscv5 := enableEL || enableCL
-
 	// Create bootnode service config
 	config := bootnode.DefaultConfig()
 	config.PrivateKey = privKey
 	config.Database = sqliteDB
 	config.BindIP = bindIP
-	config.BindPort = uint16(bindPort)
+	config.ELBindPort = uint16(elBindPort)
+	config.CLBindPort = uint16(clBindPort)
 	config.ENRIP = enrIPv4
 	config.ENRIP6 = enrIPv6
-	config.ENRPort = enrUDPPort
-	config.EnableDiscv4 = enableDiscv4
-	config.EnableDiscv5 = enableDiscv5
+	config.ELENRPort = uint16(elEnrPort)
+	config.CLENRPort = uint16(clEnrPort)
 	config.MaxActiveNodes = maxActiveNodes
 	config.MaxNodesPerIP = maxNodesPerIP
 	config.Logger = logger
 
 	// Set EL config if provided
-	if enableEL && elConfig != nil {
+	if elConfig != nil {
 		config.ELConfig = elConfig
 		config.ELGenesisHash = elGenesisHashBytes
 		config.ELGenesisTime = elGenesisTime
@@ -461,7 +444,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set CL config if provided
-	if enableCL && clConfig != nil {
+	if clConfig != nil {
 		config.CLConfig = clConfig
 		config.CLBootnodes = clBootnodes
 	}
@@ -473,17 +456,21 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print node information
-	localNode := service.LocalNode()
-	logger.WithFields(logrus.Fields{
-		"nodeID":      localNode.ID().String()[:16] + "...",
-		"bindAddress": fmt.Sprintf("%s:%d", bindAddr, bindPort),
-		"enrAddress":  fmt.Sprintf("%s:%d", enrIPv4.String(), enrUDPPort),
-	}).Info("bootnode information")
-
-	// Print ENR
-	enrStr, err := localNode.Record().EncodeBase64()
-	if err == nil {
-		logger.WithField("enr", enrStr).Info("local ENR")
+	if elNode := service.ELLocalNode(); elNode != nil {
+		enrStr, _ := elNode.Record().EncodeBase64()
+		logger.WithFields(logrus.Fields{
+			"nodeID":      elNode.ID().String()[:16] + "...",
+			"bindAddress": fmt.Sprintf("%s:%d", bindAddr, elBindPort),
+			"enr":         enrStr,
+		}).Info("EL bootnode")
+	}
+	if clNode := service.CLLocalNode(); clNode != nil {
+		enrStr, _ := clNode.Record().EncodeBase64()
+		logger.WithFields(logrus.Fields{
+			"nodeID":      clNode.ID().String()[:16] + "...",
+			"bindAddress": fmt.Sprintf("%s:%d", bindAddr, clBindPort),
+			"enr":         enrStr,
+		}).Info("CL bootnode")
 	}
 
 	// Start bootnode service
@@ -553,11 +540,11 @@ func getLocalIP() net.IP {
 	return net.ParseIP("0.0.0.0")
 }
 
-// parsePrivateKey parses a hex-encoded private key.
+// runDevnetShim runs the devnet shim mode with separate EL and CL ENRs.
 func runDevnetShim(
 	logger *logrus.Logger,
 	privKey *ecdsa.PrivateKey,
-	shimEndpoint string,
+	shimIP string,
 	elConfig *elconfig.ChainConfig,
 	elGenesisHash [32]byte,
 	elGenesisTime uint64,
@@ -565,51 +552,30 @@ func runDevnetShim(
 	clGenesisTime uint64,
 	gracePeriod time.Duration,
 ) error {
-	// Parse the endpoint
-	parts := strings.Split(shimEndpoint, ":")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid devnet-shim format, expected IP:port, got: %s", shimEndpoint)
-	}
-
-	shimIP := parts[0]
-	shimPort := parts[1]
-
 	// Get public key and node ID
 	pubKey := privKey.Public().(*ecdsa.PublicKey)
 	nodeID := ethcrypto.PubkeyToAddress(*pubKey)
 
 	// Generate enode URL (for EL)
-	enode := fmt.Sprintf("enode://%x@%s:%s", ethcrypto.FromECDSAPub(pubKey)[1:], shimIP, shimPort)
+	enode := fmt.Sprintf("enode://%x@%s:%d", ethcrypto.FromECDSAPub(pubKey)[1:], shimIP, elBindPort)
 
-	// Generate ENR using the exact same logic as buildENR in bootnode/localnode.go
-	record := enr.New()
-
-	// Set identity scheme (v4) and public key
-	record.Set(enr.WithIdentityScheme("v4"))
-	record.Set(enr.WithPublicKey(pubKey))
-
-	// Set IP address
-	if ipAddr := net.ParseIP(shimIP); ipAddr != nil {
-		if ipv4 := ipAddr.To4(); ipv4 != nil {
-			record.Set("ip", ipv4)
-		}
-	}
-
-	// Set UDP and TCP ports
-	portNum := 0
-	fmt.Sscanf(shimPort, "%d", &portNum)
-	if portNum > 0 {
-		record.Set("udp", uint16(portNum))
-		record.Set("tcp", uint16(portNum)) // TCP same as UDP
-	}
-
-	// Add EL 'eth' field if config provided
+	// Build EL ENR (with eth field only)
+	var elENRString string
 	if elConfig != nil {
-		// Gather fork data for computing fork IDs
+		record := enr.New()
+		record.Set(enr.WithIdentityScheme("v4"))
+		record.Set(enr.WithPublicKey(pubKey))
+		if ipAddr := net.ParseIP(shimIP); ipAddr != nil {
+			if ipv4 := ipAddr.To4(); ipv4 != nil {
+				record.Set("ip", ipv4)
+			}
+		}
+		record.Set("udp", uint16(elBindPort))
+		record.Set("tcp", uint16(elBindPort))
+
+		// Add EL 'eth' field only
 		forksByBlock, forksByTime := elconfig.GatherForks(elConfig, elGenesisTime)
-		// Compute all fork IDs
 		allForkIDs := elconfig.ComputeAllForkIDs(elGenesisHash, forksByBlock, forksByTime)
-		// Use current fork ID (last one in the list)
 		currentForkID := allForkIDs[len(allForkIDs)-1]
 
 		ethField := []struct {
@@ -622,49 +588,78 @@ func runDevnetShim(
 			},
 		}
 		record.Set("eth", ethField)
-		logger.WithField("forkID", currentForkID.String()).Debug("added eth field to shim ENR")
+
+		record.SetSeq(1)
+		if err := record.Sign(privKey); err != nil {
+			return fmt.Errorf("failed to sign EL ENR: %w", err)
+		}
+
+		var err error
+		elENRString, err = record.EncodeBase64()
+		if err != nil {
+			return fmt.Errorf("failed to encode EL ENR: %w", err)
+		}
+		logger.WithField("forkID", currentForkID.String()).Debug("added eth field to EL shim ENR")
 	}
 
-	// Add CL 'eth2' field if config provided
+	// Build CL ENR (with eth2 field only)
+	var clENRString string
 	if clConfig != nil {
-		// Create fork digest filter to compute eth2 field
+		record := enr.New()
+		record.Set(enr.WithIdentityScheme("v4"))
+		record.Set(enr.WithPublicKey(pubKey))
+		if ipAddr := net.ParseIP(shimIP); ipAddr != nil {
+			if ipv4 := ipAddr.To4(); ipv4 != nil {
+				record.Set("ip", ipv4)
+			}
+		}
+		record.Set("udp", uint16(clBindPort))
+		record.Set("tcp", uint16(clBindPort))
+
+		// Add CL 'eth2' field only
 		clFilter := clconfig.NewForkDigestFilter(clConfig, gracePeriod)
 		eth2Field := clFilter.ComputeEth2Field()
 		record.Set("eth2", eth2Field)
 
-		// Extract fork digest for logging
 		var forkDigest [4]byte
 		if len(eth2Field) >= 4 {
 			copy(forkDigest[:], eth2Field[0:4])
 		}
-		logger.WithField("forkDigest", fmt.Sprintf("%#x", forkDigest)).Debug("added eth2 field to shim ENR")
-	}
+		logger.WithField("forkDigest", fmt.Sprintf("%#x", forkDigest)).Debug("added eth2 field to CL shim ENR")
 
-	// Set sequence number to 1
-	record.SetSeq(1)
+		record.SetSeq(1)
+		if err := record.Sign(privKey); err != nil {
+			return fmt.Errorf("failed to sign CL ENR: %w", err)
+		}
 
-	// Sign the record
-	if err := record.Sign(privKey); err != nil {
-		return fmt.Errorf("failed to sign ENR: %w", err)
-	}
-
-	// Get the ENR string using proper base64 encoding
-	enrString, err := record.EncodeBase64()
-	if err != nil {
-		return fmt.Errorf("failed to encode ENR: %w", err)
+		var err error
+		clENRString, err = record.EncodeBase64()
+		if err != nil {
+			return fmt.Errorf("failed to encode CL ENR: %w", err)
+		}
 	}
 
 	logger.Info("Running in devnet shim mode")
 	logger.Infof("Private key: %s...%s", privateKeyHex[:10], privateKeyHex[len(privateKeyHex)-6:])
 	logger.Infof("Node ID: %s", nodeID.Hex())
 	logger.Infof("Enode: %s", enode)
-	logger.Infof("ENR: %s", enrString)
-	logger.Infof("Shim endpoint: %s", shimEndpoint)
+	if elENRString != "" {
+		logger.Infof("EL ENR: %s", elENRString)
+	}
+	if clENRString != "" {
+		logger.Infof("CL ENR: %s", clENRString)
+	}
+	logger.Infof("Shim IP: %s (EL port: %d, CL port: %d)", shimIP, elBindPort, clBindPort)
 
 	// Output to stdout for easy capture
 	fmt.Println("=== BOOTNODE INFO ===")
 	fmt.Printf("ENODE=%s\n", enode)
-	fmt.Printf("ENR=%s\n", enrString)
+	if elENRString != "" {
+		fmt.Printf("EL_ENR=%s\n", elENRString)
+	}
+	if clENRString != "" {
+		fmt.Printf("CL_ENR=%s\n", clENRString)
+	}
 	fmt.Printf("NODE_ID=%s\n", nodeID.Hex())
 	fmt.Printf("PRIVKEY=%s\n", privateKeyHex)
 	fmt.Println("=== END ===")
@@ -682,15 +677,28 @@ func runDevnetShim(
 		fmt.Fprintf(w, "%s", enode)
 	})
 
+	// /enr returns EL ENR for backward compat
 	http.HandleFunc("/enr", func(w http.ResponseWriter, r *http.Request) {
-		logger.Infof("Serving ENR to %s", r.RemoteAddr)
+		logger.Infof("Serving EL ENR to %s", r.RemoteAddr)
 		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "%s", enrString)
+		fmt.Fprintf(w, "%s", elENRString)
+	})
+
+	http.HandleFunc("/el-enr", func(w http.ResponseWriter, r *http.Request) {
+		logger.Infof("Serving EL ENR to %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", elENRString)
+	})
+
+	http.HandleFunc("/cl-enr", func(w http.ResponseWriter, r *http.Request) {
+		logger.Infof("Serving CL ENR to %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", clENRString)
 	})
 
 	http.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"enode":"%s","enr":"%s","node_id":"%s","privkey":"%s"}`, enode, enrString, nodeID.Hex(), privateKeyHex)
+		fmt.Fprintf(w, `{"enode":"%s","el_enr":"%s","cl_enr":"%s","node_id":"%s","privkey":"%s"}`, enode, elENRString, clENRString, nodeID.Hex(), privateKeyHex)
 	})
 
 	// Start HTTP server in background
