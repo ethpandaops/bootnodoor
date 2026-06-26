@@ -157,23 +157,22 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(localENR))
 }
 
-// Enode serves the local enode URL. enode:// is EL/discv4-only, so it always
-// reflects the primary (EL) identity; CL peers use /enr?layer=cl.
+// Enode serves the local enode URL. enode:// is EL/discv4-only, so it reflects
+// the EL identity; a CL-only bootnode has no enode (CL peers use the ENR).
 func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.bootnodeService.LocalNode()
-
-	// Get TCP port from ENR, fallback to UDP port if not available
-	tcpPort := localNode.TCPPort()
-	if tcpPort == 0 {
-		tcpPort = localNode.UDPPort()
+	localNode := fh.bootnodeService.ELLocalNode()
+	if localNode == nil {
+		http.Error(w, "no enode: this bootnode serves CL only (use /enr)", http.StatusNotFound)
+		return
 	}
 
-	// Create enode from local node info
+	// enode carries the discovery (UDP) port; the bootnode serves no TCP.
+	port := localNode.UDPPort()
 	localEnode := &enode.Enode{
 		PublicKey: localNode.PublicKey(),
 		IP:        localNode.IP(),
-		TCP:       tcpPort,
-		UDP:       localNode.UDPPort(),
+		TCP:       port,
+		UDP:       port,
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
@@ -223,8 +222,11 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		localENR = "" // Fallback to empty string on error
 	}
 
-	// Derive Enode from ENR
-	localEnode := deriveEnodeFromENR(localNode.Record())
+	// enode:// is EL/discv4-only; a CL-only bootnode has none.
+	localEnode := ""
+	if el := fh.bootnodeService.ELLocalNode(); el != nil {
+		localEnode = deriveEnodeFromENR(el.Record())
+	}
 
 	// Get PeerID
 	peerID := localNode.ID().String()

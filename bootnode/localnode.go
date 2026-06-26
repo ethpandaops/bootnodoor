@@ -24,14 +24,31 @@ func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, e
 		}
 	}
 
-	if localENR == nil {
+	switch {
+	case localENR == nil:
 		localENR, err = buildENR(key, enrIP, enrIP6, enrPort)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build ENR: %w", err)
 		}
-	} else if enrPort > 0 && localENR.UDP() != enrPort {
-		// A stored ENR keeps its IP (preserving any IP-discovery result) but config
-		// is authoritative for the port, so a port change takes effect on restart.
+
+	case !cfg.EnableIPDiscovery:
+		// With IP discovery off there is no learned address to preserve, so config
+		// is the single source of truth for the advertised endpoint: rebuild from
+		// it (carrying the stored sequence forward) so a changed --enr-ip/--enr-ip6
+		// or port takes effect on restart with a persistent node database.
+		seq := localENR.Seq()
+		localENR, err = buildENR(key, enrIP, enrIP6, enrPort)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build ENR: %w", err)
+		}
+		localENR.SetSeq(seq)
+		if err := localENR.Sign(key); err != nil {
+			return nil, fmt.Errorf("failed to re-sign ENR: %w", err)
+		}
+
+	case enrPort > 0 && localENR.UDP() != enrPort:
+		// IP discovery is on, so the stored IP may be a learned external address
+		// worth keeping; config still wins on the port.
 		localENR.Set("udp", enrPort)
 		if localENR.IP6() != nil {
 			localENR.Set("udp6", enrPort)

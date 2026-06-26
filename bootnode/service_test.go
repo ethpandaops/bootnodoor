@@ -380,3 +380,38 @@ func TestBuildENR_NoIPv6OmitsV6Fields(t *testing.T) {
 		t.Errorf("udp6 = %d, want absent for a v4-only node", rec.UDP6())
 	}
 }
+
+// With IP discovery off, a changed advertised IP in config must take effect on
+// restart even when a matching ENR is already persisted.
+func TestCreateLocalNode_DiscoveryOffConfigIPWins(t *testing.T) {
+	key := mustKey(t)
+	stored := storedENRWith(t, key, nil) // advertises 1.2.3.4
+	cfg := &Config{Logger: quietLogger(), EnableIPDiscovery: false}
+
+	ln, err := createLocalNode(cfg, key, net.ParseIP("5.6.7.8"), net.ParseIP("2001:db8::9"), 9000, stored)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("5.6.7.8")) {
+		t.Errorf("discovery off: ENR ip = %v, want config 5.6.7.8", ip)
+	}
+	if ip6 := ln.Record().IP6(); ip6 == nil || !ip6.Equal(net.ParseIP("2001:db8::9")) {
+		t.Errorf("discovery off: ENR ip6 = %v, want config 2001:db8::9", ip6)
+	}
+}
+
+// With IP discovery on, the stored (possibly learned) IP is preserved over a
+// config value so a restart doesn't clobber a discovered external address.
+func TestCreateLocalNode_DiscoveryOnPreservesStoredIP(t *testing.T) {
+	key := mustKey(t)
+	stored := storedENRWith(t, key, nil) // advertises 1.2.3.4
+	cfg := &Config{Logger: quietLogger(), EnableIPDiscovery: true}
+
+	ln, err := createLocalNode(cfg, key, net.ParseIP("5.6.7.8"), nil, 9000, stored)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("1.2.3.4")) {
+		t.Errorf("discovery on: ENR ip = %v, want preserved 1.2.3.4", ip)
+	}
+}
