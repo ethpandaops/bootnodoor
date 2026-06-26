@@ -102,9 +102,6 @@ Consensus Layer (CL) clients, with support for:
 )
 
 func init() {
-	// Private key. --private-key is the shared key used for both layers; supply
-	// --el-private-key and/or --cl-private-key to give the EL and CL identities
-	// distinct keys (e.g. when migrating from separate EL and CL bootnodes).
 	rootCmd.Flags().StringVar(&privateKeyHex, "private-key", "", "Private key in hex format (shared fallback for both layers)")
 	rootCmd.Flags().StringVar(&elPrivateKeyHex, "el-private-key", "", "Private key for the EL identity (hex or file; falls back to --private-key)")
 	rootCmd.Flags().StringVar(&clPrivateKeyHex, "cl-private-key", "", "Private key for the CL identity (hex or file; falls back to --private-key)")
@@ -129,9 +126,7 @@ func init() {
 	rootCmd.Flags().StringVar(&bindAddr, "bind-addr", "0.0.0.0", "IP address to bind to")
 	rootCmd.Flags().IntVar(&bindPort, "bind-port", 9000, "UDP port to bind to")
 
-	// Per-layer port overrides. When the EL and CL identities use different keys,
-	// these let each keep its legacy port (e.g. EL on 30303, CL on 9000) so peers
-	// that hardcoded the old bootnode endpoints stay connected.
+	// Per-layer port overrides, so a migrated EL/CL identity can keep its legacy port.
 	rootCmd.Flags().IntVar(&elBindPort, "el-port", 0, "UDP port for the EL identity (0 = use --bind-port)")
 	rootCmd.Flags().IntVar(&clBindPort, "cl-port", 0, "UDP port for the CL identity (0 = use --bind-port)")
 	rootCmd.Flags().IntVar(&elEnrPort, "el-enr-port", 0, "UDP port the EL identity advertises in its ENR (0 = use --el-port)")
@@ -185,9 +180,8 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Parse private keys (each supports hex or file path). The shared key is
-	// optional when per-layer keys cover every enabled layer; bootnode.New
-	// validates that each enabled layer ends up with a key.
+	// The shared key is optional when per-layer keys cover every enabled layer;
+	// bootnode.New validates that each enabled layer ends up with a key.
 	var privKey, elKey, clKey *ecdsa.PrivateKey
 	if privateKeyHex != "" {
 		if privKey, err = parsePrivateKey(privateKeyHex); err != nil {
@@ -540,8 +534,6 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create bootnode service: %w", err)
 	}
 
-	// Print node information, per identity. When the EL and CL identities use
-	// distinct keys they have distinct node IDs/ENRs, so log them separately.
 	if service.HasSeparateIdentities() {
 		logIdentity(logger, "EL", service.ELLocalNode())
 		logIdentity(logger, "CL", service.CLLocalNode())
@@ -597,8 +589,8 @@ func startWebUI(service *bootnode.Service) {
 	webui.StartHttpServer(config, logger, service)
 }
 
-// logIdentity prints one identity's node ID, enode URL and ENR. The layer label
-// is empty for a single shared identity and "EL"/"CL" for separate identities.
+// logIdentity prints one identity's node ID, enode URL and ENR. layer is "" for
+// a single shared identity, "EL"/"CL" for separate identities.
 func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
 	if n == nil {
 		return

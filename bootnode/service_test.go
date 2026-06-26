@@ -6,9 +6,85 @@ import (
 	"testing"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/sirupsen/logrus"
 )
+
+func quietLogger() *logrus.Logger {
+	l := logrus.New()
+	l.SetLevel(logrus.PanicLevel)
+	return l
+}
+
+// storedENRWith builds a signed ENR carrying the given extra fields, simulating
+// a record persisted by an earlier (e.g. shared single-key) deployment.
+func storedENRWith(t *testing.T, key *ecdsa.PrivateKey, fields map[string][]byte) *enr.Record {
+	t.Helper()
+	rec, err := buildENR(key, net.ParseIP("1.2.3.4"), nil, 9000)
+	if err != nil {
+		t.Fatalf("buildENR: %v", err)
+	}
+	for k, v := range fields {
+		_ = rec.Set(k, v)
+	}
+	rec.SetSeq(rec.Seq() + 1)
+	if err := rec.Sign(key); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return rec
+}
+
+// A reused shared ENR carries both eth and eth2; an EL-only identity must drop
+// the inherited eth2 so peers don't classify it as serving CL.
+func TestUpdateENR_ELOnlyDropsInheritedEth2(t *testing.T) {
+	cfg := &Config{Logger: quietLogger(), ELConfig: &elconfig.ChainConfig{}, ELGenesisHash: [32]byte{1, 2, 3}, ELGenesisTime: 1000}
+	key := mustKey(t)
+	stored := storedENRWith(t, key, map[string][]byte{"eth2": {0xaa, 0xbb, 0xcc, 0xdd}})
+	ln, err := createLocalNode(cfg, key, net.ParseIP("1.2.3.4"), nil, 9000, stored)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+
+	if err := NewENRManager(cfg, key, ln, true, false).UpdateENR(0, 0); err != nil {
+		t.Fatalf("UpdateENR: %v", err)
+	}
+
+	rec := ln.Record()
+	if _, ok := rec.Eth(); !ok {
+		t.Error("EL identity should advertise eth")
+	}
+	var eth2 []byte
+	if err := rec.Get("eth2", &eth2); err == nil {
+		t.Error("EL-only identity should not advertise eth2")
+	}
+}
+
+// An identity that serves neither layer (no chain config) must drop both fields
+// inherited from a reused record — covering the eth-removal branch.
+func TestUpdateENR_DropsUnservedFields(t *testing.T) {
+	cfg := &Config{Logger: quietLogger()}
+	key := mustKey(t)
+	stored := storedENRWith(t, key, map[string][]byte{"eth": {0x01, 0x02, 0x03, 0x04}, "eth2": {0xaa, 0xbb, 0xcc, 0xdd}})
+	ln, err := createLocalNode(cfg, key, net.ParseIP("1.2.3.4"), nil, 9000, stored)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+
+	if err := NewENRManager(cfg, key, ln, false, false).UpdateENR(0, 0); err != nil {
+		t.Fatalf("UpdateENR: %v", err)
+	}
+
+	rec := ln.Record()
+	var v []byte
+	if err := rec.Get("eth", &v); err == nil {
+		t.Error("unserved eth field should be removed")
+	}
+	if err := rec.Get("eth2", &v); err == nil {
+		t.Error("unserved eth2 field should be removed")
+	}
+}
 
 // newTestService builds a minimal Service with the given identities and an
 // in-memory database, enough to exercise updateENRWithDiscoveredIP.

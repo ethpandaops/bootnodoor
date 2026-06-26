@@ -33,7 +33,7 @@ type OverviewPageData struct {
 	LocalENRSeq    uint64
 
 	// Per-identity records, populated when EL and CL use distinct keys. CL has no
-	// enode field: enode:// is an EL/discv4 construct, CL peers consume the ENR.
+	// enode field: enode:// is EL/discv4-only.
 	SeparateIdentities bool
 	ELLocalENR         string
 	ELLocalEnode       string
@@ -151,9 +151,8 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(localENR))
 }
 
-// Enode serves the local enode URL as plain text. enode:// is a discv4/EL
-// construct, so this always reflects the primary (EL) identity; CL peers use
-// the ENR (see /enr?layer=cl).
+// Enode serves the local enode URL. enode:// is EL/discv4-only, so it always
+// reflects the primary (EL) identity; CL peers use /enr?layer=cl.
 func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
 	localNode := fh.bootnodeService.LocalNode()
 
@@ -241,7 +240,6 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		LocalENRSeq: localNode.Record().Seq(),
 	}
 
-	// When EL and CL run under distinct keys, expose each identity's record.
 	if fh.bootnodeService.HasSeparateIdentities() {
 		pageData.SeparateIdentities = true
 		if elNode := fh.bootnodeService.ELLocalNode(); elNode != nil {

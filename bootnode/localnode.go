@@ -10,14 +10,11 @@ import (
 )
 
 // createLocalNode creates a local node with ENR for one identity.
-//
-// The ENR will be updated with eth/eth2 fields later by the ENRManager.
 func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, enrPort uint16, storedENR *enr.Record) (*v5node.Node, error) {
 	var localENR *enr.Record
 	var err error
 
 	if storedENR != nil {
-		// Use stored ENR as baseline, but verify it matches this identity's key
 		pubKey := storedENR.PublicKey()
 		if pubKey != nil && pubKey.Equal(&key.PublicKey) {
 			localENR = storedENR
@@ -27,17 +24,14 @@ func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, e
 		}
 	}
 
-	// Create new ENR if we don't have a valid one
 	if localENR == nil {
 		localENR, err = buildENR(key, enrIP, enrIP6, enrPort)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build ENR: %w", err)
 		}
 	} else if enrPort > 0 && localENR.UDP() != enrPort {
-		// A stored ENR is authoritative for its IP (preserving any address learned
-		// via IP discovery) but config is authoritative for the advertised port, so
-		// a changed --*-port/--*-enr-port takes effect on restart with a persistent
-		// node database instead of advertising the stale stored port.
+		// A stored ENR keeps its IP (preserving any IP-discovery result) but config
+		// is authoritative for the port, so a port change takes effect on restart.
 		localENR.Set("udp", enrPort)
 		localENR.Set("tcp", enrPort)
 		localENR.SetSeq(localENR.Seq() + 1)

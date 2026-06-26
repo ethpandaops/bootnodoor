@@ -133,7 +133,6 @@ func New(cfg *Config) (*Service, error) {
 		id.transport = transports[id.bindPort]
 	}
 
-	// Build the local node and ENR manager for each identity.
 	for _, id := range s.identities {
 		storedENR, lerr := s.loadStoredENR(id.storeKey)
 		if lerr != nil {
@@ -159,8 +158,7 @@ func New(cfg *Config) (*Service, error) {
 		}
 	}
 
-	// Primary identity aliases (EL if present, else the sole identity) for the
-	// code paths that operate on a single representative local node/ENR.
+	// Aliases for the code paths that operate on a single representative identity.
 	primary := s.primaryIdentity()
 	s.localNode = primary.localNode
 	s.enrManager = primary.enrManager
@@ -171,7 +169,6 @@ func New(cfg *Config) (*Service, error) {
 		MinDistinctIPs: 3, // From at least 3 distinct IPs
 		Logger:         cfg.Logger,
 		OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
-			// Update every identity's ENR with the discovered IP
 			s.updateENRWithDiscoveredIP(ip, port, isIPv6)
 		},
 	}
@@ -375,8 +372,7 @@ func (s *Service) initDiscv5(id *identity) error {
 	discv5Config.MaxSessions = s.config.MaxSessions
 	discv5Config.Logger = s.config.Logger
 
-	// Set callbacks. FINDNODE is scoped to the layers this identity serves so the
-	// EL identity only answers with EL nodes and the CL identity only with CL nodes.
+	// FINDNODE is scoped to the layers this identity serves.
 	discv5Config.OnHandshakeComplete = s.onHandshakeComplete
 	discv5Config.OnNodeUpdate = s.onNodeUpdate
 	discv5Config.OnNodeSeen = s.onNodeSeen
@@ -452,7 +448,6 @@ func (s *Service) createTable(localID [32]byte, nodeDB *nodes.NodeDB, layerName 
 	return table, nil
 }
 
-// elIdentity returns the identity serving the EL layer (nil if EL disabled).
 func (s *Service) elIdentity() *identity {
 	for _, id := range s.identities {
 		if id.servesEL {
@@ -462,7 +457,6 @@ func (s *Service) elIdentity() *identity {
 	return nil
 }
 
-// clIdentity returns the identity serving the CL layer (nil if CL disabled).
 func (s *Service) clIdentity() *identity {
 	for _, id := range s.identities {
 		if id.servesCL {
@@ -472,9 +466,8 @@ func (s *Service) clIdentity() *identity {
 	return nil
 }
 
-// singleSocket reports whether every identity binds the same UDP port, i.e.
-// they share one socket. When true, an externally-observed port from IP
-// discovery is unambiguous and can be advertised by all identities.
+// singleSocket reports whether every identity shares one socket, in which case
+// an externally-observed port from IP discovery is unambiguous.
 func (s *Service) singleSocket() bool {
 	for _, id := range s.identities {
 		if id.bindPort != s.identities[0].bindPort {
@@ -484,8 +477,7 @@ func (s *Service) singleSocket() bool {
 	return true
 }
 
-// primaryIdentity returns the representative identity: EL if present, else the
-// sole identity. Used for the single-local-node code paths and accessors.
+// primaryIdentity returns the representative identity: EL if present, else CL.
 func (s *Service) primaryIdentity() *identity {
 	if id := s.elIdentity(); id != nil {
 		return id
@@ -493,7 +485,6 @@ func (s *Service) primaryIdentity() *identity {
 	return s.clIdentity()
 }
 
-// elPing returns the ping service bound to the EL identity (nil if EL disabled).
 func (s *Service) elPing() *services.PingService {
 	if id := s.elIdentity(); id != nil {
 		return id.pingService
@@ -501,7 +492,6 @@ func (s *Service) elPing() *services.PingService {
 	return nil
 }
 
-// clPing returns the ping service bound to the CL identity (nil if CL disabled).
 func (s *Service) clPing() *services.PingService {
 	if id := s.clIdentity(); id != nil {
 		return id.pingService
@@ -1064,19 +1054,16 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 }
 
 func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNode *v5node.Node, requester *net.UDPAddr) []*v5node.Node {
-	// Serve nodes by distance relative to the node ID this identity advertises —
-	// the peer computed msg.Distances against the ID it dialed.
+	// Distances are relative to the node ID the peer dialed.
 	var allNodes []*nodes.Node
 	localID := id.localNode.ID()
 
 	serveEL := id.servesEL
 	serveCL := id.servesCL
 
-	// A shared identity answers both layers under one ID, so classify a known
-	// requester by its ENR and serve only the table(s) it belongs to (preserving
-	// single-key behavior: an unclassifiable known peer gets nothing). Separate
-	// EL/CL identities are already layer-scoped by which ID was dialed; an unknown
-	// requester (no ENR yet) falls through and is served both.
+	// A shared identity serves both layers under one ID, so classify a known
+	// requester by its ENR and serve only its layer(s); an unclassifiable known
+	// peer gets nothing, an unknown one (no ENR yet) falls through to both.
 	if id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
 		serveEL, _ = s.enrManager.FilterELNode(sourceRecord)
@@ -1416,16 +1403,13 @@ func (s *Service) onPongReceived(remoteID []byte, sourceIP net.IP, reportedIP ne
 	s.ipDiscovery.ReportIP(reportedIP, reportedPort, reporterIDStr, sourceIP)
 }
 
-// updateENRWithDiscoveredIP updates every identity's ENR with the discovered
-// external IP. Each identity keeps its own advertised port.
+// updateENRWithDiscoveredIP updates every identity's ENR with the discovered IP.
 func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// The discovered port is the external mapping of the socket the PONGs came
-	// through. It is only unambiguous when every identity shares one socket
-	// (the default dual-key path); with identities on separate bind ports it
-	// can't be attributed to a layer, so each keeps its configured port.
+	// The discovered port can only be attributed to a layer when all identities
+	// share one socket; otherwise each keeps its configured port.
 	sharedSocket := s.singleSocket()
 
 	for _, id := range s.identities {
@@ -1438,7 +1422,6 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 			advPort = port
 		}
 
-		// Skip if this identity already advertises the discovered address.
 		current := id.localNode.Record()
 		var err error
 		if isIPv6 {

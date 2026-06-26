@@ -12,15 +12,13 @@ import (
 	"github.com/ethpandaops/bootnodoor/transport"
 )
 
-// localENRKey is the db state key under which the primary identity's ENR is
-// persisted. Kept stable for backward compatibility with single-key deployments.
+// localENRKey is the db state key for the primary identity's ENR, kept stable
+// for backward compatibility with single-key deployments.
 const localENRKey = "local_enr"
 
-// identity is one local discovery persona: a key, the ENR/node advertised under
-// its node ID, the discv5 service that answers for it, and the transport it
-// listens on. A single-key bootnode has one identity that serves both layers;
-// supplying separate EL and CL keys yields two identities so operators can keep
-// the distinct node IDs their existing EL and CL bootnodes already advertise.
+// identity is one local discovery persona. A single-key bootnode has one
+// identity serving both layers; separate EL and CL keys yield two, letting
+// operators keep the distinct node IDs their existing bootnodes advertise.
 type identity struct {
 	key      *ecdsa.PrivateKey
 	servesEL bool
@@ -30,7 +28,7 @@ type identity struct {
 	enrIP6   net.IP
 	bindPort uint16
 	enrPort  uint16
-	storeKey string // db state key for the persisted ENR
+	storeKey string
 
 	localNode     *v5node.Node
 	enrManager    *ENRManager
@@ -39,10 +37,8 @@ type identity struct {
 	pingService   *services.PingService
 }
 
-// resolveIdentities turns the (possibly per-layer) key/port config into the set
-// of identities to run. EL and CL collapse into a single shared identity when
-// they share a key (a key uniquely determines the node ID, so the same key is
-// always one identity; Validate rejects same-key-different-port configs).
+// resolveIdentities collapses EL and CL into one identity when they share a key
+// (a key uniquely determines the node ID; Validate rejects same-key-different-port).
 func resolveIdentities(cfg *Config) []*identity {
 	elKey, clKey := cfg.elKey(), cfg.clKey()
 
@@ -68,7 +64,6 @@ func resolveIdentities(cfg *Config) []*identity {
 	return ids
 }
 
-// newIdentity builds an identity, filling the advertised IPs from the shared config.
 func newIdentity(cfg *Config, key *ecdsa.PrivateKey, servesEL, servesCL bool, bindPort, enrPort uint16, storeKey string) *identity {
 	return &identity{
 		key:      key,

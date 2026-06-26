@@ -154,6 +154,17 @@ func (r *Record) Set(key string, value interface{}) error {
 	return nil
 }
 
+// Delete removes a key from the record, if present.
+func (r *Record) Delete(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.pairs[key]; ok {
+		delete(r.pairs, key)
+		r.raw = nil // Invalidate cached encoding
+	}
+}
+
 // Get retrieves a value from the record by key.
 //
 // The value is decoded into the provided destination pointer.

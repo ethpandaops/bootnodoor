@@ -13,19 +13,15 @@ import (
 
 // ENRManager handles ENR creation and updates for a single identity.
 //
-// The fork filters (elFilter/clFilter) are always built for whatever layers the
-// chain config enables, so any manager can classify a remote node as EL or CL.
-// The eth/eth2 fields written into this manager's own record, however, are gated
-// by servesEL/servesCL: an EL-only identity advertises only eth, a CL-only identity
-// only eth2, and a shared identity advertises both.
+// The fork filters are always built for whatever layers the chain config enables
+// (so any manager can classify a remote node), but the eth/eth2 fields written
+// into this manager's own record are gated by servesEL/servesCL.
 type ENRManager struct {
 	// config is the bootnode configuration
 	config *Config
 
-	// key signs this identity's ENR records
 	key *ecdsa.PrivateKey
 
-	// servesEL/servesCL control which fork fields this identity advertises
 	servesEL bool
 	servesCL bool
 
@@ -82,7 +78,6 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 		return fmt.Errorf("failed to clone ENR: %w", err)
 	}
 
-	// Add EL 'eth' field if this identity serves EL
 	if m.servesEL && m.config.HasEL() {
 		forkID := m.elFilter.GetCurrentForkID(currentBlock, currentTime)
 		// Set eth field as a list of fork IDs - ENR.Set() will handle RLP encoding
@@ -99,9 +94,11 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 		newRecord.Set("eth", ethField)
 
 		m.config.Logger.WithField("forkID", forkID.String()).Debug("updated ENR with eth field")
+	} else {
+		// Drop any stale eth field (e.g. inherited from a reused shared ENR).
+		newRecord.Delete("eth")
 	}
 
-	// Add CL 'eth2' field if this identity serves CL
 	if m.servesCL && m.config.HasCL() {
 		eth2Field := m.clFilter.ComputeEth2Field()
 		newRecord.Set("eth2", eth2Field)
@@ -112,6 +109,8 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 			copy(forkDigest[:], eth2Field[0:4])
 		}
 		m.config.Logger.WithField("forkDigest", fmt.Sprintf("%#x", forkDigest)).Debug("updated ENR with eth2 field")
+	} else {
+		newRecord.Delete("eth2")
 	}
 
 	// Increment sequence number
