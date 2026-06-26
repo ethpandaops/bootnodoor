@@ -287,6 +287,17 @@ func (r *Record) UDP() uint16 {
 	return 0
 }
 
+// UDP6 returns the IPv6 UDP port from the record.
+//
+// Returns 0 if no "udp6" key is present or if the value is not a valid port.
+func (r *Record) UDP6() uint16 {
+	var port uint16
+	if err := r.Get("udp6", &port); err == nil {
+		return port
+	}
+	return 0
+}
+
 // TCP returns the TCP port from the record.
 //
 // Returns 0 if no "tcp" key is present or if the value is not a valid port.

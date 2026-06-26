@@ -1060,17 +1060,15 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	serveEL := id.servesEL
 	serveCL := id.servesCL
 
-	// A shared identity answers both layers under one ID, so classify the requester
-	// by its ENR and narrow to the matching table (preserving single-key behavior).
-	// Separate EL/CL identities are already layer-scoped by which ID was dialed.
+	// A shared identity answers both layers under one ID, so classify a known
+	// requester by its ENR and serve only the table(s) it belongs to (preserving
+	// single-key behavior: an unclassifiable known peer gets nothing). Separate
+	// EL/CL identities are already layer-scoped by which ID was dialed; an unknown
+	// requester (no ENR yet) falls through and is served both.
 	if id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
-		isEL, _ := s.enrManager.FilterELNode(sourceRecord)
-		isCL := s.enrManager.FilterCLNode(sourceRecord)
-		if isEL || isCL {
-			serveEL = isEL
-			serveCL = isCL
-		}
+		serveEL, _ = s.enrManager.FilterELNode(sourceRecord)
+		serveCL = s.enrManager.FilterCLNode(sourceRecord)
 	}
 
 	if serveEL && s.elTable != nil {
@@ -1436,7 +1434,7 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 		current := id.localNode.Record()
 		var err error
 		if isIPv6 {
-			if curIP := current.IP6(); curIP != nil && curIP.Equal(ip) {
+			if curIP := current.IP6(); curIP != nil && curIP.Equal(ip) && current.UDP6() == advPort {
 				continue
 			}
 			err = id.enrManager.UpdateENRWithIP6(ip, advPort)

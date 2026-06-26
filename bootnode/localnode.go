@@ -33,6 +33,18 @@ func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, e
 		if err != nil {
 			return nil, fmt.Errorf("failed to build ENR: %w", err)
 		}
+	} else if enrPort > 0 && localENR.UDP() != enrPort {
+		// A stored ENR is authoritative for its IP (preserving any address learned
+		// via IP discovery) but config is authoritative for the advertised port, so
+		// a changed --*-port/--*-enr-port takes effect on restart with a persistent
+		// node database instead of advertising the stale stored port.
+		localENR.Set("udp", enrPort)
+		localENR.Set("tcp", enrPort)
+		localENR.SetSeq(localENR.Seq() + 1)
+		if err := localENR.Sign(key); err != nil {
+			return nil, fmt.Errorf("failed to re-sign ENR after port change: %w", err)
+		}
+		cfg.Logger.WithField("udp", enrPort).Info("updated stored ENR port from config")
 	}
 
 	// Create node from ENR
