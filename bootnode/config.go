@@ -45,6 +45,13 @@ type Config struct {
 	// ENRIP6 is the IPv6 address to advertise in ENR (optional)
 	ENRIP6 net.IP
 
+	// ENRIPProvided/ENRIP6Provided record whether the advertised IP was explicitly
+	// configured (vs auto-detected). An explicit address is authoritative and
+	// overrides a stored ENR on restart; an auto-detected one does not, so a
+	// learned/discovered address survives.
+	ENRIPProvided  bool
+	ENRIP6Provided bool
+
 	// ENRPort is the UDP port to advertise in ENR (default: same as BindPort)
 	ENRPort uint16
 

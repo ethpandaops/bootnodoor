@@ -507,6 +507,8 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.CLENRPort = uint16(clEnrPort)
 	config.ENRIP = enrIPv4
 	config.ENRIP6 = enrIPv6
+	config.ENRIPProvided = enrIP != ""
+	config.ENRIP6Provided = enrIP6 != ""
 	config.ENRPort = enrUDPPort
 	config.EnableDiscv4 = enableDiscv4
 	config.EnableDiscv5 = enableDiscv5

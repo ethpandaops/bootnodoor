@@ -381,37 +381,41 @@ func TestBuildENR_NoIPv6OmitsV6Fields(t *testing.T) {
 	}
 }
 
-// With IP discovery off, a changed advertised IP in config must take effect on
-// restart even when a matching ENR is already persisted.
-func TestCreateLocalNode_DiscoveryOffConfigIPWins(t *testing.T) {
+// An explicitly-configured --enr-ip/--enr-ip6 must take effect on restart even
+// when a matching ENR is already persisted (and must add a missing v6 endpoint).
+func TestCreateLocalNode_ExplicitIPWins(t *testing.T) {
 	key := mustKey(t)
-	stored := storedENRWith(t, key, nil) // advertises 1.2.3.4
-	cfg := &Config{Logger: quietLogger(), EnableIPDiscovery: false}
+	stored := storedENRWith(t, key, nil) // advertises 1.2.3.4, no ip6
+	cfg := &Config{Logger: quietLogger(), ENRIPProvided: true, ENRIP6Provided: true}
 
 	ln, err := createLocalNode(cfg, key, net.ParseIP("5.6.7.8"), net.ParseIP("2001:db8::9"), 9000, stored)
 	if err != nil {
 		t.Fatalf("createLocalNode: %v", err)
 	}
-	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("5.6.7.8")) {
-		t.Errorf("discovery off: ENR ip = %v, want config 5.6.7.8", ip)
+	rec := ln.Record()
+	if ip := rec.IP(); ip == nil || !ip.Equal(net.ParseIP("5.6.7.8")) {
+		t.Errorf("ENR ip = %v, want explicit 5.6.7.8", ip)
 	}
-	if ip6 := ln.Record().IP6(); ip6 == nil || !ip6.Equal(net.ParseIP("2001:db8::9")) {
-		t.Errorf("discovery off: ENR ip6 = %v, want config 2001:db8::9", ip6)
+	if ip6 := rec.IP6(); ip6 == nil || !ip6.Equal(net.ParseIP("2001:db8::9")) {
+		t.Errorf("ENR ip6 = %v, want explicit 2001:db8::9", ip6)
+	}
+	if rec.UDP6() != 9000 { // adding ip6 must add a usable udp6 too
+		t.Errorf("ENR udp6 = %d, want 9000", rec.UDP6())
 	}
 }
 
-// With IP discovery on, the stored (possibly learned) IP is preserved over a
-// config value so a restart doesn't clobber a discovered external address.
-func TestCreateLocalNode_DiscoveryOnPreservesStoredIP(t *testing.T) {
+// An auto-detected (not explicitly configured) IP must not override the stored
+// address, so a learned/discovered external IP survives a restart.
+func TestCreateLocalNode_AutoDetectedIPPreservesStored(t *testing.T) {
 	key := mustKey(t)
 	stored := storedENRWith(t, key, nil) // advertises 1.2.3.4
-	cfg := &Config{Logger: quietLogger(), EnableIPDiscovery: true}
+	cfg := &Config{Logger: quietLogger(), ENRIPProvided: false}
 
 	ln, err := createLocalNode(cfg, key, net.ParseIP("5.6.7.8"), nil, 9000, stored)
 	if err != nil {
 		t.Fatalf("createLocalNode: %v", err)
 	}
 	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("1.2.3.4")) {
-		t.Errorf("discovery on: ENR ip = %v, want preserved 1.2.3.4", ip)
+		t.Errorf("ENR ip = %v, want preserved 1.2.3.4", ip)
 	}
 }

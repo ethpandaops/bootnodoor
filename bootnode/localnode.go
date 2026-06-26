@@ -24,40 +24,18 @@ func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, e
 		}
 	}
 
-	switch {
-	case localENR == nil:
+	if localENR == nil {
 		localENR, err = buildENR(key, enrIP, enrIP6, enrPort)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build ENR: %w", err)
 		}
-
-	case !cfg.EnableIPDiscovery:
-		// With IP discovery off there is no learned address to preserve, so config
-		// is the single source of truth for the advertised endpoint: rebuild from
-		// it (carrying the stored sequence forward) so a changed --enr-ip/--enr-ip6
-		// or port takes effect on restart with a persistent node database.
-		seq := localENR.Seq()
-		localENR, err = buildENR(key, enrIP, enrIP6, enrPort)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build ENR: %w", err)
-		}
-		localENR.SetSeq(seq)
+	} else if reconcileStoredENR(cfg, localENR, enrIP, enrIP6, enrPort) {
+		// An explicitly-configured field (or the port) changed, so the record was
+		// updated; bump the sequence and re-sign so peers pick it up.
+		localENR.SetSeq(localENR.Seq() + 1)
 		if err := localENR.Sign(key); err != nil {
 			return nil, fmt.Errorf("failed to re-sign ENR: %w", err)
 		}
-
-	case enrPort > 0 && localENR.UDP() != enrPort:
-		// IP discovery is on, so the stored IP may be a learned external address
-		// worth keeping; config still wins on the port.
-		localENR.Set("udp", enrPort)
-		if localENR.IP6() != nil {
-			localENR.Set("udp6", enrPort)
-		}
-		localENR.SetSeq(localENR.Seq() + 1)
-		if err := localENR.Sign(key); err != nil {
-			return nil, fmt.Errorf("failed to re-sign ENR after port change: %w", err)
-		}
-		cfg.Logger.WithField("udp", enrPort).Info("updated stored ENR port from config")
 	}
 
 	// Create node from ENR
@@ -69,6 +47,40 @@ func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, e
 	cfg.Logger.WithField("nodeID", node.ID().String()[:16]+"...").Info("created local node")
 
 	return node, nil
+}
+
+// reconcileStoredENR applies authoritative config to a reused stored ENR:
+// explicitly-configured advertised IPs override the stored value and the port is
+// always config-authoritative, so a changed --enr-ip/--enr-ip6/port takes effect
+// on restart. An auto-detected IP is left untouched so an address learned via IP
+// discovery survives. Reports whether the record changed.
+func reconcileStoredENR(cfg *Config, rec *enr.Record, enrIP, enrIP6 net.IP, enrPort uint16) bool {
+	changed := false
+
+	if cfg.ENRIPProvided && enrIP != nil {
+		if cur := rec.IP(); cur == nil || !cur.Equal(enrIP) {
+			rec.Set("ip", enrIP.To4())
+			changed = true
+		}
+	}
+	if cfg.ENRIP6Provided && enrIP6 != nil {
+		if cur := rec.IP6(); cur == nil || !cur.Equal(enrIP6) {
+			rec.Set("ip6", enrIP6.To16())
+			changed = true
+		}
+	}
+
+	// A udp/udp6 port is only meaningful alongside the matching IP family.
+	if enrPort > 0 && rec.IP() != nil && rec.UDP() != enrPort {
+		rec.Set("udp", enrPort)
+		changed = true
+	}
+	if enrPort > 0 && rec.IP6() != nil && rec.UDP6() != enrPort {
+		rec.Set("udp6", enrPort)
+		changed = true
+	}
+
+	return changed
 }
 
 // buildENR builds a new ENR record for one identity.
