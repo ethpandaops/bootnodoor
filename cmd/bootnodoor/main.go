@@ -601,6 +601,14 @@ func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
 	if layer != "" {
 		fields["layer"] = layer
 	}
+	// Advertised reachability, per family, so operators can see where peers will
+	// connect (and that IPv6 is actually being advertised).
+	if ip := record.IP(); ip != nil && record.UDP() != 0 {
+		fields["advertised"] = net.JoinHostPort(ip.String(), fmt.Sprintf("%d", record.UDP()))
+	}
+	if ip6 := record.IP6(); ip6 != nil && record.UDP6() != 0 {
+		fields["advertised6"] = net.JoinHostPort(ip6.String(), fmt.Sprintf("%d", record.UDP6()))
+	}
 	// enode:// is EL/discv4-only; CL peers use the ENR.
 	if pub := record.PublicKey(); layer != "CL" && pub != nil && record.IP() != nil && record.UDP() != 0 {
 		e := &enode.Enode{PublicKey: pub, IP: record.IP(), TCP: record.TCP(), UDP: record.UDP()}

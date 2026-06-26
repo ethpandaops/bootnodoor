@@ -76,6 +76,11 @@ func buildENR(key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, enrPort uint16) (*enr
 	if enrPort > 0 {
 		record.Set("udp", enrPort)
 		record.Set("tcp", enrPort)
+		// An ip6 without udp6/tcp6 isn't a usable endpoint.
+		if enrIP6 != nil && enrIP6.To16() != nil {
+			record.Set("udp6", enrPort)
+			record.Set("tcp6", enrPort)
+		}
 	}
 
 	// Set sequence number to 1

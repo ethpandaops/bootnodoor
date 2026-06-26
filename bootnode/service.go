@@ -122,12 +122,14 @@ func New(cfg *Config) (*Service, error) {
 	}
 	for _, id := range s.identities {
 		if transports[id.bindPort] == nil {
-			listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), id.bindPort)
+			// JoinHostPort so an IPv6 bind addr becomes [::]:port, not :::port.
+			listenAddr := net.JoinHostPort(cfg.BindIP.String(), fmt.Sprintf("%d", id.bindPort))
 			t, terr := transport.NewUDPTransport(&transport.Config{ListenAddr: listenAddr, Logger: cfg.Logger})
 			if terr != nil {
 				closeTransports()
 				return nil, fmt.Errorf("failed to create UDP transport on port %d: %w", id.bindPort, terr)
 			}
+			cfg.Logger.WithField("address", listenAddr).Info("listening for discovery")
 			transports[id.bindPort] = t
 		}
 		id.transport = transports[id.bindPort]

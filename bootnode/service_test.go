@@ -344,3 +344,39 @@ func TestOnPongReceived_SingleSocketKeepsObservedPort(t *testing.T) {
 		t.Fatal("single-socket PONGs never reached IP-discovery consensus")
 	}
 }
+
+// An advertised IPv6 address must come with udp6/tcp6 to be a usable endpoint.
+func TestBuildENR_IPv6SetsUDP6AndTCP6(t *testing.T) {
+	rec, err := buildENR(mustKey(t), net.ParseIP("203.0.113.1"), net.ParseIP("2001:db8::1"), 9000)
+	if err != nil {
+		t.Fatalf("buildENR: %v", err)
+	}
+	if rec.IP6() == nil {
+		t.Error("ip6 should be set")
+	}
+	if rec.UDP6() != 9000 {
+		t.Errorf("udp6 = %d, want 9000", rec.UDP6())
+	}
+	var tcp6 uint16
+	if err := rec.Get("tcp6", &tcp6); err != nil || tcp6 != 9000 {
+		t.Errorf("tcp6 = %d (err %v), want 9000", tcp6, err)
+	}
+}
+
+// A v4-only node must not advertise bogus udp6/tcp6.
+func TestBuildENR_NoIPv6OmitsUDP6AndTCP6(t *testing.T) {
+	rec, err := buildENR(mustKey(t), net.ParseIP("203.0.113.1"), nil, 9000)
+	if err != nil {
+		t.Fatalf("buildENR: %v", err)
+	}
+	if rec.IP6() != nil {
+		t.Error("ip6 should be absent for a v4-only node")
+	}
+	if rec.UDP6() != 0 {
+		t.Errorf("udp6 = %d, want absent for a v4-only node", rec.UDP6())
+	}
+	var tcp6 uint16
+	if err := rec.Get("tcp6", &tcp6); err == nil {
+		t.Error("tcp6 should be absent for a v4-only node")
+	}
+}
