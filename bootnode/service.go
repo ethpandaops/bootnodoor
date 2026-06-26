@@ -1410,12 +1410,6 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.config.Logger.WithFields(map[string]interface{}{
-		"ip":     ip.String(),
-		"port":   port,
-		"isIPv6": isIPv6,
-	}).Info("IP discovery: consensus reached, updating ENR")
-
 	for _, id := range s.identities {
 		if id.localNode == nil {
 			continue
@@ -1448,6 +1442,12 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 			s.config.Logger.WithError(err).Error("failed to update ENR with discovered IP")
 			continue
 		}
+
+		s.config.Logger.WithFields(map[string]interface{}{
+			"ip":     ip.String(),
+			"port":   advPort,
+			"isIPv6": isIPv6,
+		}).Info("IP discovery: consensus reached, updated ENR")
 
 		if err := s.storeENR(id.storeKey, id.localNode.Record()); err != nil {
 			s.config.Logger.WithError(err).Warn("failed to store updated ENR")

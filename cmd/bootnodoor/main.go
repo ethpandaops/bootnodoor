@@ -22,6 +22,7 @@ import (
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
 	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
+	"github.com/ethpandaops/bootnodoor/enode"
 	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/webui"
 	"github.com/ethpandaops/bootnodoor/webui/types"
@@ -608,8 +609,9 @@ func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
 	if layer != "" {
 		fields["layer"] = layer
 	}
-	if enodeURL := deriveEnodeFromENR(record); enodeURL != "" {
-		fields["enode"] = enodeURL
+	if pub := record.PublicKey(); pub != nil && record.IP() != nil && record.UDP() != 0 {
+		e := &enode.Enode{PublicKey: pub, IP: record.IP(), TCP: record.TCP(), UDP: record.UDP()}
+		fields["enode"] = e.String()
 	}
 	logger.WithFields(fields).Info("bootnode identity")
 
@@ -620,20 +622,6 @@ func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
 		}
 		logger.WithFields(enrFields).Info("local ENR")
 	}
-}
-
-// deriveEnodeFromENR builds an enode:// URL from a record's pubkey, IP and port.
-func deriveEnodeFromENR(record *enr.Record) string {
-	ip := record.IP()
-	udpPort := record.UDP()
-	pubKey := record.PublicKey()
-	if ip == nil || udpPort == 0 || pubKey == nil {
-		return ""
-	}
-
-	// enode IDs use the uncompressed pubkey without the 0x04 prefix.
-	pubKeyHex := hex.EncodeToString(ethcrypto.FromECDSAPub(pubKey)[1:])
-	return fmt.Sprintf("enode://%s@%s:%d", pubKeyHex, ip.String(), udpPort)
 }
 
 // getLocalIP attempts to detect a local non-loopback IP address.

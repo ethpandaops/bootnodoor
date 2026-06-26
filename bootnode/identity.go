@@ -51,29 +51,12 @@ func resolveIdentities(cfg *Config) []*identity {
 		cfg.elENRPort() == cfg.clENRPort()
 
 	if shared {
-		return []*identity{{
-			key:      elKey,
-			servesEL: true,
-			servesCL: true,
-			enrIP:    cfg.ENRIP,
-			enrIP6:   cfg.ENRIP6,
-			bindPort: cfg.elBindPort(),
-			enrPort:  cfg.elENRPort(),
-			storeKey: localENRKey,
-		}}
+		return []*identity{newIdentity(cfg, elKey, true, true, cfg.elBindPort(), cfg.elENRPort(), localENRKey)}
 	}
 
 	var ids []*identity
 	if cfg.HasEL() {
-		ids = append(ids, &identity{
-			key:      elKey,
-			servesEL: true,
-			enrIP:    cfg.ENRIP,
-			enrIP6:   cfg.ENRIP6,
-			bindPort: cfg.elBindPort(),
-			enrPort:  cfg.elENRPort(),
-			storeKey: localENRKey,
-		})
+		ids = append(ids, newIdentity(cfg, elKey, true, false, cfg.elBindPort(), cfg.elENRPort(), localENRKey))
 	}
 	if cfg.HasCL() {
 		// Keep the legacy key for CL-only deployments; namespace it only when an
@@ -82,17 +65,23 @@ func resolveIdentities(cfg *Config) []*identity {
 		if cfg.HasEL() {
 			clStore = localENRKey + "_cl"
 		}
-		ids = append(ids, &identity{
-			key:      clKey,
-			servesCL: true,
-			enrIP:    cfg.ENRIP,
-			enrIP6:   cfg.ENRIP6,
-			bindPort: cfg.clBindPort(),
-			enrPort:  cfg.clENRPort(),
-			storeKey: clStore,
-		})
+		ids = append(ids, newIdentity(cfg, clKey, false, true, cfg.clBindPort(), cfg.clENRPort(), clStore))
 	}
 	return ids
+}
+
+// newIdentity builds an identity, filling the advertised IPs from the shared config.
+func newIdentity(cfg *Config, key *ecdsa.PrivateKey, servesEL, servesCL bool, bindPort, enrPort uint16, storeKey string) *identity {
+	return &identity{
+		key:      key,
+		servesEL: servesEL,
+		servesCL: servesCL,
+		enrIP:    cfg.ENRIP,
+		enrIP6:   cfg.ENRIP6,
+		bindPort: bindPort,
+		enrPort:  enrPort,
+		storeKey: storeKey,
+	}
 }
 
 func sameKey(a, b *ecdsa.PrivateKey) bool {
