@@ -33,7 +33,9 @@ func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, e
 		// A stored ENR keeps its IP (preserving any IP-discovery result) but config
 		// is authoritative for the port, so a port change takes effect on restart.
 		localENR.Set("udp", enrPort)
-		localENR.Set("tcp", enrPort)
+		if localENR.IP6() != nil {
+			localENR.Set("udp6", enrPort)
+		}
 		localENR.SetSeq(localENR.Seq() + 1)
 		if err := localENR.Sign(key); err != nil {
 			return nil, fmt.Errorf("failed to re-sign ENR after port change: %w", err)
@@ -72,14 +74,12 @@ func buildENR(key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, enrPort uint16) (*enr
 		}
 	}
 
-	// Set UDP and TCP ports (TCP same as UDP for now)
+	// A bootnode only serves discovery (UDP); it accepts no RLPx/libp2p, so it
+	// advertises udp/udp6 and omits tcp/tcp6 rather than inviting failed dials.
 	if enrPort > 0 {
 		record.Set("udp", enrPort)
-		record.Set("tcp", enrPort)
-		// An ip6 without udp6/tcp6 isn't a usable endpoint.
 		if enrIP6 != nil && enrIP6.To16() != nil {
 			record.Set("udp6", enrPort)
-			record.Set("tcp6", enrPort)
 		}
 	}
 

@@ -609,9 +609,11 @@ func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
 	if ip6 := record.IP6(); ip6 != nil && record.UDP6() != 0 {
 		fields["advertised6"] = net.JoinHostPort(ip6.String(), fmt.Sprintf("%d", record.UDP6()))
 	}
-	// enode:// is EL/discv4-only; CL peers use the ENR.
+	// enode:// is EL/discv4-only; CL peers use the ENR. A bootnode serves no TCP,
+	// so the enode carries the discovery (UDP) port.
 	if pub := record.PublicKey(); layer != "CL" && pub != nil && record.IP() != nil && record.UDP() != 0 {
-		e := &enode.Enode{PublicKey: pub, IP: record.IP(), TCP: record.TCP(), UDP: record.UDP()}
+		port := record.UDP()
+		e := &enode.Enode{PublicKey: pub, IP: record.IP(), TCP: port, UDP: port}
 		fields["enode"] = e.String()
 	}
 	logger.WithFields(fields).Info("bootnode identity")
@@ -690,12 +692,11 @@ func runDevnetShim(
 		}
 	}
 
-	// Set UDP and TCP ports
+	// Discovery is UDP-only; the bootnode serves no TCP.
 	portNum := 0
 	fmt.Sscanf(shimPort, "%d", &portNum)
 	if portNum > 0 {
 		record.Set("udp", uint16(portNum))
-		record.Set("tcp", uint16(portNum)) // TCP same as UDP
 	}
 
 	// Add EL 'eth' field if config provided

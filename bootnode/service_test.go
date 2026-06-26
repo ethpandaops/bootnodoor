@@ -345,26 +345,30 @@ func TestOnPongReceived_SingleSocketKeepsObservedPort(t *testing.T) {
 	}
 }
 
-// An advertised IPv6 address must come with udp6/tcp6 to be a usable endpoint.
-func TestBuildENR_IPv6SetsUDP6AndTCP6(t *testing.T) {
+// A bootnode serves discovery only, so it advertises udp/udp6 and never
+// tcp/tcp6 (which would invite RLPx/libp2p dials it can't answer).
+func TestBuildENR_AdvertisesUDPNotTCP(t *testing.T) {
 	rec, err := buildENR(mustKey(t), net.ParseIP("203.0.113.1"), net.ParseIP("2001:db8::1"), 9000)
 	if err != nil {
 		t.Fatalf("buildENR: %v", err)
 	}
-	if rec.IP6() == nil {
-		t.Error("ip6 should be set")
+	if rec.IP6() == nil || rec.UDP6() != 9000 {
+		t.Errorf("v6 endpoint: ip6=%v udp6=%d, want set and 9000", rec.IP6(), rec.UDP6())
 	}
-	if rec.UDP6() != 9000 {
-		t.Errorf("udp6 = %d, want 9000", rec.UDP6())
+	if rec.UDP() != 9000 {
+		t.Errorf("udp = %d, want 9000", rec.UDP())
 	}
-	var tcp6 uint16
-	if err := rec.Get("tcp6", &tcp6); err != nil || tcp6 != 9000 {
-		t.Errorf("tcp6 = %d (err %v), want 9000", tcp6, err)
+	var p uint16
+	if err := rec.Get("tcp", &p); err == nil {
+		t.Error("tcp must not be advertised by a discovery-only bootnode")
+	}
+	if err := rec.Get("tcp6", &p); err == nil {
+		t.Error("tcp6 must not be advertised by a discovery-only bootnode")
 	}
 }
 
-// A v4-only node must not advertise bogus udp6/tcp6.
-func TestBuildENR_NoIPv6OmitsUDP6AndTCP6(t *testing.T) {
+// A v4-only node must not advertise any v6 fields.
+func TestBuildENR_NoIPv6OmitsV6Fields(t *testing.T) {
 	rec, err := buildENR(mustKey(t), net.ParseIP("203.0.113.1"), nil, 9000)
 	if err != nil {
 		t.Fatalf("buildENR: %v", err)
@@ -374,9 +378,5 @@ func TestBuildENR_NoIPv6OmitsUDP6AndTCP6(t *testing.T) {
 	}
 	if rec.UDP6() != 0 {
 		t.Errorf("udp6 = %d, want absent for a v4-only node", rec.UDP6())
-	}
-	var tcp6 uint16
-	if err := rec.Get("tcp6", &tcp6); err == nil {
-		t.Error("tcp6 should be absent for a v4-only node")
 	}
 }
