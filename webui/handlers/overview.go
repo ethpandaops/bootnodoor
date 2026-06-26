@@ -36,9 +36,11 @@ type OverviewPageData struct {
 	// enode field: enode:// is EL/discv4-only.
 	SeparateIdentities bool
 	ELPeerID           string
+	ELBindAddress      string
 	ELLocalENR         string
 	ELLocalEnode       string
 	CLPeerID           string
+	CLBindAddress      string
 	CLLocalENR         string
 	CurrentFork    string
 	CurrentDigest  string
@@ -246,11 +248,17 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		pageData.SeparateIdentities = true
 		if elNode := fh.bootnodeService.ELLocalNode(); elNode != nil {
 			pageData.ELPeerID = elNode.ID().String()
+			if addr := elNode.Addr(); addr != nil {
+				pageData.ELBindAddress = addr.String()
+			}
 			pageData.ELLocalENR, _ = elNode.Record().EncodeBase64()
 			pageData.ELLocalEnode = deriveEnodeFromENR(elNode.Record())
 		}
 		if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
 			pageData.CLPeerID = clNode.ID().String()
+			if addr := clNode.Addr(); addr != nil {
+				pageData.CLBindAddress = addr.String()
+			}
 			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
 		}
 	}

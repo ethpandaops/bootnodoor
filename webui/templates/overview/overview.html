@@ -126,10 +126,21 @@
                   <td class="text-muted">Uptime</td>
                   <td class="text-end" data-stat="uptime">{{ formatTimeDiff .StartTime }}</td>
                 </tr>
+                {{ if .SeparateIdentities }}
+                <tr>
+                  <td class="text-muted">Bind Address (EL)</td>
+                  <td class="text-end"><code style="font-size: 0.85em;">{{ .ELBindAddress }}</code></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">Bind Address (CL)</td>
+                  <td class="text-end"><code style="font-size: 0.85em;">{{ .CLBindAddress }}</code></td>
+                </tr>
+                {{ else }}
                 <tr>
                   <td class="text-muted">Bind Address</td>
                   <td class="text-end"><code style="font-size: 0.85em;" data-stat="bind-address">{{ .BindAddress }}</code></td>
                 </tr>
+                {{ end }}
                 {{ if .LocalENR }}
                 <tr>
                   <td class="text-muted">
