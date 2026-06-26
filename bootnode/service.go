@@ -469,6 +469,9 @@ func (s *Service) clIdentity() *identity {
 // singleSocket reports whether every identity shares one socket, in which case
 // an externally-observed port from IP discovery is unambiguous.
 func (s *Service) singleSocket() bool {
+	if len(s.identities) == 0 {
+		return true
+	}
 	for _, id := range s.identities {
 		if id.bindPort != s.identities[0].bindPort {
 			return false
@@ -1255,6 +1258,10 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 
 // checkAndAddNode performs admission checks and adds node to appropriate table.
 func (s *Service) checkAndAddNode(n *v5node.Node) bool {
+	if s.enrManager == nil {
+		return false
+	}
+
 	// Determine layer
 	isEL, _ := s.enrManager.FilterELNode(n.Record())
 	isCL := s.enrManager.FilterCLNode(n.Record())
@@ -1398,9 +1405,18 @@ func (s *Service) onPongReceived(remoteID []byte, sourceIP net.IP, reportedIP ne
 		return
 	}
 
-	// Report to IP discovery service with source IP
+	// Split sockets observe different external ports, which would split the
+	// IP-discovery vote across IP:port buckets and prevent consensus. Bucket
+	// them under one port instead; the per-identity advertised port is applied
+	// in updateENRWithDiscoveredIP, which ignores the discovered port when
+	// identities don't share a socket.
+	port := reportedPort
+	if !s.singleSocket() {
+		port = s.primaryIdentity().enrPort
+	}
+
 	reporterIDStr := fmt.Sprintf("%x", remoteID[:8])
-	s.ipDiscovery.ReportIP(reportedIP, reportedPort, reporterIDStr, sourceIP)
+	s.ipDiscovery.ReportIP(reportedIP, port, reporterIDStr, sourceIP)
 }
 
 // updateENRWithDiscoveredIP updates every identity's ENR with the discovered IP.

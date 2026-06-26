@@ -601,7 +601,8 @@ func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
 	if layer != "" {
 		fields["layer"] = layer
 	}
-	if pub := record.PublicKey(); pub != nil && record.IP() != nil && record.UDP() != 0 {
+	// enode:// is EL/discv4-only; CL peers use the ENR.
+	if pub := record.PublicKey(); layer != "CL" && pub != nil && record.IP() != nil && record.UDP() != 0 {
 		e := &enode.Enode{PublicKey: pub, IP: record.IP(), TCP: record.TCP(), UDP: record.UDP()}
 		fields["enode"] = e.String()
 	}

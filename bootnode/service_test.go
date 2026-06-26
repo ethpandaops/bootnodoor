@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
 	"github.com/ethpandaops/bootnodoor/enr"
@@ -91,9 +92,7 @@ func TestUpdateENR_DropsUnservedFields(t *testing.T) {
 func newTestService(t *testing.T, ids []*identity) *Service {
 	t.Helper()
 
-	logger := logrus.New()
-	logger.SetLevel(logrus.PanicLevel)
-
+	logger := quietLogger()
 	database := db.NewDatabase(&db.SqliteDatabaseConfig{File: ":memory:", MaxOpenConns: 5, MaxIdleConns: 2}, logger)
 	if err := database.Init(); err != nil {
 		t.Fatalf("db init: %v", err)
@@ -164,5 +163,122 @@ func TestUpdateENRWithDiscoveredIP_SplitSocketKeepsConfiguredPort(t *testing.T) 
 		if rec.UDP() != want[id.servesEL] {
 			t.Errorf("identity (EL=%v): ENR udp = %d, want %d (configured port, not discovered)", id.servesEL, rec.UDP(), want[id.servesEL])
 		}
+	}
+}
+
+func TestResolveIdentities_SharedKeyCollapses(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PrivateKey = mustKey(t)
+	cfg.ELConfig = &elconfig.ChainConfig{}
+	cfg.CLConfig = &clconfig.Config{}
+	cfg.ApplyDefaults()
+
+	ids := resolveIdentities(cfg)
+	if len(ids) != 1 {
+		t.Fatalf("shared key should collapse to 1 identity, got %d", len(ids))
+	}
+	if !ids[0].servesEL || !ids[0].servesCL {
+		t.Errorf("shared identity should serve both layers, got EL=%v CL=%v", ids[0].servesEL, ids[0].servesCL)
+	}
+	if ids[0].storeKey != localENRKey {
+		t.Errorf("shared identity storeKey = %q, want %q", ids[0].storeKey, localENRKey)
+	}
+}
+
+func TestResolveIdentities_SeparateKeysSplit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ELPrivateKey = mustKey(t)
+	cfg.CLPrivateKey = mustKey(t)
+	cfg.ELConfig = &elconfig.ChainConfig{}
+	cfg.CLConfig = &clconfig.Config{}
+	cfg.ApplyDefaults()
+
+	ids := resolveIdentities(cfg)
+	if len(ids) != 2 {
+		t.Fatalf("distinct keys should yield 2 identities, got %d", len(ids))
+	}
+	var el, cl *identity
+	for _, id := range ids {
+		if id.servesEL {
+			el = id
+		}
+		if id.servesCL {
+			cl = id
+		}
+	}
+	if el == nil || cl == nil || el == cl {
+		t.Fatalf("expected one EL and one distinct CL identity")
+	}
+	if el.servesCL || cl.servesEL {
+		t.Error("split identities should each serve a single layer")
+	}
+	if el.storeKey != localENRKey || cl.storeKey != localENRKey+"_cl" {
+		t.Errorf("storeKeys: EL=%q CL=%q", el.storeKey, cl.storeKey)
+	}
+}
+
+func TestResolveIdentities_CLOnlyKeepsLegacyStoreKey(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PrivateKey = mustKey(t)
+	cfg.CLConfig = &clconfig.Config{} // no ELConfig
+	cfg.ApplyDefaults()
+
+	ids := resolveIdentities(cfg)
+	if len(ids) != 1 || ids[0].servesEL || !ids[0].servesCL {
+		t.Fatalf("CL-only should yield one CL identity, got %+v", ids)
+	}
+	if ids[0].storeKey != localENRKey {
+		t.Errorf("CL-only storeKey = %q, want legacy %q", ids[0].storeKey, localENRKey)
+	}
+}
+
+// validatableConfig returns a config that passes Validate, ready for a test to
+// mutate one aspect. Database is a non-nil placeholder (Validate only nil-checks it).
+func validatableConfig(t *testing.T) *Config {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.Logger = quietLogger()
+	cfg.Database = &db.Database{}
+	cfg.ELConfig = &elconfig.ChainConfig{}
+	cfg.ELGenesisHash = [32]byte{1}
+	cfg.ELGenesisTime = 1
+	cfg.CLConfig = &clconfig.Config{}
+	cfg.ApplyDefaults()
+	return cfg
+}
+
+func TestValidate_SameKeyDifferentPortRejected(t *testing.T) {
+	cfg := validatableConfig(t)
+	cfg.PrivateKey = mustKey(t) // both layers share this key
+	cfg.ELBindPort = 30303
+	cfg.CLBindPort = 9000
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("same key with different ports should be rejected")
+	}
+}
+
+func TestValidate_SharedKeyDefaultPortsOK(t *testing.T) {
+	cfg := validatableConfig(t)
+	cfg.PrivateKey = mustKey(t)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("shared key + default ports should validate: %v", err)
+	}
+}
+
+func TestValidate_PerLayerKeysOK(t *testing.T) {
+	cfg := validatableConfig(t)
+	cfg.PrivateKey = nil
+	cfg.ELPrivateKey = mustKey(t)
+	cfg.CLPrivateKey = mustKey(t)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("distinct per-layer keys should validate: %v", err)
+	}
+}
+
+func TestValidate_MissingKeyForEnabledLayerRejected(t *testing.T) {
+	cfg := validatableConfig(t)
+	cfg.PrivateKey = nil // no key for either layer
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an enabled layer without a key should be rejected")
 	}
 }
