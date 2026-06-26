@@ -472,6 +472,18 @@ func (s *Service) clIdentity() *identity {
 	return nil
 }
 
+// singleSocket reports whether every identity binds the same UDP port, i.e.
+// they share one socket. When true, an externally-observed port from IP
+// discovery is unambiguous and can be advertised by all identities.
+func (s *Service) singleSocket() bool {
+	for _, id := range s.identities {
+		if id.bindPort != s.identities[0].bindPort {
+			return false
+		}
+	}
+	return true
+}
+
 // primaryIdentity returns the representative identity: EL if present, else the
 // sole identity. Used for the single-local-node code paths and accessors.
 func (s *Service) primaryIdentity() *identity {
@@ -1410,17 +1422,19 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// The discovered port is the external mapping of the socket the PONGs came
+	// through. It is only unambiguous when every identity shares one socket
+	// (the default dual-key path); with identities on separate bind ports it
+	// can't be attributed to a layer, so each keeps its configured port.
+	sharedSocket := s.singleSocket()
+
 	for _, id := range s.identities {
 		if id.localNode == nil {
 			continue
 		}
 
-		// A single shared socket reflects the externally-observed port, so honor
-		// it (preserving NAT port-mapping self-correction). With multiple
-		// identities the discovered port is ambiguous across sockets, so each
-		// identity keeps its own advertised port.
 		advPort := id.enrPort
-		if len(s.identities) == 1 {
+		if sharedSocket {
 			advPort = port
 		}
 
