@@ -537,10 +537,10 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	}
 
 	if service.HasSeparateIdentities() {
-		logIdentity(logger, "EL", service.ELLocalNode())
-		logIdentity(logger, "CL", service.CLLocalNode())
+		logIdentity(logger, service, "EL", service.ELLocalNode())
+		logIdentity(logger, service, "CL", service.CLLocalNode())
 	} else {
-		logIdentity(logger, "", service.LocalNode())
+		logIdentity(logger, service, "", service.LocalNode())
 	}
 
 	// Start bootnode service
@@ -591,9 +591,9 @@ func startWebUI(service *bootnode.Service) {
 	webui.StartHttpServer(config, logger, service)
 }
 
-// logIdentity prints one identity's node ID, enode URL and ENR. layer is "" for
+// logIdentity prints one identity's node ID, enode URL and ENRs. layer is "" for
 // a single shared identity, "EL"/"CL" for separate identities.
-func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
+func logIdentity(logger *logrus.Logger, service *bootnode.Service, layer string, n *v5node.Node) {
 	if n == nil {
 		return
 	}
@@ -625,7 +625,17 @@ func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
 		if layer != "" {
 			enrFields["layer"] = layer
 		}
-		logger.WithFields(enrFields).Info("local ENR")
+		logger.WithFields(enrFields).Info("local ENR (discoverable, fork-filtered)")
+	}
+
+	// The generic ENR (fork fields stripped) is what goes into static bootnode
+	// lists / client configs, which omit fork filtering.
+	if generic, err := service.GenericENR(n); err == nil {
+		genericFields := logrus.Fields{"enr": generic}
+		if layer != "" {
+			genericFields["layer"] = layer
+		}
+		logger.WithFields(genericFields).Info("generic ENR (for static bootnode lists)")
 	}
 }
 

@@ -29,6 +29,7 @@ type OverviewPageData struct {
 	PeerID      string
 	BindAddress string
 	LocalENR    string
+	GenericENR  string // ENR with fork fields stripped, for static bootnode lists
 	LocalEnode  string // NEW: Enode derived from ENR
 	LocalENRSeq uint64
 
@@ -38,11 +39,13 @@ type OverviewPageData struct {
 	ELPeerID           string
 	ELBindAddress      string
 	ELLocalENR         string
+	ELGenericENR       string
 	ELLocalEnode       string
 	ELLocalENRSeq      uint64
 	CLPeerID           string
 	CLBindAddress      string
 	CLLocalENR         string
+	CLGenericENR       string
 	CLLocalENRSeq      uint64
 	CurrentFork        string
 	CurrentDigest      string
@@ -128,26 +131,37 @@ type OldDigestInfo struct {
 	Remaining time.Duration
 }
 
-// localNodeForLayer returns the local node for the ?layer=el|cl query param,
-// falling back to the primary identity for any other value.
+// localNodeForLayer returns the local node for the ?layer= query param: the EL
+// or CL identity (nil if that layer isn't running), or the primary identity when
+// no specific layer is requested.
 func (fh *FrontendHandler) localNodeForLayer(r *http.Request) *v5node.Node {
 	switch r.URL.Query().Get("layer") {
 	case "el":
-		if n := fh.bootnodeService.ELLocalNode(); n != nil {
-			return n
-		}
+		return fh.bootnodeService.ELLocalNode()
 	case "cl":
-		if n := fh.bootnodeService.CLLocalNode(); n != nil {
-			return n
-		}
+		return fh.bootnodeService.CLLocalNode()
+	default:
+		return fh.bootnodeService.LocalNode()
 	}
-	return fh.bootnodeService.LocalNode()
 }
 
-// ENR serves the local ENR as plain text (use ?layer=el|cl to select identity)
+// ENR serves the local ENR as plain text. Use ?layer=el|cl to select an
+// identity, and ?generic=1 for the fork-stripped record to put in static
+// bootnode lists.
 func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	localNode := fh.localNodeForLayer(r)
-	localENR, err := localNode.Record().EncodeBase64()
+	if localNode == nil {
+		http.Error(w, "no ENR for the requested layer", http.StatusNotFound)
+		return
+	}
+
+	var localENR string
+	var err error
+	if r.URL.Query().Get("generic") == "1" {
+		localENR, err = fh.bootnodeService.GenericENR(localNode)
+	} else {
+		localENR, err = localNode.Record().EncodeBase64()
+	}
 	if err != nil {
 		http.Error(w, "Failed to encode ENR", http.StatusInternalServerError)
 		return
@@ -237,6 +251,9 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		bindAddr = addr.String()
 	}
 
+	// Generic (fork-stripped) ENR for static bootnode lists.
+	genericENR, _ := fh.bootnodeService.GenericENR(localNode)
+
 	// Initialize page data with basic info
 	pageData := &OverviewPageData{
 		Status:      "Online",
@@ -244,6 +261,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		PeerID:      peerID,
 		BindAddress: bindAddr,
 		LocalENR:    localENR,
+		GenericENR:  genericENR,
 		LocalEnode:  localEnode,
 		LocalENRSeq: localNode.Record().Seq(),
 	}
@@ -256,6 +274,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 				pageData.ELBindAddress = addr.String()
 			}
 			pageData.ELLocalENR, _ = elNode.Record().EncodeBase64()
+			pageData.ELGenericENR, _ = fh.bootnodeService.GenericENR(elNode)
 			pageData.ELLocalEnode = deriveEnodeFromENR(elNode.Record())
 			pageData.ELLocalENRSeq = elNode.Record().Seq()
 		}
@@ -265,6 +284,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 				pageData.CLBindAddress = addr.String()
 			}
 			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
+			pageData.CLGenericENR, _ = fh.bootnodeService.GenericENR(clNode)
 			pageData.CLLocalENRSeq = clNode.Record().Seq()
 		}
 	}

@@ -419,3 +419,42 @@ func TestCreateLocalNode_AutoDetectedIPPreservesStored(t *testing.T) {
 		t.Errorf("ENR ip = %v, want preserved 1.2.3.4", ip)
 	}
 }
+
+// GenericENR strips the fork fields (eth/eth2) so the record is usable in static
+// bootnode lists, while keeping the node ID and endpoint.
+func TestGenericENR_StripsForkFields(t *testing.T) {
+	id := &identity{key: mustKey(t), servesEL: true, servesCL: true, bindPort: 9000, enrPort: 9000, storeKey: "local_enr"}
+	s := newTestService(t, []*identity{id})
+
+	// Simulate the live, fork-filtered record (as UpdateENR would produce).
+	rec := id.localNode.Record()
+	_ = rec.Set("eth", []byte{1, 2, 3, 4})
+	_ = rec.Set("eth2", []byte{5, 6, 7, 8})
+	rec.SetSeq(rec.Seq() + 1)
+	if err := rec.Sign(id.key); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	genericStr, err := s.GenericENR(id.localNode)
+	if err != nil {
+		t.Fatalf("GenericENR: %v", err)
+	}
+	g, err := enr.DecodeBase64(genericStr)
+	if err != nil {
+		t.Fatalf("decode generic: %v", err)
+	}
+
+	if _, ok := g.Eth(); ok {
+		t.Error("generic ENR should not carry eth")
+	}
+	var eth2 []byte
+	if err := g.Get("eth2", &eth2); err == nil {
+		t.Error("generic ENR should not carry eth2")
+	}
+	if g.IP() == nil || g.UDP() != 9000 {
+		t.Errorf("generic ENR should keep the endpoint: ip=%v udp=%d", g.IP(), g.UDP())
+	}
+	if g.PublicKey() == nil {
+		t.Error("generic ENR should keep the public key / node ID")
+	}
+}

@@ -78,6 +78,11 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 		return fmt.Errorf("failed to clone ENR: %w", err)
 	}
 
+	// A bootnode serves no TCP, so never advertise tcp/tcp6 — including any
+	// inherited from an ENR persisted by an older, TCP-advertising version.
+	newRecord.Delete("tcp")
+	newRecord.Delete("tcp6")
+
 	if m.servesEL && m.config.HasEL() {
 		forkID := m.elFilter.GetCurrentForkID(currentBlock, currentTime)
 		// Set eth field as a list of fork IDs - ENR.Set() will handle RLP encoding

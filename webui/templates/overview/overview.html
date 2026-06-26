@@ -23,6 +23,15 @@
           </button>
         </div>
         {{ end }}
+        {{ if .ELGenericENR }}
+        <label class="text-muted small mt-2">Generic ENR — for static bootnode lists (no fork filter)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .ELGenericENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELGenericENR }}" data-bs-toggle="tooltip" title="Copy generic ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
       </div>
     </div>
     {{ end }}
@@ -37,6 +46,15 @@
             <i class="fa fa-copy"></i>
           </button>
         </div>
+        {{ if .CLGenericENR }}
+        <label class="text-muted small mt-2">Generic ENR — for static bootnode lists (no fork filter)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLGenericENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLGenericENR }}" data-bs-toggle="tooltip" title="Copy generic ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
       </div>
     </div>
     {{ end }}
@@ -45,13 +63,23 @@
     <div class="card mt-3">
       <div class="card-body">
         <h5 class="card-title">Bootnode ENR</h5>
-        <p class="text-muted mb-3">Share this Ethereum Node Record (ENR) with peers to allow them to discover and connect to this bootnode.</p>
+        <p class="text-muted mb-3">Share the discoverable ENR with peers; commit the generic ENR (no fork filter) to static bootnode lists.</p>
+        <label class="text-muted small">Discoverable (fork-filtered)</label>
         <div class="input-group">
           <input type="text" class="form-control font-monospace" value="{{ .LocalENR }}" readonly>
           <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .LocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
             <i class="fa fa-copy"></i>
           </button>
         </div>
+        {{ if .GenericENR }}
+        <label class="text-muted small mt-2">Generic — for static bootnode lists</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .GenericENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .GenericENR }}" data-bs-toggle="tooltip" title="Copy generic ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
       </div>
     </div>
     {{ end }}

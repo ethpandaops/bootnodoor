@@ -1346,6 +1346,33 @@ func (s *Service) HasSeparateIdentities() bool {
 	return s.elIdentity() != nil && s.clIdentity() != nil && s.elIdentity() != s.clIdentity()
 }
 
+// GenericENR returns the base64 ENR for the given identity's node with the fork
+// fields (eth/eth2) removed. This is the record to commit to static bootnode
+// lists, which omit fork filtering so the bootnode is accepted regardless of the
+// client's fork state; the bootnode still advertises the full fork-filtered ENR
+// for live discovery.
+func (s *Service) GenericENR(node *v5node.Node) (string, error) {
+	if node == nil {
+		return "", fmt.Errorf("nil node")
+	}
+	for _, id := range s.identities {
+		if id.localNode != node {
+			continue
+		}
+		rec, err := node.Record().Clone()
+		if err != nil {
+			return "", err
+		}
+		rec.Delete("eth")
+		rec.Delete("eth2")
+		if err := rec.Sign(id.key); err != nil {
+			return "", err
+		}
+		return rec.EncodeBase64()
+	}
+	return "", fmt.Errorf("no identity for node")
+}
+
 // ELTable returns the EL routing table (may be nil if EL disabled).
 func (s *Service) ELTable() *nodes.FlatTable {
 	return s.elTable
