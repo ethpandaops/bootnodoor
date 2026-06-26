@@ -32,12 +32,12 @@ type OverviewPageData struct {
 	LocalEnode     string // NEW: Enode derived from ENR
 	LocalENRSeq    uint64
 
-	// Per-identity records, populated when EL and CL use distinct keys.
+	// Per-identity records, populated when EL and CL use distinct keys. CL has no
+	// enode field: enode:// is an EL/discv4 construct, CL peers consume the ENR.
 	SeparateIdentities bool
 	ELLocalENR         string
 	ELLocalEnode       string
 	CLLocalENR         string
-	CLLocalEnode       string
 	CurrentFork    string
 	CurrentDigest  string
 	PreviousFork   string
@@ -151,9 +151,11 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(localENR))
 }
 
-// Enode serves the local enode URL as plain text (use ?layer=el|cl to select)
+// Enode serves the local enode URL as plain text. enode:// is a discv4/EL
+// construct, so this always reflects the primary (EL) identity; CL peers use
+// the ENR (see /enr?layer=cl).
 func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.localNodeForLayer(r)
+	localNode := fh.bootnodeService.LocalNode()
 
 	// Get TCP port from ENR, fallback to UDP port if not available
 	tcpPort := localNode.TCPPort()
@@ -248,7 +250,6 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		}
 		if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
 			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
-			pageData.CLLocalEnode = deriveEnodeFromENR(clNode.Record())
 		}
 	}
 

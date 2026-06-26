@@ -37,14 +37,6 @@
             <i class="fa fa-copy"></i>
           </button>
         </div>
-        {{ if .CLLocalEnode }}
-        <div class="input-group mt-2">
-          <input type="text" class="form-control font-monospace" value="{{ .CLLocalEnode }}" readonly>
-          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLLocalEnode }}" data-bs-toggle="tooltip" title="Copy Enode to clipboard">
-            <i class="fa fa-copy"></i>
-          </button>
-        </div>
-        {{ end }}
       </div>
     </div>
     {{ end }}

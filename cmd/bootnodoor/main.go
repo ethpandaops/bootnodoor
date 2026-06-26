@@ -668,6 +668,10 @@ func runDevnetShim(
 	pubKey := privKey.Public().(*ecdsa.PublicKey)
 	nodeID := ethcrypto.PubkeyToAddress(*pubKey)
 
+	// Derive the key hex from the resolved shim key rather than the --private-key
+	// flag, which may be empty when --el-private-key/--cl-private-key was used.
+	privKeyHex := hex.EncodeToString(ethcrypto.FromECDSA(privKey))
+
 	// Generate enode URL (for EL)
 	enode := fmt.Sprintf("enode://%x@%s:%s", ethcrypto.FromECDSAPub(pubKey)[1:], shimIP, shimPort)
 
@@ -745,7 +749,7 @@ func runDevnetShim(
 	}
 
 	logger.Info("Running in devnet shim mode")
-	logger.Infof("Private key: %s...%s", privateKeyHex[:10], privateKeyHex[len(privateKeyHex)-6:])
+	logger.Infof("Private key: %s...%s", privKeyHex[:10], privKeyHex[len(privKeyHex)-6:])
 	logger.Infof("Node ID: %s", nodeID.Hex())
 	logger.Infof("Enode: %s", enode)
 	logger.Infof("ENR: %s", enrString)
@@ -756,14 +760,14 @@ func runDevnetShim(
 	fmt.Printf("ENODE=%s\n", enode)
 	fmt.Printf("ENR=%s\n", enrString)
 	fmt.Printf("NODE_ID=%s\n", nodeID.Hex())
-	fmt.Printf("PRIVKEY=%s\n", privateKeyHex)
+	fmt.Printf("PRIVKEY=%s\n", privKeyHex)
 	fmt.Println("=== END ===")
 
 	// Start a simple HTTP server to serve the bootnode info
 	http.HandleFunc("/privkey", func(w http.ResponseWriter, r *http.Request) {
 		logger.Infof("Serving private key to %s", r.RemoteAddr)
 		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "%s", privateKeyHex)
+		fmt.Fprintf(w, "%s", privKeyHex)
 	})
 
 	http.HandleFunc("/enode", func(w http.ResponseWriter, r *http.Request) {
@@ -780,7 +784,7 @@ func runDevnetShim(
 
 	http.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"enode":"%s","enr":"%s","node_id":"%s","privkey":"%s"}`, enode, enrString, nodeID.Hex(), privateKeyHex)
+		fmt.Fprintf(w, `{"enode":"%s","enr":"%s","node_id":"%s","privkey":"%s"}`, enode, enrString, nodeID.Hex(), privKeyHex)
 	})
 
 	// Start HTTP server in background
