@@ -141,7 +141,27 @@
                   <td class="text-end"><code style="font-size: 0.85em;" data-stat="bind-address">{{ .BindAddress }}</code></td>
                 </tr>
                 {{ end }}
-                {{ if .LocalENR }}
+                {{ if .SeparateIdentities }}
+                <tr>
+                  <td class="text-muted">
+                    ENR Seq (EL)
+                    <i class="fa fa-info-circle text-muted"
+                       style="font-size: 0.8em;"
+                       role="button"
+                       data-bs-toggle="popover"
+                       data-bs-trigger="hover focus"
+                       data-bs-placement="right"
+                       data-bs-html="true"
+                       data-bs-title="ENR Sequence Number"
+                       data-bs-content="The sequence number of this node's Ethereum Node Record (ENR). This number increments each time the ENR is updated with new information."></i>
+                  </td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info">{{ .ELLocalENRSeq }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">ENR Seq (CL)</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info">{{ .CLLocalENRSeq }}</span></td>
+                </tr>
+                {{ else if .LocalENR }}
                 <tr>
                   <td class="text-muted">
                     ENR Seq

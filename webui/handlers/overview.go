@@ -23,14 +23,14 @@ type ForkInfo struct {
 
 // OverviewPageData contains data for the overview page
 type OverviewPageData struct {
-	Status         string
-	NetworkName    string
-	StartTime      time.Time
-	PeerID         string
-	BindAddress    string
-	LocalENR       string
-	LocalEnode     string // NEW: Enode derived from ENR
-	LocalENRSeq    uint64
+	Status      string
+	NetworkName string
+	StartTime   time.Time
+	PeerID      string
+	BindAddress string
+	LocalENR    string
+	LocalEnode  string // NEW: Enode derived from ENR
+	LocalENRSeq uint64
 
 	// Per-identity records, populated when EL and CL use distinct keys. CL has no
 	// enode field: enode:// is EL/discv4-only.
@@ -39,16 +39,18 @@ type OverviewPageData struct {
 	ELBindAddress      string
 	ELLocalENR         string
 	ELLocalEnode       string
+	ELLocalENRSeq      uint64
 	CLPeerID           string
 	CLBindAddress      string
 	CLLocalENR         string
-	CurrentFork    string
-	CurrentDigest  string
-	PreviousFork   string
-	PreviousDigest string
-	GenesisDigest  string
-	OldDigests     []OldDigestInfo
-	GracePeriod    string
+	CLLocalENRSeq      uint64
+	CurrentFork        string
+	CurrentDigest      string
+	PreviousFork       string
+	PreviousDigest     string
+	GenesisDigest      string
+	OldDigests         []OldDigestInfo
+	GracePeriod        string
 
 	// Fork lists
 	ELForks []ForkInfo // Execution Layer forks
@@ -253,6 +255,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 			}
 			pageData.ELLocalENR, _ = elNode.Record().EncodeBase64()
 			pageData.ELLocalEnode = deriveEnodeFromENR(elNode.Record())
+			pageData.ELLocalENRSeq = elNode.Record().Seq()
 		}
 		if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
 			pageData.CLPeerID = clNode.ID().String()
@@ -260,6 +263,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 				pageData.CLBindAddress = addr.String()
 			}
 			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
+			pageData.CLLocalENRSeq = clNode.Record().Seq()
 		}
 	}
 
