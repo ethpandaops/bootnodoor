@@ -43,7 +43,7 @@ type identity struct {
 // of identities to run. EL and CL collapse into a single shared identity when
 // they resolve to the same key, bind port and advertised port.
 func resolveIdentities(cfg *Config) []*identity {
-	elKey, clKey := cfg.ELKey(), cfg.CLKey()
+	elKey, clKey := cfg.elKey(), cfg.clKey()
 
 	shared := cfg.HasEL() && cfg.HasCL() &&
 		sameKey(elKey, clKey) &&

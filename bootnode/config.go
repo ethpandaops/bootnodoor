@@ -176,10 +176,10 @@ func (c *Config) Validate() error {
 	}
 
 	// Each enabled layer needs a key, either its own override or the shared one.
-	if c.HasEL() && c.ELKey() == nil {
+	if c.HasEL() && c.elKey() == nil {
 		return fmt.Errorf("private key is required (set --private-key or --el-private-key)")
 	}
-	if c.HasCL() && c.CLKey() == nil {
+	if c.HasCL() && c.clKey() == nil {
 		return fmt.Errorf("private key is required (set --private-key or --cl-private-key)")
 	}
 
@@ -275,16 +275,16 @@ func (c *Config) HasCL() bool {
 	return c.CLConfig != nil
 }
 
-// ELKey returns the private key for the EL identity (override or shared fallback).
-func (c *Config) ELKey() *ecdsa.PrivateKey {
+// elKey returns the private key for the EL identity (override or shared fallback).
+func (c *Config) elKey() *ecdsa.PrivateKey {
 	if c.ELPrivateKey != nil {
 		return c.ELPrivateKey
 	}
 	return c.PrivateKey
 }
 
-// CLKey returns the private key for the CL identity (override or shared fallback).
-func (c *Config) CLKey() *ecdsa.PrivateKey {
+// clKey returns the private key for the CL identity (override or shared fallback).
+func (c *Config) clKey() *ecdsa.PrivateKey {
 	if c.CLPrivateKey != nil {
 		return c.CLPrivateKey
 	}

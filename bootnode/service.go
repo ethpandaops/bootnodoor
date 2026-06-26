@@ -42,9 +42,8 @@ type Service struct {
 	localNode *v5node.Node
 
 	// Network components
-	transport     *transport.UDPTransport // primary identity's transport
-	discv4Service *discv4.Service          // May be nil if discv4 disabled
-	discv5Service *discv5.Service          // primary identity's discv5 (may be nil)
+	discv4Service *discv4.Service // May be nil if discv4 disabled
+	discv5Service *discv5.Service // primary identity's discv5 (may be nil)
 
 	// ENR management (primary identity; its fork filters classify all peers)
 	enrManager *ENRManager
@@ -60,8 +59,7 @@ type Service struct {
 	elTable *nodes.FlatTable // May be nil if EL disabled
 	clTable *nodes.FlatTable // May be nil if CL disabled
 
-	// Discovery services
-	pingService     *services.PingService   // Handles PING/PONG for aliveness checks
+	// Discovery services (ping is per-identity; see identity.pingService)
 	elLookupService *services.LookupService // EL lookup service (may be nil if EL disabled)
 	clLookupService *services.LookupService // CL lookup service (may be nil if CL disabled)
 
@@ -166,7 +164,6 @@ func New(cfg *Config) (*Service, error) {
 	primary := s.primaryIdentity()
 	s.localNode = primary.localNode
 	s.enrManager = primary.enrManager
-	s.transport = primary.transport
 
 	// Create IP discovery service
 	ipDiscoveryCfg := services.IPDiscoveryConfig{
@@ -1426,20 +1423,28 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 			continue
 		}
 
-		// Skip if this identity already advertises the discovered IP.
-		current := id.localNode.Record()
-		if !isIPv6 {
-			if curIP := current.IP(); curIP != nil && curIP.Equal(ip) && current.UDP() == id.enrPort {
-				continue
-			}
+		// A single shared socket reflects the externally-observed port, so honor
+		// it (preserving NAT port-mapping self-correction). With multiple
+		// identities the discovered port is ambiguous across sockets, so each
+		// identity keeps its own advertised port.
+		advPort := id.enrPort
+		if len(s.identities) == 1 {
+			advPort = port
 		}
 
-		// The ENR manager signs and increments the sequence number.
+		// Skip if this identity already advertises the discovered address.
+		current := id.localNode.Record()
 		var err error
 		if isIPv6 {
-			err = id.enrManager.UpdateENRWithIP6(ip, id.enrPort)
+			if curIP := current.IP6(); curIP != nil && curIP.Equal(ip) {
+				continue
+			}
+			err = id.enrManager.UpdateENRWithIP6(ip, advPort)
 		} else {
-			err = id.enrManager.UpdateENRWithIP(ip, id.enrPort)
+			if curIP := current.IP(); curIP != nil && curIP.Equal(ip) && current.UDP() == advPort {
+				continue
+			}
+			err = id.enrManager.UpdateENRWithIP(ip, advPort)
 		}
 		if err != nil {
 			s.config.Logger.WithError(err).Error("failed to update ENR with discovered IP")

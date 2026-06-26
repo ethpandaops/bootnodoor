@@ -417,6 +417,20 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to apply database schema: %w", err)
 	}
 
+	// Reject out-of-range ports before they wrap on the cast to uint16.
+	for _, p := range []struct {
+		name string
+		val  int
+	}{
+		{"--bind-port", bindPort}, {"--enr-port", enrPort},
+		{"--el-port", elBindPort}, {"--cl-port", clBindPort},
+		{"--el-enr-port", elEnrPort}, {"--cl-enr-port", clEnrPort},
+	} {
+		if p.val < 0 || p.val > 65535 {
+			return fmt.Errorf("%s must be between 0 and 65535, got %d", p.name, p.val)
+		}
+	}
+
 	// Parse bind address
 	bindIP := net.ParseIP(bindAddr)
 	if bindIP == nil {
