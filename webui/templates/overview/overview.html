@@ -77,12 +77,29 @@
     <div class="card mt-3">
       <div class="card-body">
         <h5 class="card-title">Peer ID</h5>
+        {{ if .SeparateIdentities }}
+        <label class="text-muted small">Execution Layer (EL)</label>
+        <div class="input-group mb-2">
+          <input type="text" class="form-control font-monospace" value="{{ .ELPeerID }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELPeerID }}" data-bs-toggle="tooltip" title="Copy EL Peer ID to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        <label class="text-muted small">Consensus Layer (CL)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLPeerID }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLPeerID }}" data-bs-toggle="tooltip" title="Copy CL Peer ID to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ else }}
         <div class="input-group">
           <input type="text" class="form-control font-monospace" value="{{ .PeerID }}" readonly>
           <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .PeerID }}" data-bs-toggle="tooltip" title="Copy Peer ID to clipboard">
             <i class="fa fa-copy"></i>
           </button>
         </div>
+        {{ end }}
       </div>
     </div>
 

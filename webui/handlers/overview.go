@@ -35,8 +35,10 @@ type OverviewPageData struct {
 	// Per-identity records, populated when EL and CL use distinct keys. CL has no
 	// enode field: enode:// is EL/discv4-only.
 	SeparateIdentities bool
+	ELPeerID           string
 	ELLocalENR         string
 	ELLocalEnode       string
+	CLPeerID           string
 	CLLocalENR         string
 	CurrentFork    string
 	CurrentDigest  string
@@ -243,10 +245,12 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	if fh.bootnodeService.HasSeparateIdentities() {
 		pageData.SeparateIdentities = true
 		if elNode := fh.bootnodeService.ELLocalNode(); elNode != nil {
+			pageData.ELPeerID = elNode.ID().String()
 			pageData.ELLocalENR, _ = elNode.Record().EncodeBase64()
 			pageData.ELLocalEnode = deriveEnodeFromENR(elNode.Record())
 		}
 		if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
+			pageData.CLPeerID = clNode.ID().String()
 			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
 		}
 	}
