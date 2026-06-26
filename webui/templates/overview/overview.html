@@ -3,6 +3,44 @@
     <h3 class="py-2">Bootnode Overview</h3>
 
     <!-- ENR Header Section -->
+    {{ if .SeparateIdentities }}
+    {{ if .ELLocalENR }}
+    <div class="card mt-3">
+      <div class="card-body">
+        <h5 class="card-title">Execution Layer (EL) ENR</h5>
+        <p class="text-muted mb-3">Share this ENR with EL peers. The EL identity uses its own node key.</p>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .ELLocalENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ if .ELLocalEnode }}
+        <div class="input-group mt-2">
+          <input type="text" class="form-control font-monospace" value="{{ .ELLocalEnode }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLocalEnode }}" data-bs-toggle="tooltip" title="Copy Enode to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
+      </div>
+    </div>
+    {{ end }}
+    {{ if .CLLocalENR }}
+    <div class="card mt-3">
+      <div class="card-body">
+        <h5 class="card-title">Consensus Layer (CL) ENR</h5>
+        <p class="text-muted mb-3">Share this ENR with CL peers. The CL identity uses its own node key.</p>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLLocalENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLLocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+    {{ end }}
+    {{ else }}
     {{ if .LocalENR }}
     <div class="card mt-3">
       <div class="card-body">
@@ -32,6 +70,7 @@
         </div>
       </div>
     </div>
+    {{ end }}
     {{ end }}
 
     <!-- Peer ID Section -->

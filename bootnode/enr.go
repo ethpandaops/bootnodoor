@@ -1,6 +1,7 @@
 package bootnode
 
 import (
+	"crypto/ecdsa"
 	"fmt"
 	"net"
 
@@ -10,10 +11,23 @@ import (
 	"github.com/ethpandaops/bootnodoor/enr"
 )
 
-// ENRManager handles ENR creation and updates with both eth and eth2 fields.
+// ENRManager handles ENR creation and updates for a single identity.
+//
+// The fork filters (elFilter/clFilter) are always built for whatever layers the
+// chain config enables, so any manager can classify a remote node as EL or CL.
+// The eth/eth2 fields written into this manager's own record, however, are gated
+// by servesEL/servesCL: an EL-only identity advertises only eth, a CL-only identity
+// only eth2, and a shared identity advertises both.
 type ENRManager struct {
 	// config is the bootnode configuration
 	config *Config
+
+	// key signs this identity's ENR records
+	key *ecdsa.PrivateKey
+
+	// servesEL/servesCL control which fork fields this identity advertises
+	servesEL bool
+	servesCL bool
 
 	// elFilter is the EL fork ID filter (nil if EL disabled)
 	elFilter *elconfig.ForkFilter
@@ -25,10 +39,13 @@ type ENRManager struct {
 	localNode *v5node.Node
 }
 
-// NewENRManager creates a new ENR manager.
-func NewENRManager(cfg *Config, localNode *v5node.Node) *ENRManager {
+// NewENRManager creates a new ENR manager for one identity.
+func NewENRManager(cfg *Config, key *ecdsa.PrivateKey, localNode *v5node.Node, servesEL, servesCL bool) *ENRManager {
 	manager := &ENRManager{
 		config:    cfg,
+		key:       key,
+		servesEL:  servesEL,
+		servesCL:  servesCL,
 		localNode: localNode,
 	}
 
@@ -65,8 +82,8 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 		return fmt.Errorf("failed to clone ENR: %w", err)
 	}
 
-	// Add EL 'eth' field if enabled
-	if m.config.HasEL() {
+	// Add EL 'eth' field if this identity serves EL
+	if m.servesEL && m.config.HasEL() {
 		forkID := m.elFilter.GetCurrentForkID(currentBlock, currentTime)
 		// Set eth field as a list of fork IDs - ENR.Set() will handle RLP encoding
 		// The eth field format is [[Hash, Next]] - a list containing fork IDs
@@ -84,8 +101,8 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 		m.config.Logger.WithField("forkID", forkID.String()).Debug("updated ENR with eth field")
 	}
 
-	// Add CL 'eth2' field if enabled
-	if m.config.HasCL() {
+	// Add CL 'eth2' field if this identity serves CL
+	if m.servesCL && m.config.HasCL() {
 		eth2Field := m.clFilter.ComputeEth2Field()
 		newRecord.Set("eth2", eth2Field)
 
@@ -101,7 +118,7 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 	newRecord.SetSeq(record.Seq() + 1)
 
 	// Re-sign the record
-	if err := newRecord.Sign(m.config.PrivateKey); err != nil {
+	if err := newRecord.Sign(m.key); err != nil {
 		return fmt.Errorf("failed to sign ENR: %w", err)
 	}
 
@@ -194,7 +211,7 @@ func (m *ENRManager) UpdateENRWithIP(ip net.IP, port uint16) error {
 	newRecord.SetSeq(record.Seq() + 1)
 
 	// Re-sign the record
-	if err := newRecord.Sign(m.config.PrivateKey); err != nil {
+	if err := newRecord.Sign(m.key); err != nil {
 		return fmt.Errorf("failed to sign ENR: %w", err)
 	}
 
@@ -225,7 +242,7 @@ func (m *ENRManager) UpdateENRWithIP6(ip net.IP, port uint16) error {
 	newRecord.SetSeq(record.Seq() + 1)
 
 	// Re-sign the record
-	if err := newRecord.Sign(m.config.PrivateKey); err != nil {
+	if err := newRecord.Sign(m.key); err != nil {
 		return fmt.Errorf("failed to sign ENR: %w", err)
 	}
 

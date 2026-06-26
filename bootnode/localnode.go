@@ -1,24 +1,25 @@
 package bootnode
 
 import (
+	"crypto/ecdsa"
 	"fmt"
+	"net"
 
 	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enr"
 )
 
-// createLocalNode creates the local node with ENR.
+// createLocalNode creates a local node with ENR for one identity.
 //
-// This generates the local node that will be shared across both discv4 and discv5.
-// The ENR will contain all network information and will be updated with eth/eth2 fields later.
-func createLocalNode(cfg *Config, storedENR *enr.Record) (*v5node.Node, error) {
+// The ENR will be updated with eth/eth2 fields later by the ENRManager.
+func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, enrPort uint16, storedENR *enr.Record) (*v5node.Node, error) {
 	var localENR *enr.Record
 	var err error
 
 	if storedENR != nil {
-		// Use stored ENR as baseline, but verify it matches our private key
+		// Use stored ENR as baseline, but verify it matches this identity's key
 		pubKey := storedENR.PublicKey()
-		if pubKey != nil && pubKey.Equal(&cfg.PrivateKey.PublicKey) {
+		if pubKey != nil && pubKey.Equal(&key.PublicKey) {
 			localENR = storedENR
 			cfg.Logger.Debug("using stored ENR as baseline")
 		} else {
@@ -28,7 +29,7 @@ func createLocalNode(cfg *Config, storedENR *enr.Record) (*v5node.Node, error) {
 
 	// Create new ENR if we don't have a valid one
 	if localENR == nil {
-		localENR, err = buildENR(cfg)
+		localENR, err = buildENR(key, enrIP, enrIP6, enrPort)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build ENR: %w", err)
 		}
@@ -45,45 +46,37 @@ func createLocalNode(cfg *Config, storedENR *enr.Record) (*v5node.Node, error) {
 	return node, nil
 }
 
-// buildENR builds a new ENR record from configuration.
-func buildENR(cfg *Config) (*enr.Record, error) {
+// buildENR builds a new ENR record for one identity.
+func buildENR(key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, enrPort uint16) (*enr.Record, error) {
 	record := enr.New()
 
 	// Set identity scheme (v4) and public key
 	record.Set(enr.WithIdentityScheme("v4"))
-	record.Set(enr.WithPublicKey(&cfg.PrivateKey.PublicKey))
+	record.Set(enr.WithPublicKey(&key.PublicKey))
 
 	// Set IP addresses
-	if cfg.ENRIP != nil {
-		if ipv4 := cfg.ENRIP.To4(); ipv4 != nil {
+	if enrIP != nil {
+		if ipv4 := enrIP.To4(); ipv4 != nil {
 			record.Set("ip", ipv4)
 		}
 	}
-	if cfg.ENRIP6 != nil {
-		if ipv6 := cfg.ENRIP6.To16(); ipv6 != nil {
+	if enrIP6 != nil {
+		if ipv6 := enrIP6.To16(); ipv6 != nil {
 			record.Set("ip6", ipv6)
 		}
 	}
 
-	// Set UDP port
-	if cfg.ENRPort > 0 {
-		record.Set("udp", cfg.ENRPort)
-	} else if cfg.BindPort > 0 {
-		record.Set("udp", cfg.BindPort)
-	}
-
-	// Set TCP port (same as UDP for now)
-	if cfg.ENRPort > 0 {
-		record.Set("tcp", cfg.ENRPort)
-	} else if cfg.BindPort > 0 {
-		record.Set("tcp", cfg.BindPort)
+	// Set UDP and TCP ports (TCP same as UDP for now)
+	if enrPort > 0 {
+		record.Set("udp", enrPort)
+		record.Set("tcp", enrPort)
 	}
 
 	// Set sequence number to 1
 	record.SetSeq(1)
 
 	// Sign the record
-	if err := record.Sign(cfg.PrivateKey); err != nil {
+	if err := record.Sign(key); err != nil {
 		return nil, fmt.Errorf("failed to sign ENR: %w", err)
 	}
 

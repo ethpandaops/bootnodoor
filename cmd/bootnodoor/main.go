@@ -21,6 +21,7 @@ import (
 	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
+	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/webui"
 	"github.com/ethpandaops/bootnodoor/webui/types"
@@ -28,8 +29,10 @@ import (
 
 var (
 	// Flags
-	privateKeyHex string
-	nodeDBPath    string
+	privateKeyHex   string
+	elPrivateKeyHex string
+	clPrivateKeyHex string
+	nodeDBPath      string
 
 	// EL configuration
 	elConfigPath    string
@@ -47,6 +50,12 @@ var (
 	// Network binding
 	bindAddr string
 	bindPort int
+
+	// Per-layer port overrides (for migrating distinct EL/CL bootnodes)
+	elBindPort int
+	clBindPort int
+	elEnrPort  int
+	clEnrPort  int
 
 	// ENR configuration
 	enrIP   string
@@ -92,9 +101,12 @@ Consensus Layer (CL) clients, with support for:
 )
 
 func init() {
-	// Private key
-	rootCmd.Flags().StringVar(&privateKeyHex, "private-key", "", "Private key in hex format (required)")
-	rootCmd.MarkFlagRequired("private-key")
+	// Private key. --private-key is the shared key used for both layers; supply
+	// --el-private-key and/or --cl-private-key to give the EL and CL identities
+	// distinct keys (e.g. when migrating from separate EL and CL bootnodes).
+	rootCmd.Flags().StringVar(&privateKeyHex, "private-key", "", "Private key in hex format (shared fallback for both layers)")
+	rootCmd.Flags().StringVar(&elPrivateKeyHex, "el-private-key", "", "Private key for the EL identity (hex or file; falls back to --private-key)")
+	rootCmd.Flags().StringVar(&clPrivateKeyHex, "cl-private-key", "", "Private key for the CL identity (hex or file; falls back to --private-key)")
 
 	// Node database
 	rootCmd.Flags().StringVar(&nodeDBPath, "nodedb", "", "Path to node database directory (empty = in-memory)")
@@ -115,6 +127,14 @@ func init() {
 	// Network binding
 	rootCmd.Flags().StringVar(&bindAddr, "bind-addr", "0.0.0.0", "IP address to bind to")
 	rootCmd.Flags().IntVar(&bindPort, "bind-port", 9000, "UDP port to bind to")
+
+	// Per-layer port overrides. When the EL and CL identities use different keys,
+	// these let each keep its legacy port (e.g. EL on 30303, CL on 9000) so peers
+	// that hardcoded the old bootnode endpoints stay connected.
+	rootCmd.Flags().IntVar(&elBindPort, "el-port", 0, "UDP port for the EL identity (0 = use --bind-port)")
+	rootCmd.Flags().IntVar(&clBindPort, "cl-port", 0, "UDP port for the CL identity (0 = use --bind-port)")
+	rootCmd.Flags().IntVar(&elEnrPort, "el-enr-port", 0, "UDP port the EL identity advertises in its ENR (0 = use --el-port)")
+	rootCmd.Flags().IntVar(&clEnrPort, "cl-enr-port", 0, "UDP port the CL identity advertises in its ENR (0 = use --cl-port)")
 
 	// ENR configuration
 	rootCmd.Flags().StringVar(&enrIP, "enr-ip", "", "IPv4 address to advertise in ENR (auto-detected if not specified)")
@@ -164,10 +184,34 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Parse private key (supports file paths)
-	privKey, err := parsePrivateKey(privateKeyHex)
-	if err != nil {
-		return fmt.Errorf("invalid private key: %w", err)
+	// Parse private keys (each supports hex or file path). The shared key is
+	// optional when per-layer keys cover every enabled layer; bootnode.New
+	// validates that each enabled layer ends up with a key.
+	var privKey, elKey, clKey *ecdsa.PrivateKey
+	if privateKeyHex != "" {
+		if privKey, err = parsePrivateKey(privateKeyHex); err != nil {
+			return fmt.Errorf("invalid private key: %w", err)
+		}
+	}
+	if elPrivateKeyHex != "" {
+		if elKey, err = parsePrivateKey(elPrivateKeyHex); err != nil {
+			return fmt.Errorf("invalid EL private key: %w", err)
+		}
+	}
+	if clPrivateKeyHex != "" {
+		if clKey, err = parsePrivateKey(clPrivateKeyHex); err != nil {
+			return fmt.Errorf("invalid CL private key: %w", err)
+		}
+	}
+
+	// The devnet shim is a single-ENR dev tool; resolve one key for it.
+	shimKey := privKey
+	if shimKey == nil {
+		if elKey != nil {
+			shimKey = elKey
+		} else {
+			shimKey = clKey
+		}
 	}
 
 	// Parse EL config if provided (needed for both shim and normal mode)
@@ -337,7 +381,10 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 
 	// Check if running in devnet shim mode (after parsing configs)
 	if devnetShim != "" {
-		return runDevnetShim(logger, privKey, devnetShim, elConfig, elGenesisHashBytes, elGenesisTime, clConfig, clGenesisTime, gracePeriod)
+		if shimKey == nil {
+			return fmt.Errorf("devnet-shim requires a private key (--private-key, --el-private-key or --cl-private-key)")
+		}
+		return runDevnetShim(logger, shimKey, devnetShim, elConfig, elGenesisHashBytes, elGenesisTime, clConfig, clGenesisTime, gracePeriod)
 	}
 
 	// Validate: at least one layer must be configured (only for normal mode)
@@ -440,9 +487,15 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	// Create bootnode service config
 	config := bootnode.DefaultConfig()
 	config.PrivateKey = privKey
+	config.ELPrivateKey = elKey
+	config.CLPrivateKey = clKey
 	config.Database = sqliteDB
 	config.BindIP = bindIP
 	config.BindPort = uint16(bindPort)
+	config.ELBindPort = uint16(elBindPort)
+	config.CLBindPort = uint16(clBindPort)
+	config.ELENRPort = uint16(elEnrPort)
+	config.CLENRPort = uint16(clEnrPort)
 	config.ENRIP = enrIPv4
 	config.ENRIP6 = enrIPv6
 	config.ENRPort = enrUDPPort
@@ -472,18 +525,13 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create bootnode service: %w", err)
 	}
 
-	// Print node information
-	localNode := service.LocalNode()
-	logger.WithFields(logrus.Fields{
-		"nodeID":      localNode.ID().String()[:16] + "...",
-		"bindAddress": fmt.Sprintf("%s:%d", bindAddr, bindPort),
-		"enrAddress":  fmt.Sprintf("%s:%d", enrIPv4.String(), enrUDPPort),
-	}).Info("bootnode information")
-
-	// Print ENR
-	enrStr, err := localNode.Record().EncodeBase64()
-	if err == nil {
-		logger.WithField("enr", enrStr).Info("local ENR")
+	// Print node information, per identity. When the EL and CL identities use
+	// distinct keys they have distinct node IDs/ENRs, so log them separately.
+	if service.HasSeparateIdentities() {
+		logIdentity(logger, "EL", service.ELLocalNode())
+		logIdentity(logger, "CL", service.CLLocalNode())
+	} else {
+		logIdentity(logger, "", service.LocalNode())
 	}
 
 	// Start bootnode service
@@ -532,6 +580,46 @@ func startWebUI(service *bootnode.Service) {
 	}
 
 	webui.StartHttpServer(config, logger, service)
+}
+
+// logIdentity prints one identity's node ID, enode URL and ENR. The layer label
+// is empty for a single shared identity and "EL"/"CL" for separate identities.
+func logIdentity(logger *logrus.Logger, layer string, n *v5node.Node) {
+	if n == nil {
+		return
+	}
+	record := n.Record()
+
+	fields := logrus.Fields{"nodeID": n.ID().String()[:16] + "..."}
+	if layer != "" {
+		fields["layer"] = layer
+	}
+	if enodeURL := deriveEnodeFromENR(record); enodeURL != "" {
+		fields["enode"] = enodeURL
+	}
+	logger.WithFields(fields).Info("bootnode identity")
+
+	if enrStr, err := record.EncodeBase64(); err == nil {
+		enrFields := logrus.Fields{"enr": enrStr}
+		if layer != "" {
+			enrFields["layer"] = layer
+		}
+		logger.WithFields(enrFields).Info("local ENR")
+	}
+}
+
+// deriveEnodeFromENR builds an enode:// URL from a record's pubkey, IP and port.
+func deriveEnodeFromENR(record *enr.Record) string {
+	ip := record.IP()
+	udpPort := record.UDP()
+	pubKey := record.PublicKey()
+	if ip == nil || udpPort == 0 || pubKey == nil {
+		return ""
+	}
+
+	// enode IDs use the uncompressed pubkey without the 0x04 prefix.
+	pubKeyHex := hex.EncodeToString(ethcrypto.FromECDSAPub(pubKey)[1:])
+	return fmt.Sprintf("enode://%s@%s:%d", pubKeyHex, ip.String(), udpPort)
 }
 
 // getLocalIP attempts to detect a local non-loopback IP address.

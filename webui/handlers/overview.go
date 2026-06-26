@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enode"
 	"github.com/ethpandaops/bootnodoor/webui/server"
 )
@@ -30,6 +31,13 @@ type OverviewPageData struct {
 	LocalENR       string
 	LocalEnode     string // NEW: Enode derived from ENR
 	LocalENRSeq    uint64
+
+	// Per-identity records, populated when EL and CL use distinct keys.
+	SeparateIdentities bool
+	ELLocalENR         string
+	ELLocalEnode       string
+	CLLocalENR         string
+	CLLocalEnode       string
 	CurrentFork    string
 	CurrentDigest  string
 	PreviousFork   string
@@ -114,9 +122,25 @@ type OldDigestInfo struct {
 	Remaining time.Duration
 }
 
-// ENR serves the local ENR as plain text
+// localNodeForLayer returns the local node for the ?layer=el|cl query param,
+// falling back to the primary identity for any other value.
+func (fh *FrontendHandler) localNodeForLayer(r *http.Request) *v5node.Node {
+	switch r.URL.Query().Get("layer") {
+	case "el":
+		if n := fh.bootnodeService.ELLocalNode(); n != nil {
+			return n
+		}
+	case "cl":
+		if n := fh.bootnodeService.CLLocalNode(); n != nil {
+			return n
+		}
+	}
+	return fh.bootnodeService.LocalNode()
+}
+
+// ENR serves the local ENR as plain text (use ?layer=el|cl to select identity)
 func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.bootnodeService.LocalNode()
+	localNode := fh.localNodeForLayer(r)
 	localENR, err := localNode.Record().EncodeBase64()
 	if err != nil {
 		http.Error(w, "Failed to encode ENR", http.StatusInternalServerError)
@@ -127,9 +151,9 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(localENR))
 }
 
-// Enode serves the local enode URL as plain text
+// Enode serves the local enode URL as plain text (use ?layer=el|cl to select)
 func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.bootnodeService.LocalNode()
+	localNode := fh.localNodeForLayer(r)
 
 	// Get TCP port from ENR, fallback to UDP port if not available
 	tcpPort := localNode.TCPPort()
@@ -213,6 +237,19 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		LocalENR:    localENR,
 		LocalEnode:  localEnode,
 		LocalENRSeq: localNode.Record().Seq(),
+	}
+
+	// When EL and CL run under distinct keys, expose each identity's record.
+	if fh.bootnodeService.HasSeparateIdentities() {
+		pageData.SeparateIdentities = true
+		if elNode := fh.bootnodeService.ELLocalNode(); elNode != nil {
+			pageData.ELLocalENR, _ = elNode.Record().EncodeBase64()
+			pageData.ELLocalEnode = deriveEnodeFromENR(elNode.Record())
+		}
+		if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
+			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
+			pageData.CLLocalEnode = deriveEnodeFromENR(clNode.Record())
+		}
 	}
 
 	// Get EL table stats if available
