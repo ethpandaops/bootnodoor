@@ -4,12 +4,14 @@ import (
 	"crypto/ecdsa"
 	"net"
 	"testing"
+	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
 	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/services"
 	"github.com/sirupsen/logrus"
 )
 
@@ -280,5 +282,65 @@ func TestValidate_MissingKeyForEnabledLayerRejected(t *testing.T) {
 	cfg.PrivateKey = nil // no key for either layer
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("an enabled layer without a key should be rejected")
+	}
+}
+
+// ipDiscoveryService wires an IPDiscovery that signals the consensus port on a
+// channel, plus a Service holding the given identities.
+func ipDiscoveryService(t *testing.T, ids []*identity) (*Service, <-chan uint16) {
+	t.Helper()
+	consensus := make(chan uint16, 1)
+	ipd := services.NewIPDiscovery(services.IPDiscoveryConfig{
+		MinReports:     3,
+		MinDistinctIPs: 3,
+		Logger:         quietLogger(),
+		OnConsensusReached: func(_ net.IP, port uint16, _ bool) {
+			select {
+			case consensus <- port:
+			default:
+			}
+		},
+	})
+	return &Service{config: &Config{Logger: quietLogger()}, identities: ids, ipDiscovery: ipd}, consensus
+}
+
+// Split sockets observe different external ports; onPongReceived must bucket
+// them so IP-discovery consensus is reachable (the bug fixed in 6ff551f).
+func TestOnPongReceived_SplitSocketReachesConsensus(t *testing.T) {
+	s, consensus := ipDiscoveryService(t, []*identity{
+		{key: mustKey(t), servesEL: true, bindPort: 30303, enrPort: 30303},
+		{key: mustKey(t), servesCL: true, bindPort: 9000, enrPort: 9000},
+	})
+
+	// Same external IP, different observed ports (one per socket), distinct reporters.
+	s.onPongReceived([]byte("reporter-a-1"), net.ParseIP("10.0.0.1"), net.ParseIP("9.9.9.9"), 30303)
+	s.onPongReceived([]byte("reporter-b-2"), net.ParseIP("10.0.0.2"), net.ParseIP("9.9.9.9"), 9000)
+	s.onPongReceived([]byte("reporter-c-3"), net.ParseIP("10.0.0.3"), net.ParseIP("9.9.9.9"), 40404)
+
+	select {
+	case <-consensus:
+	case <-time.After(2 * time.Second):
+		t.Fatal("split-socket PONGs never reached IP-discovery consensus")
+	}
+}
+
+// A single shared socket must keep the externally-observed port so a NAT port
+// remap still self-corrects.
+func TestOnPongReceived_SingleSocketKeepsObservedPort(t *testing.T) {
+	s, consensus := ipDiscoveryService(t, []*identity{
+		{key: mustKey(t), servesEL: true, servesCL: true, bindPort: 9000, enrPort: 9000},
+	})
+
+	for i, reporter := range []string{"reporter-a-1", "reporter-b-2", "reporter-c-3"} {
+		s.onPongReceived([]byte(reporter), net.IPv4(10, 0, 0, byte(i+1)), net.ParseIP("9.9.9.9"), 31000)
+	}
+
+	select {
+	case port := <-consensus:
+		if port != 31000 {
+			t.Errorf("single-socket consensus port = %d, want observed 31000", port)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("single-socket PONGs never reached IP-discovery consensus")
 	}
 }
