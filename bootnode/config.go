@@ -183,6 +183,14 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("private key is required (set --private-key or --cl-private-key)")
 	}
 
+	// A node ID is derived from its key, so EL and CL sharing a key are one
+	// identity and cannot be split across different ports. Distinct ports require
+	// distinct keys.
+	if c.HasEL() && c.HasCL() && sameKey(c.elKey(), c.clKey()) &&
+		(c.elBindPort() != c.clBindPort() || c.elENRPort() != c.clENRPort()) {
+		return fmt.Errorf("EL and CL share a key but use different ports; separate ports require separate keys (set --el-private-key/--cl-private-key)")
+	}
+
 	// Validate EL config if provided
 	if c.ELConfig != nil {
 		if c.ELGenesisHash == [32]byte{} {

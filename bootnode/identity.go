@@ -41,14 +41,12 @@ type identity struct {
 
 // resolveIdentities turns the (possibly per-layer) key/port config into the set
 // of identities to run. EL and CL collapse into a single shared identity when
-// they resolve to the same key, bind port and advertised port.
+// they share a key (a key uniquely determines the node ID, so the same key is
+// always one identity; Validate rejects same-key-different-port configs).
 func resolveIdentities(cfg *Config) []*identity {
 	elKey, clKey := cfg.elKey(), cfg.clKey()
 
-	shared := cfg.HasEL() && cfg.HasCL() &&
-		sameKey(elKey, clKey) &&
-		cfg.elBindPort() == cfg.clBindPort() &&
-		cfg.elENRPort() == cfg.clENRPort()
+	shared := cfg.HasEL() && cfg.HasCL() && sameKey(elKey, clKey)
 
 	if shared {
 		return []*identity{newIdentity(cfg, elKey, true, true, cfg.elBindPort(), cfg.elENRPort(), localENRKey)}
