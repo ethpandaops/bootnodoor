@@ -65,18 +65,19 @@ func buildENR(cfg *Config) (*enr.Record, error) {
 		}
 	}
 
-	// Set UDP port
-	if cfg.ENRPort > 0 {
-		record.Set("udp", cfg.ENRPort)
-	} else if cfg.BindPort > 0 {
-		record.Set("udp", cfg.BindPort)
+	// Set UDP/TCP ports
+	port := cfg.ENRPort
+	if port == 0 {
+		port = cfg.BindPort
 	}
-
-	// Set TCP port (same as UDP for now)
-	if cfg.ENRPort > 0 {
-		record.Set("tcp", cfg.ENRPort)
-	} else if cfg.BindPort > 0 {
-		record.Set("tcp", cfg.BindPort)
+	if port > 0 {
+		record.Set("udp", port)
+		record.Set("tcp", port)
+		// ip6 needs udp6/tcp6 to be a usable endpoint.
+		if cfg.ENRIP6 != nil && cfg.ENRIP6.To16() != nil {
+			record.Set("udp6", port)
+			record.Set("tcp6", port)
+		}
 	}
 
 	// Set sequence number to 1

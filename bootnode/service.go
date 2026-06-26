@@ -108,7 +108,8 @@ func New(cfg *Config) (*Service, error) {
 	}
 
 	// Create UDP transport (shared by both protocols)
-	listenAddr := fmt.Sprintf("%s:%d", cfg.BindIP.String(), cfg.BindPort)
+	// JoinHostPort so an IPv6 bind addr becomes [::]:port, not :::port.
+	listenAddr := net.JoinHostPort(cfg.BindIP.String(), fmt.Sprintf("%d", cfg.BindPort))
 	transportConfig := &transport.Config{
 		ListenAddr: listenAddr,
 		Logger:     cfg.Logger,
