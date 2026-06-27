@@ -380,8 +380,8 @@ The dashboard shows:
 - `GET /` - Web dashboard overview
 - `GET /el-nodes` - EL nodes list page
 - `GET /cl-nodes` - CL nodes list page
-- `GET /enr` - Local ENR in base64 format
-- `GET /enode` - Local enode URL (EL format)
+- `GET /enr` - Local ENR in base64 format (use `?layer=el|cl` to select an identity, `?generic=1` for the fork-stripped record)
+- `GET /enode` - Local enode URL (EL only; discovery-only, so it advertises `tcp=0` with the UDP port in `?discport=`)
 - `GET /metrics` - Prometheus metrics (when enabled)
 - `GET /debug/pprof/` - Performance profiling (when `--pprof` enabled)
 

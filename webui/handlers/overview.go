@@ -180,13 +180,13 @@ func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// enode carries the discovery (UDP) port; the bootnode serves no TCP.
-	port := localNode.UDPPort()
+	// A bootnode serves no RLPx, so it advertises tcp=0 and carries the
+	// discovery (UDP) port in ?discport= (enode://…@ip:0?discport=…).
 	localEnode := &enode.Enode{
 		PublicKey: localNode.PublicKey(),
 		IP:        localNode.IP(),
-		TCP:       port,
-		UDP:       port,
+		TCP:       0,
+		UDP:       localNode.UDPPort(),
 	}
 
 	w.Header().Set("Content-Type", "text/plain")
@@ -482,6 +482,7 @@ func deriveEnodeFromENR(record interface {
 	// Format IP address
 	ipStr := ip.String()
 
-	// Build enode URL
-	return fmt.Sprintf("enode://%s@%s:%d", pubKeyHex, ipStr, udpPort)
+	// A bootnode serves no RLPx, so advertise tcp=0 and carry the discovery
+	// (UDP) port in ?discport=.
+	return fmt.Sprintf("enode://%s@%s:0?discport=%d", pubKeyHex, ipStr, udpPort)
 }

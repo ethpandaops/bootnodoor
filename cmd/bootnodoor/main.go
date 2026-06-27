@@ -611,11 +611,11 @@ func logIdentity(logger *logrus.Logger, service *bootnode.Service, layer string,
 	if ip6 := record.IP6(); ip6 != nil && record.UDP6() != 0 {
 		fields["advertised6"] = net.JoinHostPort(ip6.String(), fmt.Sprintf("%d", record.UDP6()))
 	}
-	// enode:// is EL/discv4-only; CL peers use the ENR. A bootnode serves no TCP,
-	// so the enode carries the discovery (UDP) port.
+	// enode:// is EL/discv4-only; CL peers use the ENR. A bootnode serves no
+	// RLPx, so it advertises tcp=0 and carries the discovery (UDP) port in
+	// ?discport= (enode://…@ip:0?discport=…), matching its tcp-less ENR.
 	if pub := record.PublicKey(); layer != "CL" && pub != nil && record.IP() != nil && record.UDP() != 0 {
-		port := record.UDP()
-		e := &enode.Enode{PublicKey: pub, IP: record.IP(), TCP: port, UDP: port}
+		e := &enode.Enode{PublicKey: pub, IP: record.IP(), TCP: 0, UDP: record.UDP()}
 		fields["enode"] = e.String()
 	}
 	logger.WithFields(fields).Info("bootnode identity")
@@ -687,8 +687,9 @@ func runDevnetShim(
 	// flag, which may be empty when --el-private-key/--cl-private-key was used.
 	privKeyHex := hex.EncodeToString(ethcrypto.FromECDSA(privKey))
 
-	// Generate enode URL (for EL)
-	enode := fmt.Sprintf("enode://%x@%s:%s", ethcrypto.FromECDSAPub(pubKey)[1:], shimIP, shimPort)
+	// Generate enode URL (for EL). A bootnode serves no RLPx, so advertise
+	// tcp=0 and carry the discovery port in ?discport=, matching the tcp-less ENR.
+	enode := fmt.Sprintf("enode://%x@%s:0?discport=%s", ethcrypto.FromECDSAPub(pubKey)[1:], shimIP, shimPort)
 
 	// Generate ENR using the exact same logic as buildENR in bootnode/localnode.go
 	record := enr.New()
