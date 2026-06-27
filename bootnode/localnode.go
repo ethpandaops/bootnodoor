@@ -68,6 +68,12 @@ func reconcileStoredENR(cfg *Config, rec *enr.Record, enrIP, enrIP6 net.IP, enrP
 			rec.Set("ip6", enrIP6.To16())
 			changed = true
 		}
+	} else if !cfg.ENRIP6Provided && !cfg.EnableIPDiscovery && rec.IP6() != nil {
+		// No v6 source remains (the operator dropped --enr-ip6 and discovery is
+		// off), so a stored ip6/udp6 is stale — strip it instead of advertising it.
+		rec.Delete("ip6")
+		rec.Delete("udp6")
+		changed = true
 	}
 
 	// A udp/udp6 port is only meaningful alongside the matching IP family.

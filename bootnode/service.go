@@ -1365,6 +1365,10 @@ func (s *Service) GenericENR(node *v5node.Node) (string, error) {
 		}
 		rec.Delete("eth")
 		rec.Delete("eth2")
+		// Keep the live sequence number deliberately: a peer seeded from this
+		// generic record then keeps it (discv5 only adopts a strictly-higher seq),
+		// so the bootnode stays fork-agnostic for that peer and is never pruned by
+		// fork-digest filtering — the reason static lists omit fork fields.
 		if err := rec.Sign(id.key); err != nil {
 			return "", err
 		}

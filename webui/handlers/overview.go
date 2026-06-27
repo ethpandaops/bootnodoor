@@ -30,7 +30,7 @@ type OverviewPageData struct {
 	BindAddress string
 	LocalENR    string
 	GenericENR  string // ENR with fork fields stripped, for static bootnode lists
-	LocalEnode  string // NEW: Enode derived from ENR
+	LocalEnode  string
 	LocalENRSeq uint64
 
 	// Per-identity records, populated when EL and CL use distinct keys. CL has no

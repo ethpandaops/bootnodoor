@@ -305,7 +305,7 @@ func ipDiscoveryService(t *testing.T, ids []*identity) (*Service, <-chan uint16)
 }
 
 // Split sockets observe different external ports; onPongReceived must bucket
-// them so IP-discovery consensus is reachable (the bug fixed in 6ff551f).
+// them so IP-discovery consensus is reachable.
 func TestOnPongReceived_SplitSocketReachesConsensus(t *testing.T) {
 	s, consensus := ipDiscoveryService(t, []*identity{
 		{key: mustKey(t), servesEL: true, bindPort: 30303, enrPort: 30303},
@@ -417,6 +417,29 @@ func TestCreateLocalNode_AutoDetectedIPPreservesStored(t *testing.T) {
 	}
 	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("1.2.3.4")) {
 		t.Errorf("ENR ip = %v, want preserved 1.2.3.4", ip)
+	}
+}
+
+// Dropping --enr-ip6 with discovery off must strip a stale stored ip6/udp6 so the
+// bootnode stops advertising a v6 endpoint it no longer has a source for.
+func TestCreateLocalNode_RemovedIPv6Stripped(t *testing.T) {
+	key := mustKey(t)
+	stored, err := buildENR(key, net.ParseIP("1.2.3.4"), net.ParseIP("2001:db8::9"), 9000)
+	if err != nil {
+		t.Fatalf("buildENR: %v", err)
+	}
+	cfg := &Config{Logger: quietLogger(), ENRIPProvided: false, ENRIP6Provided: false, EnableIPDiscovery: false}
+
+	ln, err := createLocalNode(cfg, key, net.ParseIP("5.6.7.8"), nil, 9000, stored)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+	rec := ln.Record()
+	if ip6 := rec.IP6(); ip6 != nil {
+		t.Errorf("ENR ip6 = %v, want nil after --enr-ip6 dropped", ip6)
+	}
+	if rec.UDP6() != 0 {
+		t.Errorf("ENR udp6 = %d, want 0 after --enr-ip6 dropped", rec.UDP6())
 	}
 }
 
