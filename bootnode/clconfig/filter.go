@@ -348,12 +348,39 @@ func (f *ForkDigestFilter) ComputeEth2Field() []byte {
 	currentDigest := f.currentForkDigest
 	f.mu.RUnlock()
 
-	// For simplicity, use placeholder for next fork
-	// In production, this should track upcoming forks
-	nextForkVersion := [4]byte{0xff, 0xff, 0xff, 0xff}
-	nextForkEpoch := ^uint64(0) // Far future
+	nextForkVersion, nextForkEpoch := f.nextForkInfo()
 
 	return EncodeETH2Field(currentDigest, nextForkVersion, nextForkEpoch)
+}
+
+// nextForkInfo returns the next scheduled fork version and epoch for eth2 ENR.
+//
+// If there is no future fork in the config, this returns the current fork
+// version and FAR_FUTURE_EPOCH (uint64 max).
+func (f *ForkDigestFilter) nextForkInfo() ([4]byte, uint64) {
+	const farFutureEpoch = ^uint64(0)
+
+	genesisTime := f.config.GetGenesisTime()
+	secondsPerSlot := f.config.SecondsPerSlot
+	if secondsPerSlot == 0 {
+		secondsPerSlot = 12
+	}
+
+	currentEpoch := uint64(0)
+	if genesisTime > 0 {
+		slotsPerEpoch := f.config.GetSlotsPerEpoch()
+		currentEpoch = uint64(GetCurrentEpoch(genesisTime, uint64(time.Now().Unix()), secondsPerSlot, slotsPerEpoch))
+	}
+
+	currentForkVersion := f.config.GetForkVersionAtEpoch(currentEpoch)
+
+	for _, fork := range f.config.getForks() {
+		if fork.epoch > currentEpoch {
+			return fork.parsedVersion, fork.epoch
+		}
+	}
+
+	return currentForkVersion, farFutureEpoch
 }
 
 // ForkFilterStatsProvider interface methods for webui integration
