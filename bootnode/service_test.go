@@ -481,3 +481,50 @@ func TestGenericENR_StripsForkFields(t *testing.T) {
 		t.Error("generic ENR should keep the public key / node ID")
 	}
 }
+
+// In shared-key mode the live record carries both fork fields; ELENR/CLENR each
+// drop the other layer's field so single-layer clients that reject a foreign
+// field still accept the record.
+func TestLayerENR_StripsForeignForkField(t *testing.T) {
+	id := &identity{key: mustKey(t), servesEL: true, servesCL: true, bindPort: 9000, enrPort: 9000, storeKey: "local_enr"}
+	s := newTestService(t, []*identity{id})
+
+	rec := id.localNode.Record()
+	_ = rec.Set("eth", []byte{1, 2, 3, 4})
+	_ = rec.Set("eth2", []byte{5, 6, 7, 8})
+	rec.SetSeq(rec.Seq() + 1)
+	if err := rec.Sign(id.key); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	elStr, err := s.ELENR()
+	if err != nil {
+		t.Fatalf("ELENR: %v", err)
+	}
+	el, err := enr.DecodeBase64(elStr)
+	if err != nil {
+		t.Fatalf("decode EL: %v", err)
+	}
+	var v []byte
+	if err := el.Get("eth", &v); err != nil {
+		t.Error("EL ENR should keep eth")
+	}
+	if err := el.Get("eth2", &v); err == nil {
+		t.Error("EL ENR should not carry eth2")
+	}
+
+	clStr, err := s.CLENR()
+	if err != nil {
+		t.Fatalf("CLENR: %v", err)
+	}
+	cl, err := enr.DecodeBase64(clStr)
+	if err != nil {
+		t.Fatalf("decode CL: %v", err)
+	}
+	if err := cl.Get("eth2", &v); err != nil {
+		t.Error("CL ENR should keep eth2")
+	}
+	if err := cl.Get("eth", &v); err == nil {
+		t.Error("CL ENR should not carry eth")
+	}
+}

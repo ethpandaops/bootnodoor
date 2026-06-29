@@ -659,6 +659,23 @@ func getLocalIP() net.IP {
 }
 
 // parsePrivateKey parses a hex-encoded private key.
+// shimStrippedENR clones a signed shim record, removes the named fields, and
+// re-signs it — yielding the eth-only or eth2-only variant for single-layer
+// clients that reject an ENR carrying the other layer's fork field.
+func shimStrippedENR(base *enr.Record, key *ecdsa.PrivateKey, drop ...string) (string, error) {
+	rec, err := base.Clone()
+	if err != nil {
+		return "", err
+	}
+	for _, k := range drop {
+		rec.Delete(k)
+	}
+	if err := rec.Sign(key); err != nil {
+		return "", err
+	}
+	return rec.EncodeBase64()
+}
+
 func runDevnetShim(
 	logger *logrus.Logger,
 	privKey *ecdsa.PrivateKey,
@@ -763,17 +780,44 @@ func runDevnetShim(
 		return fmt.Errorf("failed to encode ENR: %w", err)
 	}
 
+	// Per-layer ENRs: some clients reject an ENR carrying the other layer's fork
+	// field, so also emit eth-only (EL) and eth2-only (CL) records. When only one
+	// layer is configured its variant equals the combined ENR.
+	var elENRString, clENRString string
+	if elConfig != nil {
+		if elENRString, err = shimStrippedENR(record, privKey, "eth2"); err != nil {
+			return fmt.Errorf("failed to encode EL ENR: %w", err)
+		}
+	}
+	if clConfig != nil {
+		if clENRString, err = shimStrippedENR(record, privKey, "eth"); err != nil {
+			return fmt.Errorf("failed to encode CL ENR: %w", err)
+		}
+	}
+
 	logger.Info("Running in devnet shim mode")
 	logger.Infof("Private key: %s...%s", privKeyHex[:10], privKeyHex[len(privKeyHex)-6:])
 	logger.Infof("Node ID: %s", nodeID.Hex())
 	logger.Infof("Enode: %s", enode)
 	logger.Infof("ENR: %s", enrString)
+	if elENRString != "" {
+		logger.Infof("EL ENR: %s", elENRString)
+	}
+	if clENRString != "" {
+		logger.Infof("CL ENR: %s", clENRString)
+	}
 	logger.Infof("Shim endpoint: %s", shimEndpoint)
 
 	// Output to stdout for easy capture
 	fmt.Println("=== BOOTNODE INFO ===")
 	fmt.Printf("ENODE=%s\n", enode)
 	fmt.Printf("ENR=%s\n", enrString)
+	if elENRString != "" {
+		fmt.Printf("EL_ENR=%s\n", elENRString)
+	}
+	if clENRString != "" {
+		fmt.Printf("CL_ENR=%s\n", clENRString)
+	}
 	fmt.Printf("NODE_ID=%s\n", nodeID.Hex())
 	fmt.Printf("PRIVKEY=%s\n", privKeyHex)
 	fmt.Println("=== END ===")
@@ -797,9 +841,29 @@ func runDevnetShim(
 		fmt.Fprintf(w, "%s", enrString)
 	})
 
+	http.HandleFunc("/el-enr", func(w http.ResponseWriter, r *http.Request) {
+		if elENRString == "" {
+			http.Error(w, "no EL ENR: this shim serves CL only", http.StatusNotFound)
+			return
+		}
+		logger.Infof("Serving EL ENR to %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", elENRString)
+	})
+
+	http.HandleFunc("/cl-enr", func(w http.ResponseWriter, r *http.Request) {
+		if clENRString == "" {
+			http.Error(w, "no CL ENR: this shim serves EL only", http.StatusNotFound)
+			return
+		}
+		logger.Infof("Serving CL ENR to %s", r.RemoteAddr)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s", clENRString)
+	})
+
 	http.HandleFunc("/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"enode":"%s","enr":"%s","node_id":"%s","privkey":"%s"}`, enode, enrString, nodeID.Hex(), privKeyHex)
+		fmt.Fprintf(w, `{"enode":"%s","enr":"%s","el_enr":"%s","cl_enr":"%s","node_id":"%s","privkey":"%s"}`, enode, enrString, elENRString, clENRString, nodeID.Hex(), privKeyHex)
 	})
 
 	// Start HTTP server in background

@@ -33,6 +33,13 @@ type OverviewPageData struct {
 	LocalEnode  string
 	LocalENRSeq uint64
 
+	// Layer-specific records for the shared-key, dual-layer case: the combined
+	// LocalENR carries both eth and eth2, which some single-layer clients reject,
+	// so we also surface the eth-only and eth2-only variants. Empty unless both
+	// layers run under one key.
+	ELLayerENR string
+	CLLayerENR string
+
 	// Per-identity records, populated when EL and CL use distinct keys. CL has no
 	// enode field: enode:// is EL/discv4-only.
 	SeparateIdentities bool
@@ -171,6 +178,30 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(localENR))
 }
 
+// ELENR serves the EL ENR with the CL-only eth2 field removed, as plain text.
+// This is the record to give EL clients, some of which reject an ENR carrying
+// eth2.
+func (fh *FrontendHandler) ELENR(w http.ResponseWriter, r *http.Request) {
+	enrStr, err := fh.bootnodeService.ELENR()
+	if err != nil {
+		http.Error(w, "no EL ENR: this bootnode serves CL only", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(enrStr))
+}
+
+// CLENR serves the CL ENR with the EL-only eth field removed, as plain text.
+func (fh *FrontendHandler) CLENR(w http.ResponseWriter, r *http.Request) {
+	enrStr, err := fh.bootnodeService.CLENR()
+	if err != nil {
+		http.Error(w, "no CL ENR: this bootnode serves EL only", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(enrStr))
+}
+
 // Enode serves the local enode URL. enode:// is EL/discv4-only, so it reflects
 // the EL identity; a CL-only bootnode has no enode (CL peers use the ENR).
 func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +295,14 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		GenericENR:  genericENR,
 		LocalEnode:  localEnode,
 		LocalENRSeq: localNode.Record().Seq(),
+	}
+
+	// Shared-key dual-layer node: also expose eth-only and eth2-only records, for
+	// clients that reject an ENR carrying the other layer's field.
+	if !fh.bootnodeService.HasSeparateIdentities() &&
+		fh.bootnodeService.ELTable() != nil && fh.bootnodeService.CLTable() != nil {
+		pageData.ELLayerENR, _ = fh.bootnodeService.ELENR()
+		pageData.CLLayerENR, _ = fh.bootnodeService.CLENR()
 	}
 
 	if fh.bootnodeService.HasSeparateIdentities() {

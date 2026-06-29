@@ -71,6 +71,24 @@
             <i class="fa fa-copy"></i>
           </button>
         </div>
+        {{ if .ELLayerENR }}
+        <label class="text-muted small mt-2">EL clients (eth only)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .ELLayerENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLayerENR }}" data-bs-toggle="tooltip" title="Copy EL ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
+        {{ if .CLLayerENR }}
+        <label class="text-muted small mt-2">CL clients (eth2 only)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLLayerENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLLayerENR }}" data-bs-toggle="tooltip" title="Copy CL ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
         {{ if .GenericENR }}
         <label class="text-muted small mt-2">Generic — for static bootnode lists</label>
         <div class="input-group">

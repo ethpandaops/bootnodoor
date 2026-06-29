@@ -1346,12 +1346,12 @@ func (s *Service) HasSeparateIdentities() bool {
 	return s.elIdentity() != nil && s.clIdentity() != nil && s.elIdentity() != s.clIdentity()
 }
 
-// GenericENR returns the base64 ENR for the given identity's node with the fork
-// fields (eth/eth2) removed. This is the record to commit to static bootnode
-// lists, which omit fork filtering so the bootnode is accepted regardless of the
-// client's fork state; the bootnode still advertises the full fork-filtered ENR
-// for live discovery.
-func (s *Service) GenericENR(node *v5node.Node) (string, error) {
+// strippedENR returns the base64 ENR for the given identity's node with the named
+// fields removed and the record re-signed by that identity's key. The live
+// sequence number is kept deliberately: a peer seeded from this record keeps it
+// (discv5 only adopts a strictly-higher seq), so the stripped fields stay absent
+// for that peer rather than being overwritten by the next live update.
+func (s *Service) strippedENR(node *v5node.Node, drop ...string) (string, error) {
 	if node == nil {
 		return "", fmt.Errorf("nil node")
 	}
@@ -1363,18 +1363,47 @@ func (s *Service) GenericENR(node *v5node.Node) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		rec.Delete("eth")
-		rec.Delete("eth2")
-		// Keep the live sequence number deliberately: a peer seeded from this
-		// generic record then keeps it (discv5 only adopts a strictly-higher seq),
-		// so the bootnode stays fork-agnostic for that peer and is never pruned by
-		// fork-digest filtering — the reason static lists omit fork fields.
+		for _, key := range drop {
+			rec.Delete(key)
+		}
 		if err := rec.Sign(id.key); err != nil {
 			return "", err
 		}
 		return rec.EncodeBase64()
 	}
 	return "", fmt.Errorf("no identity for node")
+}
+
+// GenericENR returns the base64 ENR for the given identity's node with the fork
+// fields (eth/eth2) removed. This is the record to commit to static bootnode
+// lists, which omit fork filtering so the bootnode is accepted regardless of the
+// client's fork state; the bootnode still advertises the full fork-filtered ENR
+// for live discovery.
+func (s *Service) GenericENR(node *v5node.Node) (string, error) {
+	return s.strippedENR(node, "eth", "eth2")
+}
+
+// ELENR returns the EL identity's ENR with the CL-only eth2 field removed — the
+// record to hand to EL clients, some of which reject an ENR carrying eth2. In
+// shared-key mode this strips eth2 from the combined record; with separate keys
+// the EL record already omits eth2, so the strip is a no-op. Empty if EL is
+// disabled.
+func (s *Service) ELENR() (string, error) {
+	node := s.ELLocalNode()
+	if node == nil {
+		return "", fmt.Errorf("EL not enabled")
+	}
+	return s.strippedENR(node, "eth2")
+}
+
+// CLENR returns the CL identity's ENR with the EL-only eth field removed. Empty
+// if CL is disabled. See ELENR for the shared- vs separate-key behavior.
+func (s *Service) CLENR() (string, error) {
+	node := s.CLLocalNode()
+	if node == nil {
+		return "", fmt.Errorf("CL not enabled")
+	}
+	return s.strippedENR(node, "eth")
 }
 
 // ELTable returns the EL routing table (may be nil if EL disabled).
