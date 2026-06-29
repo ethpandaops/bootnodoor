@@ -474,11 +474,15 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 
 	// Print node information
 	localNode := service.LocalNode()
-	logger.WithFields(logrus.Fields{
+	infoFields := logrus.Fields{
 		"nodeID":      localNode.ID().String()[:16] + "...",
-		"bindAddress": fmt.Sprintf("%s:%d", bindAddr, bindPort),
-		"enrAddress":  fmt.Sprintf("%s:%d", enrIPv4.String(), enrUDPPort),
-	}).Info("bootnode information")
+		"bindAddress": net.JoinHostPort(bindAddr, fmt.Sprintf("%d", bindPort)),
+		"enrAddress":  net.JoinHostPort(enrIPv4.String(), fmt.Sprintf("%d", enrUDPPort)),
+	}
+	if enrIPv6 != nil {
+		infoFields["enrAddress6"] = net.JoinHostPort(enrIPv6.String(), fmt.Sprintf("%d", enrUDPPort))
+	}
+	logger.WithFields(infoFields).Info("bootnode information")
 
 	// Print ENR
 	enrStr, err := localNode.Record().EncodeBase64()
