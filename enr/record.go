@@ -199,6 +199,12 @@ func (r *Record) Get(key string, dest interface{}) error {
 	}
 
 	// For complex types, use RLP encoding/decoding
+	if encodedBytes, ok := value.([]byte); ok {
+		if err := rlp.DecodeBytes(encodedBytes, dest); err == nil {
+			return nil
+		}
+	}
+
 	encoded, err := rlp.EncodeToBytes(value)
 	if err != nil {
 		return fmt.Errorf("enr: failed to encode value: %w", err)
