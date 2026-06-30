@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enode"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/webui/server"
 )
 
@@ -276,11 +279,8 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	// Get PeerID
 	peerID := localNode.ID().String()
 
-	// Get bind address
-	bindAddr := "N/A"
-	if addr := localNode.Addr(); addr != nil {
-		bindAddr = addr.String()
-	}
+	// Get bind address (includes IPv6 when the ENR advertises it)
+	bindAddr := formatBindAddrs(localNode.Record())
 
 	// Generic (fork-stripped) ENR for static bootnode lists.
 	genericENR, _ := fh.bootnodeService.GenericENR(localNode)
@@ -288,7 +288,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	// Initialize page data with basic info
 	pageData := &OverviewPageData{
 		Status:      "Online",
-		StartTime:   time.Now(), // TODO: Track actual start time in service
+		StartTime:   fh.bootnodeService.StartTime(),
 		PeerID:      peerID,
 		BindAddress: bindAddr,
 		LocalENR:    localENR,
@@ -309,9 +309,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		pageData.SeparateIdentities = true
 		if elNode := fh.bootnodeService.ELLocalNode(); elNode != nil {
 			pageData.ELPeerID = elNode.ID().String()
-			if addr := elNode.Addr(); addr != nil {
-				pageData.ELBindAddress = addr.String()
-			}
+			pageData.ELBindAddress = formatBindAddrs(elNode.Record())
 			pageData.ELLocalENR, _ = elNode.Record().EncodeBase64()
 			pageData.ELGenericENR, _ = fh.bootnodeService.GenericENR(elNode)
 			pageData.ELLocalEnode = deriveEnodeFromENR(elNode.Record())
@@ -319,9 +317,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		}
 		if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
 			pageData.CLPeerID = clNode.ID().String()
-			if addr := clNode.Addr(); addr != nil {
-				pageData.CLBindAddress = addr.String()
-			}
+			pageData.CLBindAddress = formatBindAddrs(clNode.Record())
 			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
 			pageData.CLGenericENR, _ = fh.bootnodeService.GenericENR(clNode)
 			pageData.CLLocalENRSeq = clNode.Record().Seq()
@@ -493,6 +489,27 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	// exposed through additional methods if required.
 
 	return pageData, nil
+}
+
+// formatBindAddrs renders the IPv4 and (when present) IPv6 addresses advertised
+// in the record. A dual-stack node shares one UDP port across families, so the
+// IPv6 entry falls back to the IPv4 udp port when udp6 is unset.
+func formatBindAddrs(record *enr.Record) string {
+	var addrs []string
+	if ip := record.IP(); ip != nil {
+		addrs = append(addrs, net.JoinHostPort(ip.String(), strconv.Itoa(int(record.UDP()))))
+	}
+	if ip6 := record.IP6(); ip6 != nil {
+		port := record.UDP6()
+		if port == 0 {
+			port = record.UDP()
+		}
+		addrs = append(addrs, net.JoinHostPort(ip6.String(), strconv.Itoa(int(port))))
+	}
+	if len(addrs) == 0 {
+		return "N/A"
+	}
+	return strings.Join(addrs, ", ")
 }
 
 // deriveEnodeFromENR derives an enode:// URL from an ENR record

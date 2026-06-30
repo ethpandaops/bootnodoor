@@ -8,7 +8,8 @@
     <div class="card mt-3">
       <div class="card-body">
         <h5 class="card-title">Execution Layer (EL) ENR</h5>
-        <p class="text-muted mb-3">Share this ENR with EL peers. The EL identity uses its own node key.</p>
+        <p class="text-muted mb-3">Share these with EL peers. The EL identity uses its own node key.</p>
+        <label class="text-muted small">ENR</label>
         <div class="input-group">
           <input type="text" class="form-control font-monospace" value="{{ .ELLocalENR }}" readonly>
           <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
@@ -16,7 +17,8 @@
           </button>
         </div>
         {{ if .ELLocalEnode }}
-        <div class="input-group mt-2">
+        <label class="text-muted small mt-2">Enode — enode:// URL for EL clients</label>
+        <div class="input-group">
           <input type="text" class="form-control font-monospace" value="{{ .ELLocalEnode }}" readonly>
           <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLocalEnode }}" data-bs-toggle="tooltip" title="Copy Enode to clipboard">
             <i class="fa fa-copy"></i>
@@ -775,6 +777,7 @@
     var now = new Date();
     var start = new Date(startTime);
     var diff = Math.floor((now - start) / 1000); /* seconds */
+    if (diff < 0) diff = 0; /* guard against client/server clock skew */
 
     var days = Math.floor(diff / 86400);
     var hours = Math.floor((diff % 86400) / 3600);

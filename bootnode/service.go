@@ -1325,6 +1325,11 @@ func (s *Service) LocalNode() *v5node.Node {
 	return s.localNode
 }
 
+// StartTime returns when the service started running.
+func (s *Service) StartTime() time.Time {
+	return s.startTime
+}
+
 // ELLocalNode returns the EL identity's local node (nil if EL disabled).
 func (s *Service) ELLocalNode() *v5node.Node {
 	if id := s.elIdentity(); id != nil {
