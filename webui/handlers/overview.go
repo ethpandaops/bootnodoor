@@ -7,9 +7,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
+	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enode"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/webui/server"
 )
 
@@ -22,21 +26,44 @@ type ForkInfo struct {
 
 // OverviewPageData contains data for the overview page
 type OverviewPageData struct {
-	Status         string
-	NetworkName    string
-	StartTime      time.Time
-	PeerID         string
-	BindAddress    string
-	LocalENR       string
-	LocalEnode     string // NEW: Enode derived from ENR
-	LocalENRSeq    uint64
-	CurrentFork    string
-	CurrentDigest  string
-	PreviousFork   string
-	PreviousDigest string
-	GenesisDigest  string
-	OldDigests     []OldDigestInfo
-	GracePeriod    string
+	Status      string
+	NetworkName string
+	StartTime   time.Time
+	PeerID      string
+	BindAddress string
+	LocalENR    string
+	GenericENR  string // ENR with fork fields stripped, for static bootnode lists
+	LocalEnode  string
+	LocalENRSeq uint64
+
+	// Layer-specific records for the shared-key, dual-layer case: the combined
+	// LocalENR carries both eth and eth2, which some single-layer clients reject,
+	// so we also surface the eth-only and eth2-only variants. Empty unless both
+	// layers run under one key.
+	ELLayerENR string
+	CLLayerENR string
+
+	// Per-identity records, populated when EL and CL use distinct keys. CL has no
+	// enode field: enode:// is EL/discv4-only.
+	SeparateIdentities bool
+	ELPeerID           string
+	ELBindAddress      string
+	ELLocalENR         string
+	ELGenericENR       string
+	ELLocalEnode       string
+	ELLocalENRSeq      uint64
+	CLPeerID           string
+	CLBindAddress      string
+	CLLocalENR         string
+	CLGenericENR       string
+	CLLocalENRSeq      uint64
+	CurrentFork        string
+	CurrentDigest      string
+	PreviousFork       string
+	PreviousDigest     string
+	GenesisDigest      string
+	OldDigests         []OldDigestInfo
+	GracePeriod        string
 
 	// Fork lists
 	ELForks []ForkInfo // Execution Layer forks
@@ -114,10 +141,37 @@ type OldDigestInfo struct {
 	Remaining time.Duration
 }
 
-// ENR serves the local ENR as plain text
+// localNodeForLayer returns the local node for the ?layer= query param: the EL
+// or CL identity (nil if that layer isn't running), or the primary identity when
+// no specific layer is requested.
+func (fh *FrontendHandler) localNodeForLayer(r *http.Request) *v5node.Node {
+	switch r.URL.Query().Get("layer") {
+	case "el":
+		return fh.bootnodeService.ELLocalNode()
+	case "cl":
+		return fh.bootnodeService.CLLocalNode()
+	default:
+		return fh.bootnodeService.LocalNode()
+	}
+}
+
+// ENR serves the local ENR as plain text. Use ?layer=el|cl to select an
+// identity, and ?generic=1 for the fork-stripped record to put in static
+// bootnode lists.
 func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.bootnodeService.LocalNode()
-	localENR, err := localNode.Record().EncodeBase64()
+	localNode := fh.localNodeForLayer(r)
+	if localNode == nil {
+		http.Error(w, "no ENR for the requested layer", http.StatusNotFound)
+		return
+	}
+
+	var localENR string
+	var err error
+	if r.URL.Query().Get("generic") == "1" {
+		localENR, err = fh.bootnodeService.GenericENR(localNode)
+	} else {
+		localENR, err = localNode.Record().EncodeBase64()
+	}
 	if err != nil {
 		http.Error(w, "Failed to encode ENR", http.StatusInternalServerError)
 		return
@@ -127,21 +181,45 @@ func (fh *FrontendHandler) ENR(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(localENR))
 }
 
-// Enode serves the local enode URL as plain text
-func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
-	localNode := fh.bootnodeService.LocalNode()
+// ELENR serves the EL ENR with the CL-only eth2 field removed, as plain text.
+// This is the record to give EL clients, some of which reject an ENR carrying
+// eth2.
+func (fh *FrontendHandler) ELENR(w http.ResponseWriter, r *http.Request) {
+	enrStr, err := fh.bootnodeService.ELENR()
+	if err != nil {
+		http.Error(w, "no EL ENR: this bootnode serves CL only", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(enrStr))
+}
 
-	// Get TCP port from ENR, fallback to UDP port if not available
-	tcpPort := localNode.TCPPort()
-	if tcpPort == 0 {
-		tcpPort = localNode.UDPPort()
+// CLENR serves the CL ENR with the EL-only eth field removed, as plain text.
+func (fh *FrontendHandler) CLENR(w http.ResponseWriter, r *http.Request) {
+	enrStr, err := fh.bootnodeService.CLENR()
+	if err != nil {
+		http.Error(w, "no CL ENR: this bootnode serves EL only", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(enrStr))
+}
+
+// Enode serves the local enode URL. enode:// is EL/discv4-only, so it reflects
+// the EL identity; a CL-only bootnode has no enode (CL peers use the ENR).
+func (fh *FrontendHandler) Enode(w http.ResponseWriter, r *http.Request) {
+	localNode := fh.bootnodeService.ELLocalNode()
+	if localNode == nil {
+		http.Error(w, "no enode: this bootnode serves CL only (use /enr)", http.StatusNotFound)
+		return
 	}
 
-	// Create enode from local node info
+	// A bootnode serves no RLPx, so it advertises tcp=0 and carries the
+	// discovery (UDP) port in ?discport= (enode://…@ip:0?discport=…).
 	localEnode := &enode.Enode{
 		PublicKey: localNode.PublicKey(),
 		IP:        localNode.IP(),
-		TCP:       tcpPort,
+		TCP:       0,
 		UDP:       localNode.UDPPort(),
 	}
 
@@ -192,27 +270,58 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		localENR = "" // Fallback to empty string on error
 	}
 
-	// Derive Enode from ENR
-	localEnode := deriveEnodeFromENR(localNode.Record())
+	// enode:// is EL/discv4-only; a CL-only bootnode has none.
+	localEnode := ""
+	if el := fh.bootnodeService.ELLocalNode(); el != nil {
+		localEnode = deriveEnodeFromENR(el.Record())
+	}
 
 	// Get PeerID
 	peerID := localNode.ID().String()
 
-	// Get bind address
-	bindAddr := "N/A"
-	if addr := localNode.Addr(); addr != nil {
-		bindAddr = addr.String()
-	}
+	// Get bind address (includes IPv6 when the ENR advertises it)
+	bindAddr := formatBindAddrs(localNode.Record())
+
+	// Generic (fork-stripped) ENR for static bootnode lists.
+	genericENR, _ := fh.bootnodeService.GenericENR(localNode)
 
 	// Initialize page data with basic info
 	pageData := &OverviewPageData{
 		Status:      "Online",
-		StartTime:   time.Now(), // TODO: Track actual start time in service
+		StartTime:   fh.bootnodeService.StartTime(),
 		PeerID:      peerID,
 		BindAddress: bindAddr,
 		LocalENR:    localENR,
+		GenericENR:  genericENR,
 		LocalEnode:  localEnode,
 		LocalENRSeq: localNode.Record().Seq(),
+	}
+
+	// Shared-key dual-layer node: also expose eth-only and eth2-only records, for
+	// clients that reject an ENR carrying the other layer's field.
+	if !fh.bootnodeService.HasSeparateIdentities() &&
+		fh.bootnodeService.ELTable() != nil && fh.bootnodeService.CLTable() != nil {
+		pageData.ELLayerENR, _ = fh.bootnodeService.ELENR()
+		pageData.CLLayerENR, _ = fh.bootnodeService.CLENR()
+	}
+
+	if fh.bootnodeService.HasSeparateIdentities() {
+		pageData.SeparateIdentities = true
+		if elNode := fh.bootnodeService.ELLocalNode(); elNode != nil {
+			pageData.ELPeerID = elNode.ID().String()
+			pageData.ELBindAddress = formatBindAddrs(elNode.Record())
+			pageData.ELLocalENR, _ = elNode.Record().EncodeBase64()
+			pageData.ELGenericENR, _ = fh.bootnodeService.GenericENR(elNode)
+			pageData.ELLocalEnode = deriveEnodeFromENR(elNode.Record())
+			pageData.ELLocalENRSeq = elNode.Record().Seq()
+		}
+		if clNode := fh.bootnodeService.CLLocalNode(); clNode != nil {
+			pageData.CLPeerID = clNode.ID().String()
+			pageData.CLBindAddress = formatBindAddrs(clNode.Record())
+			pageData.CLLocalENR, _ = clNode.Record().EncodeBase64()
+			pageData.CLGenericENR, _ = fh.bootnodeService.GenericENR(clNode)
+			pageData.CLLocalENRSeq = clNode.Record().Seq()
+		}
 	}
 
 	// Get EL table stats if available
@@ -382,6 +491,27 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	return pageData, nil
 }
 
+// formatBindAddrs renders the IPv4 and (when present) IPv6 addresses advertised
+// in the record. A dual-stack node shares one UDP port across families, so the
+// IPv6 entry falls back to the IPv4 udp port when udp6 is unset.
+func formatBindAddrs(record *enr.Record) string {
+	var addrs []string
+	if ip := record.IP(); ip != nil {
+		addrs = append(addrs, net.JoinHostPort(ip.String(), strconv.Itoa(int(record.UDP()))))
+	}
+	if ip6 := record.IP6(); ip6 != nil {
+		port := record.UDP6()
+		if port == 0 {
+			port = record.UDP()
+		}
+		addrs = append(addrs, net.JoinHostPort(ip6.String(), strconv.Itoa(int(port))))
+	}
+	if len(addrs) == 0 {
+		return "N/A"
+	}
+	return strings.Join(addrs, ", ")
+}
+
 // deriveEnodeFromENR derives an enode:// URL from an ENR record
 func deriveEnodeFromENR(record interface {
 	IP() net.IP
@@ -408,6 +538,7 @@ func deriveEnodeFromENR(record interface {
 	// Format IP address
 	ipStr := ip.String()
 
-	// Build enode URL
-	return fmt.Sprintf("enode://%s@%s:%d", pubKeyHex, ipStr, udpPort)
+	// A bootnode serves no RLPx, so advertise tcp=0 and carry the discovery
+	// (UDP) port in ?discport=.
+	return fmt.Sprintf("enode://%s@%s:0?discport=%d", pubKeyHex, ipStr, udpPort)
 }

@@ -3,17 +3,103 @@
     <h3 class="py-2">Bootnode Overview</h3>
 
     <!-- ENR Header Section -->
+    {{ if .SeparateIdentities }}
+    {{ if .ELLocalENR }}
+    <div class="card mt-3">
+      <div class="card-body">
+        <h5 class="card-title">Execution Layer (EL) ENR</h5>
+        <p class="text-muted mb-3">Share these with EL peers. The EL identity uses its own node key.</p>
+        <label class="text-muted small">ENR</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .ELLocalENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ if .ELLocalEnode }}
+        <label class="text-muted small mt-2">Enode — enode:// URL for EL clients</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .ELLocalEnode }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLocalEnode }}" data-bs-toggle="tooltip" title="Copy Enode to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
+        {{ if .ELGenericENR }}
+        <label class="text-muted small mt-2">Generic ENR — for static bootnode lists (no fork filter)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .ELGenericENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELGenericENR }}" data-bs-toggle="tooltip" title="Copy generic ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
+      </div>
+    </div>
+    {{ end }}
+    {{ if .CLLocalENR }}
+    <div class="card mt-3">
+      <div class="card-body">
+        <h5 class="card-title">Consensus Layer (CL) ENR</h5>
+        <p class="text-muted mb-3">Share this ENR with CL peers. The CL identity uses its own node key.</p>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLLocalENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLLocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ if .CLGenericENR }}
+        <label class="text-muted small mt-2">Generic ENR — for static bootnode lists (no fork filter)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLGenericENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLGenericENR }}" data-bs-toggle="tooltip" title="Copy generic ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
+      </div>
+    </div>
+    {{ end }}
+    {{ else }}
     {{ if .LocalENR }}
     <div class="card mt-3">
       <div class="card-body">
         <h5 class="card-title">Bootnode ENR</h5>
-        <p class="text-muted mb-3">Share this Ethereum Node Record (ENR) with peers to allow them to discover and connect to this bootnode.</p>
+        <p class="text-muted mb-3">Share the discoverable ENR with peers; commit the generic ENR (no fork filter) to static bootnode lists.</p>
+        <label class="text-muted small">Discoverable (fork-filtered)</label>
         <div class="input-group">
           <input type="text" class="form-control font-monospace" value="{{ .LocalENR }}" readonly>
           <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .LocalENR }}" data-bs-toggle="tooltip" title="Copy ENR to clipboard">
             <i class="fa fa-copy"></i>
           </button>
         </div>
+        {{ if .ELLayerENR }}
+        <label class="text-muted small mt-2">EL clients (eth only)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .ELLayerENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELLayerENR }}" data-bs-toggle="tooltip" title="Copy EL ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
+        {{ if .CLLayerENR }}
+        <label class="text-muted small mt-2">CL clients (eth2 only)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLLayerENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLLayerENR }}" data-bs-toggle="tooltip" title="Copy CL ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
+        {{ if .GenericENR }}
+        <label class="text-muted small mt-2">Generic — for static bootnode lists</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .GenericENR }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .GenericENR }}" data-bs-toggle="tooltip" title="Copy generic ENR to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ end }}
       </div>
     </div>
     {{ end }}
@@ -33,17 +119,35 @@
       </div>
     </div>
     {{ end }}
+    {{ end }}
 
     <!-- Peer ID Section -->
     <div class="card mt-3">
       <div class="card-body">
         <h5 class="card-title">Peer ID</h5>
+        {{ if .SeparateIdentities }}
+        <label class="text-muted small">Execution Layer (EL)</label>
+        <div class="input-group mb-2">
+          <input type="text" class="form-control font-monospace" value="{{ .ELPeerID }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .ELPeerID }}" data-bs-toggle="tooltip" title="Copy EL Peer ID to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        <label class="text-muted small">Consensus Layer (CL)</label>
+        <div class="input-group">
+          <input type="text" class="form-control font-monospace" value="{{ .CLPeerID }}" readonly>
+          <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .CLPeerID }}" data-bs-toggle="tooltip" title="Copy CL Peer ID to clipboard">
+            <i class="fa fa-copy"></i>
+          </button>
+        </div>
+        {{ else }}
         <div class="input-group">
           <input type="text" class="form-control font-monospace" value="{{ .PeerID }}" readonly>
           <button class="btn btn-outline-secondary" type="button" data-clipboard-text="{{ .PeerID }}" data-bs-toggle="tooltip" title="Copy Peer ID to clipboard">
             <i class="fa fa-copy"></i>
           </button>
         </div>
+        {{ end }}
       </div>
     </div>
 
@@ -70,11 +174,42 @@
                   <td class="text-muted">Uptime</td>
                   <td class="text-end" data-stat="uptime">{{ formatTimeDiff .StartTime }}</td>
                 </tr>
+                {{ if .SeparateIdentities }}
+                <tr>
+                  <td class="text-muted">Bind Address (EL)</td>
+                  <td class="text-end"><code style="font-size: 0.85em;">{{ .ELBindAddress }}</code></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">Bind Address (CL)</td>
+                  <td class="text-end"><code style="font-size: 0.85em;">{{ .CLBindAddress }}</code></td>
+                </tr>
+                {{ else }}
                 <tr>
                   <td class="text-muted">Bind Address</td>
                   <td class="text-end"><code style="font-size: 0.85em;" data-stat="bind-address">{{ .BindAddress }}</code></td>
                 </tr>
-                {{ if .LocalENR }}
+                {{ end }}
+                {{ if .SeparateIdentities }}
+                <tr>
+                  <td class="text-muted">
+                    ENR Seq (EL)
+                    <i class="fa fa-info-circle text-muted"
+                       style="font-size: 0.8em;"
+                       role="button"
+                       data-bs-toggle="popover"
+                       data-bs-trigger="hover focus"
+                       data-bs-placement="right"
+                       data-bs-html="true"
+                       data-bs-title="ENR Sequence Number"
+                       data-bs-content="The sequence number of this node's Ethereum Node Record (ENR). This number increments each time the ENR is updated with new information."></i>
+                  </td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info">{{ .ELLocalENRSeq }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">ENR Seq (CL)</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-info">{{ .CLLocalENRSeq }}</span></td>
+                </tr>
+                {{ else if .LocalENR }}
                 <tr>
                   <td class="text-muted">
                     ENR Seq
@@ -642,6 +777,7 @@
     var now = new Date();
     var start = new Date(startTime);
     var diff = Math.floor((now - start) / 1000); /* seconds */
+    if (diff < 0) diff = 0; /* guard against client/server clock skew */
 
     var days = Math.floor(diff / 86400);
     var hours = Math.floor((diff % 86400) / 3600);

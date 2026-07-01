@@ -165,16 +165,33 @@ go build -o bootnodoor ./cmd/bootnodoor
 - `--private-key <hex>`: Node private key (64 hex characters, optional 0x prefix)
   - Used for node identity and ENR signing
   - **Keep this secret!** Anyone with this key can impersonate your node
+  - Acts as the shared fallback for any layer without its own `--el-private-key`/`--cl-private-key`
 
 - `--enr-ip <ip>`: Public IPv4 address to advertise in ENR
   - This is the address other nodes will use to connect to you
   - Must be reachable from the internet
   - Can be omitted for automatic discovery from PONG responses
 
+#### Separate EL and CL Identities (migration)
+
+By default a single key serves both layers under one node ID. To migrate from
+separate EL and CL bootnodes without changing the node IDs peers already know,
+give each layer its own key (and optionally its own port):
+
+- `--el-private-key <hex|file>`: Private key for the EL identity (falls back to `--private-key`)
+- `--cl-private-key <hex|file>`: Private key for the CL identity (falls back to `--private-key`)
+- `--el-port <port>` / `--cl-port <port>`: Per-layer UDP listen port (default: `--bind-port`)
+- `--el-enr-port <port>` / `--cl-enr-port <port>`: Per-layer advertised port (default: the layer's listen port)
+
+With distinct keys the bootnode publishes two ENRs — an EL record (with the `eth`
+fork field) and a CL record (with the `eth2` field) — each signed by its own key.
+They share one UDP socket unless `--el-port`/`--cl-port` differ. Fetch each from
+the web UI via `/enr?layer=el` and `/enr?layer=cl`.
+
 #### Network Binding
 
 - `--bind-addr <ip>`: IP address to bind UDP socket (default: `0.0.0.0`)
-- `--bind-port <port>`: UDP port to bind (default: `30303`)
+- `--bind-port <port>`: UDP port to bind (default: `9000`)
 - `--enr-ip6 <ip>`: Optional IPv6 address to advertise
 - `--enr-port <port>`: UDP port to advertise (default: use `--bind-port`)
 
@@ -363,8 +380,8 @@ The dashboard shows:
 - `GET /` - Web dashboard overview
 - `GET /el-nodes` - EL nodes list page
 - `GET /cl-nodes` - CL nodes list page
-- `GET /enr` - Local ENR in base64 format
-- `GET /enode` - Local enode URL (EL format)
+- `GET /enr` - Local ENR in base64 format (use `?layer=el|cl` to select an identity, `?generic=1` for the fork-stripped record)
+- `GET /enode` - Local enode URL (EL only; discovery-only, so it advertises `tcp=0` with the UDP port in `?discport=`)
 - `GET /metrics` - Prometheus metrics (when enabled)
 - `GET /debug/pprof/` - Performance profiling (when `--pprof` enabled)
 

@@ -34,15 +34,18 @@ type Service struct {
 	// Configuration
 	config *Config
 
-	// Local node (shared across protocols)
+	// Discovery identities (1 when a single key serves both layers, 2 when
+	// separate EL and CL keys are supplied). Aliases below point at the primary.
+	identities []*identity
+
+	// Local node (primary identity: EL if present, else the sole identity)
 	localNode *v5node.Node
 
 	// Network components
-	transport     *transport.UDPTransport
 	discv4Service *discv4.Service // May be nil if discv4 disabled
-	discv5Service *discv5.Service // May be nil if discv5 disabled
+	discv5Service *discv5.Service // primary identity's discv5 (may be nil)
 
-	// ENR management
+	// ENR management (primary identity; its fork filters classify all peers)
 	enrManager *ENRManager
 
 	// IP discovery
@@ -56,8 +59,7 @@ type Service struct {
 	elTable *nodes.FlatTable // May be nil if EL disabled
 	clTable *nodes.FlatTable // May be nil if CL disabled
 
-	// Discovery services
-	pingService     *services.PingService   // Handles PING/PONG for aliveness checks
+	// Discovery services (ping is per-identity; see identity.pingService)
 	elLookupService *services.LookupService // EL lookup service (may be nil if EL disabled)
 	clLookupService *services.LookupService // CL lookup service (may be nil if CL disabled)
 
@@ -107,48 +109,61 @@ func New(cfg *Config) (*Service, error) {
 		cancel: cancel,
 	}
 
-	// Create UDP transport (shared by both protocols)
-	// JoinHostPort so an IPv6 bind addr becomes [::]:port, not :::port.
-	listenAddr := net.JoinHostPort(cfg.BindIP.String(), fmt.Sprintf("%d", cfg.BindPort))
-	transportConfig := &transport.Config{
-		ListenAddr: listenAddr,
-		Logger:     cfg.Logger,
-	}
-	udpTransport, err := transport.NewUDPTransport(transportConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create UDP transport: %w", err)
-	}
-	s.transport = udpTransport
+	// Resolve discovery identities (one shared, or separate EL/CL keys).
+	s.identities = resolveIdentities(cfg)
 
-	// Load stored ENR
-	storedENR, err := s.loadStoredENR()
-	if err != nil {
-		cfg.Logger.WithError(err).Debug("no stored ENR, will create new one")
-	}
-
-	// Create local node (shared across both protocols)
-	localNode, err := createLocalNode(cfg, storedENR)
-	if err != nil {
-		udpTransport.Close()
-		return nil, fmt.Errorf("failed to create local node: %w", err)
-	}
-	s.localNode = localNode
-
-	// Store the ENR
-	if err := s.storeENR(localNode.Record()); err != nil {
-		cfg.Logger.WithError(err).Warn("failed to store initial ENR")
-	}
-
-	// Create ENR manager and update ENR with eth/eth2 fields
-	s.enrManager = NewENRManager(cfg, localNode)
-	if err := s.enrManager.UpdateENR(0, 0); err != nil {
-		cfg.Logger.WithError(err).Warn("failed to update ENR with eth/eth2 fields")
-	} else {
-		// Store updated ENR with eth/eth2 fields
-		if err := s.storeENR(localNode.Record()); err != nil {
-			cfg.Logger.WithError(err).Warn("failed to store updated ENR")
+	// Create one UDP transport per distinct bind port. Identities sharing a port
+	// share a socket and are demultiplexed by their node ID at decode time.
+	transports := make(map[uint16]*transport.UDPTransport)
+	closeTransports := func() {
+		for _, t := range transports {
+			t.Close()
 		}
 	}
+	for _, id := range s.identities {
+		if transports[id.bindPort] == nil {
+			// JoinHostPort so an IPv6 bind addr becomes [::]:port, not :::port.
+			listenAddr := net.JoinHostPort(cfg.BindIP.String(), fmt.Sprintf("%d", id.bindPort))
+			t, terr := transport.NewUDPTransport(&transport.Config{ListenAddr: listenAddr, Logger: cfg.Logger})
+			if terr != nil {
+				closeTransports()
+				return nil, fmt.Errorf("failed to create UDP transport on port %d: %w", id.bindPort, terr)
+			}
+			cfg.Logger.WithField("address", listenAddr).Info("listening for discovery")
+			transports[id.bindPort] = t
+		}
+		id.transport = transports[id.bindPort]
+	}
+
+	for _, id := range s.identities {
+		storedENR, lerr := s.loadStoredENR(id.storeKey)
+		if lerr != nil {
+			cfg.Logger.WithError(lerr).Debug("no stored ENR, will create new one")
+		}
+
+		localNode, nerr := createLocalNode(cfg, id.key, id.enrIP, id.enrIP6, id.enrPort, storedENR)
+		if nerr != nil {
+			closeTransports()
+			return nil, fmt.Errorf("failed to create local node: %w", nerr)
+		}
+		id.localNode = localNode
+
+		if serr := s.storeENR(id.storeKey, localNode.Record()); serr != nil {
+			cfg.Logger.WithError(serr).Warn("failed to store initial ENR")
+		}
+
+		id.enrManager = NewENRManager(cfg, id.key, localNode, id.servesEL, id.servesCL)
+		if uerr := id.enrManager.UpdateENR(0, 0); uerr != nil {
+			cfg.Logger.WithError(uerr).Warn("failed to update ENR with eth/eth2 fields")
+		} else if serr := s.storeENR(id.storeKey, localNode.Record()); serr != nil {
+			cfg.Logger.WithError(serr).Warn("failed to store updated ENR")
+		}
+	}
+
+	// Aliases for the code paths that operate on a single representative identity.
+	primary := s.primaryIdentity()
+	s.localNode = primary.localNode
+	s.enrManager = primary.enrManager
 
 	// Create IP discovery service
 	ipDiscoveryCfg := services.IPDiscoveryConfig{
@@ -156,32 +171,13 @@ func New(cfg *Config) (*Service, error) {
 		MinDistinctIPs: 3, // From at least 3 distinct IPs
 		Logger:         cfg.Logger,
 		OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
-			// Update local node's ENR with discovered IP
 			s.updateENRWithDiscoveredIP(ip, port, isIPv6)
 		},
 	}
 	s.ipDiscovery = services.NewIPDiscovery(ipDiscoveryCfg)
 
-	// Create discv5 service (if enabled) - pass the local node
-	if cfg.EnableDiscv5 {
-		if err := s.initDiscv5(udpTransport, localNode); err != nil {
-			udpTransport.Close()
-			return nil, fmt.Errorf("failed to initialize discv5: %w", err)
-		}
-	}
-
-	// Create discv4 service (if enabled) - pass the local node's ENR
-	if cfg.EnableDiscv4 {
-		if err := s.initDiscv4(udpTransport, localNode.Record()); err != nil {
-			if s.discv5Service != nil {
-				s.discv5Service.Stop()
-			}
-			udpTransport.Close()
-			return nil, fmt.Errorf("failed to initialize discv4: %w", err)
-		}
-	}
-
 	// Create node databases for enabled layers
+	var err error
 	if cfg.HasEL() {
 		s.elNodeDB = nodes.NewNodeDB(ctx, cfg.Database, db.LayerEL, cfg.Logger)
 	}
@@ -189,27 +185,60 @@ func New(cfg *Config) (*Service, error) {
 		s.clNodeDB = nodes.NewNodeDB(ctx, cfg.Database, db.LayerCL, cfg.Logger)
 	}
 
-	// Create routing tables for enabled layers
-	localID := localNode.ID()
+	// Create routing tables for enabled layers, each keyed by its identity's node
+	// ID (peers compute FINDNODE distances relative to the ID they dialed).
 	if cfg.HasEL() {
-		s.elTable, err = s.createTable(localID, s.elNodeDB, "EL")
+		s.elTable, err = s.createTable(s.elIdentity().localNode.ID(), s.elNodeDB, "EL")
 		if err != nil {
+			closeTransports()
 			return nil, fmt.Errorf("failed to create EL table: %w", err)
 		}
 	}
 	if cfg.HasCL() {
-		s.clTable, err = s.createTable(localID, s.clNodeDB, "CL")
+		s.clTable, err = s.createTable(s.clIdentity().localNode.ID(), s.clNodeDB, "CL")
 		if err != nil {
+			closeTransports()
 			return nil, fmt.Errorf("failed to create CL table: %w", err)
 		}
 	}
 
-	// Create ping service (shared across protocols)
-	s.pingService = services.NewPingService(
-		s.getV5Handler(),
-		s.getV4Service(),
-		cfg.Logger.WithField("service", "ping"),
-	)
+	// Create a discv5 service per identity (registered on its transport).
+	if cfg.EnableDiscv5 {
+		for _, id := range s.identities {
+			if ierr := s.initDiscv5(id); ierr != nil {
+				closeTransports()
+				return nil, fmt.Errorf("failed to initialize discv5: %w", ierr)
+			}
+		}
+		s.discv5Service = primary.discv5Service
+	}
+
+	// Create the discv4 service (EL-only) on the EL identity.
+	if cfg.EnableDiscv4 {
+		if ierr := s.initDiscv4(s.elIdentity()); ierr != nil {
+			for _, id := range s.identities {
+				if id.discv5Service != nil {
+					id.discv5Service.Stop()
+				}
+			}
+			closeTransports()
+			return nil, fmt.Errorf("failed to initialize discv4: %w", ierr)
+		}
+	}
+
+	// Create a ping service per identity. discv4 is attached to the EL identity
+	// only, so CL pings go out over discv5 under the CL node ID.
+	for _, id := range s.identities {
+		var v4 *discv4.Service
+		if id.servesEL {
+			v4 = s.discv4Service
+		}
+		var v5h *v5protocol.Handler
+		if id.discv5Service != nil {
+			v5h = id.discv5Service.Handler()
+		}
+		id.pingService = services.NewPingService(v5h, v4, cfg.Logger.WithField("service", "ping"))
+	}
 
 	// Create lookup services for enabled layers
 	if cfg.HasEL() && s.elTable != nil {
@@ -237,7 +266,7 @@ func New(cfg *Config) (*Service, error) {
 				}
 
 				// If node was discovered via v4 (only has v4 support), immediately test for v5 support
-				if n.HasV4() && !n.HasV5() && s.pingService != nil {
+				if n.HasV4() && !n.HasV5() && s.getV5Handler() != nil {
 					record := n.Record()
 					if record != nil {
 						// Try to create v5 node from ENR
@@ -285,13 +314,24 @@ func New(cfg *Config) (*Service, error) {
 	}
 
 	if cfg.HasCL() && s.clTable != nil {
-		localNode := nodes.NewFromV5(s.localNode, s.clNodeDB)
+		clID := s.clIdentity()
+		localNode := nodes.NewFromV5(clID.localNode, s.clNodeDB)
+		// CL discovery runs under the CL identity's discv5 handler. discv4 is
+		// EL-only, so only attach it when one shared identity serves both layers.
+		var clV5Handler *v5protocol.Handler
+		if clID.discv5Service != nil {
+			clV5Handler = clID.discv5Service.Handler()
+		}
+		var clV4Service *discv4.Service
+		if clID.servesEL {
+			clV4Service = s.getV4Service()
+		}
 		s.clLookupService = services.NewLookupService(services.Config{
 			LocalNode:     localNode,
 			NodeDB:        s.clNodeDB,
 			Table:         s.clTable,
-			V5Handler:     s.getV5Handler(),
-			V4Service:     s.getV4Service(),
+			V5Handler:     clV5Handler,
+			V4Service:     clV4Service,
 			Database:      cfg.Database,
 			Layer:         db.LayerCL,
 			Alpha:         3,
@@ -324,41 +364,43 @@ func New(cfg *Config) (*Service, error) {
 	return s, nil
 }
 
-// initDiscv5 initializes the discv5 service.
-func (s *Service) initDiscv5(udpTransport *transport.UDPTransport, localNode *v5node.Node) error {
+// initDiscv5 initializes the discv5 service for one identity.
+func (s *Service) initDiscv5(id *identity) error {
 	discv5Config := discv5.DefaultConfig()
-	discv5Config.LocalNode = localNode // Pass the pre-created local node
+	discv5Config.LocalNode = id.localNode
 	discv5Config.Context = s.ctx
-	discv5Config.PrivateKey = s.config.PrivateKey
+	discv5Config.PrivateKey = id.key
 	discv5Config.SessionLifetime = s.config.SessionLifetime
 	discv5Config.MaxSessions = s.config.MaxSessions
 	discv5Config.Logger = s.config.Logger
 
-	// Set callbacks
+	// FINDNODE is scoped to the layers this identity serves.
 	discv5Config.OnHandshakeComplete = s.onHandshakeComplete
 	discv5Config.OnNodeUpdate = s.onNodeUpdate
 	discv5Config.OnNodeSeen = s.onNodeSeen
-	discv5Config.OnFindNode = s.onFindNodeV5
+	discv5Config.OnFindNode = func(msg *v5protocol.FindNode, sourceNode *v5node.Node, requester *net.UDPAddr) []*v5node.Node {
+		return s.onFindNodeV5(id, msg, sourceNode, requester)
+	}
 	discv5Config.OnTalkReq = nil // No TALKREQ support
 	discv5Config.OnPongReceived = func(remoteID v5node.ID, sourceIP net.IP, reportedIP net.IP, reportedPort uint16) {
 		s.onPongReceived(remoteID[:], sourceIP, reportedIP, reportedPort)
 	}
 
 	// Create service
-	service, err := discv5.New(discv5Config, udpTransport)
+	service, err := discv5.New(discv5Config, id.transport)
 	if err != nil {
 		return err
 	}
 
-	s.discv5Service = service
+	id.discv5Service = service
 	return nil
 }
 
-// initDiscv4 initializes the discv4 service.
-func (s *Service) initDiscv4(udpTransport *transport.UDPTransport, localENR *enr.Record) error {
+// initDiscv4 initializes the discv4 service (EL-only) on the EL identity.
+func (s *Service) initDiscv4(id *identity) error {
 	discv4Config := discv4.DefaultConfig()
-	discv4Config.PrivateKey = s.config.PrivateKey
-	discv4Config.LocalENR = localENR
+	discv4Config.PrivateKey = id.key
+	discv4Config.LocalENR = id.localNode.Record()
 
 	// Set callbacks
 	discv4Config.OnFindnode = func(from *v4node.Node, target []byte, requester *net.UDPAddr) []*v4node.Node {
@@ -375,7 +417,7 @@ func (s *Service) initDiscv4(udpTransport *transport.UDPTransport, localENR *enr
 	// No callback needed - it will automatically respond with the ENR
 
 	// Create service
-	service, err := discv4.New(discv4Config, udpTransport)
+	service, err := discv4.New(discv4Config, id.transport)
 	if err != nil {
 		return err
 	}
@@ -408,9 +450,58 @@ func (s *Service) createTable(localID [32]byte, nodeDB *nodes.NodeDB, layerName 
 	return table, nil
 }
 
-// getLocalID returns the local node ID.
-func (s *Service) getLocalID() [32]byte {
-	return s.localNode.ID()
+func (s *Service) elIdentity() *identity {
+	for _, id := range s.identities {
+		if id.servesEL {
+			return id
+		}
+	}
+	return nil
+}
+
+func (s *Service) clIdentity() *identity {
+	for _, id := range s.identities {
+		if id.servesCL {
+			return id
+		}
+	}
+	return nil
+}
+
+// singleSocket reports whether every identity shares one socket, in which case
+// an externally-observed port from IP discovery is unambiguous.
+func (s *Service) singleSocket() bool {
+	if len(s.identities) == 0 {
+		return true
+	}
+	for _, id := range s.identities {
+		if id.bindPort != s.identities[0].bindPort {
+			return false
+		}
+	}
+	return true
+}
+
+// primaryIdentity returns the representative identity: EL if present, else CL.
+func (s *Service) primaryIdentity() *identity {
+	if id := s.elIdentity(); id != nil {
+		return id
+	}
+	return s.clIdentity()
+}
+
+func (s *Service) elPing() *services.PingService {
+	if id := s.elIdentity(); id != nil {
+		return id.pingService
+	}
+	return nil
+}
+
+func (s *Service) clPing() *services.PingService {
+	if id := s.clIdentity(); id != nil {
+		return id.pingService
+	}
+	return nil
 }
 
 // Start starts the bootnode service.
@@ -436,10 +527,12 @@ func (s *Service) Start() error {
 		}
 	}
 
-	// Start protocol services
-	if s.discv5Service != nil {
-		if err := s.discv5Service.Start(); err != nil {
-			return fmt.Errorf("failed to start discv5: %w", err)
+	// Start protocol services (one discv5 service per identity)
+	for _, id := range s.identities {
+		if id.discv5Service != nil {
+			if err := id.discv5Service.Start(); err != nil {
+				return fmt.Errorf("failed to start discv5: %w", err)
+			}
 		}
 	}
 	if s.discv4Service != nil {
@@ -470,17 +563,23 @@ func (s *Service) Stop() error {
 	s.running = false
 	s.mu.Unlock()
 
-	// Stop protocol services
-	if s.discv5Service != nil {
-		s.discv5Service.Stop()
+	// Stop protocol services (one discv5 service per identity)
+	for _, id := range s.identities {
+		if id.discv5Service != nil {
+			id.discv5Service.Stop()
+		}
 	}
 	if s.discv4Service != nil {
 		s.discv4Service.Stop()
 	}
 
-	// Close transport
-	if s.transport != nil {
-		s.transport.Close()
+	// Close transports (identities may share one socket, so dedupe)
+	closed := make(map[*transport.UDPTransport]bool)
+	for _, id := range s.identities {
+		if id.transport != nil && !closed[id.transport] {
+			id.transport.Close()
+			closed[id.transport] = true
+		}
 	}
 
 	// Cancel context to stop background tasks
@@ -552,15 +651,11 @@ func (s *Service) performTableMaintenance() {
 
 // performAlivenessCheck checks node aliveness by pinging a sample of nodes.
 func (s *Service) performAlivenessCheck() {
-	if s.pingService == nil {
-		return
-	}
-
 	// Ping a sample from each table
 	const sampleSize = 10 // Ping 10 nodes per table per check
 
 	// Ping EL nodes
-	if s.elTable != nil {
+	if s.elTable != nil && s.elPing() != nil {
 		elNodes := s.elTable.GetActiveNodes()
 		if len(elNodes) > sampleSize {
 			// Shuffle and take sample
@@ -580,11 +675,11 @@ func (s *Service) performAlivenessCheck() {
 		}
 
 		s.config.Logger.WithField("count", len(elNodes)).WithField("layer", "EL").Debug("pinging nodes")
-		s.pingService.PingMultiple(elNodes)
+		s.elPing().PingMultiple(elNodes)
 	}
 
 	// Ping CL nodes
-	if s.clTable != nil {
+	if s.clTable != nil && s.clPing() != nil {
 		clNodes := s.clTable.GetActiveNodes()
 		if len(clNodes) > sampleSize {
 			// Shuffle and take sample
@@ -604,7 +699,7 @@ func (s *Service) performAlivenessCheck() {
 		}
 
 		s.config.Logger.WithField("count", len(clNodes)).WithField("layer", "CL").Debug("pinging nodes")
-		s.pingService.PingMultiple(clNodes)
+		s.clPing().PingMultiple(clNodes)
 	}
 }
 
@@ -644,20 +739,16 @@ func (s *Service) performRandomWalk() {
 //
 // Note: Only checks EL nodes. CL nodes only support discv5, so checking for v4 is wasteful.
 func (s *Service) performProtocolSupportCheck() {
-	if s.pingService == nil {
-		return
-	}
-
 	// Sample nodes from each table
 	const sampleSize = 10 // Check 10 nodes per table per check
 
 	// Check EL nodes only
 	// CL nodes only support discv5, so there's no point in checking for v4 support
-	if s.elTable != nil && s.elNodeDB != nil {
+	if s.elTable != nil && s.elNodeDB != nil && s.elPing() != nil {
 		elNodes := s.elTable.GetRandomActiveNodes(sampleSize)
 		if len(elNodes) > 0 {
 			s.config.Logger.WithField("count", len(elNodes)).WithField("layer", "EL").Debug("checking protocol support")
-			s.pingService.CheckProtocolSupportMultiple(elNodes)
+			s.elPing().CheckProtocolSupportMultiple(elNodes)
 
 			// Queue protocol support updates for all checked nodes (SetV4/SetV5 already marked them dirty)
 			for _, n := range elNodes {
@@ -917,8 +1008,8 @@ func (s *Service) connectCLBootnodes() {
 }
 
 // loadStoredENR loads the stored ENR from database.
-func (s *Service) loadStoredENR() (*enr.Record, error) {
-	data, err := s.config.Database.LoadLocalENR()
+func (s *Service) loadStoredENR(key string) (*enr.Record, error) {
+	data, err := s.config.Database.GetState(key)
 	if err != nil {
 		return nil, err
 	}
@@ -926,14 +1017,14 @@ func (s *Service) loadStoredENR() (*enr.Record, error) {
 	return enr.Load(data)
 }
 
-// storeENR stores the ENR to database.
-func (s *Service) storeENR(record *enr.Record) error {
+// storeENR stores an identity's ENR to the database under its state key.
+func (s *Service) storeENR(key string, record *enr.Record) error {
 	data, err := record.EncodeRLP()
 	if err != nil {
 		return err
 	}
 
-	return s.config.Database.StoreLocalENR(data)
+	return s.config.Database.SetState(nil, key, data)
 }
 
 // Callbacks for discv5
@@ -967,39 +1058,28 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 	}
 }
 
-func (s *Service) onFindNodeV5(msg *v5protocol.FindNode, sourceNode *v5node.Node, requester *net.UDPAddr) []*v5node.Node {
-	// Determine which table to serve from based on source node's layer
-	// If source node is unknown, serve from both tables
+func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNode *v5node.Node, requester *net.UDPAddr) []*v5node.Node {
+	// Distances are relative to the node ID the peer dialed.
 	var allNodes []*nodes.Node
-	localID := s.getLocalID()
+	localID := id.localNode.ID()
 
-	if sourceNode != nil && s.enrManager != nil {
-		// Check source node's layer
+	serveEL := id.servesEL
+	serveCL := id.servesCL
+
+	// A shared identity serves both layers under one ID, so classify a known
+	// requester by its ENR and serve only its layer(s); an unclassifiable known
+	// peer gets nothing, an unknown one (no ENR yet) falls through to both.
+	if id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
-		isEL, _ := s.enrManager.FilterELNode(sourceRecord)
-		isCL := s.enrManager.FilterCLNode(sourceRecord)
+		serveEL, _ = s.enrManager.FilterELNode(sourceRecord)
+		serveCL = s.enrManager.FilterCLNode(sourceRecord)
+	}
 
-		// Serve from appropriate table(s)
-		if isEL && s.elTable != nil {
-			elNodes := s.elTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, elNodes...)
-			s.config.Logger.WithField("sourceNodeID", sourceNode.ID().String()[:16]+"...").Debug("serving EL nodes to EL source")
-		}
-		if isCL && s.clTable != nil {
-			clNodes := s.clTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, clNodes...)
-			s.config.Logger.WithField("sourceNodeID", sourceNode.ID().String()[:16]+"...").Debug("serving CL nodes to CL source")
-		}
-	} else {
-		// Source unknown or no ENR manager - serve from both tables
-		if s.elTable != nil {
-			elNodes := s.elTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, elNodes...)
-		}
-		if s.clTable != nil {
-			clNodes := s.clTable.GetNodesByDistance(localID, msg.Distances, 8)
-			allNodes = append(allNodes, clNodes...)
-		}
+	if serveEL && s.elTable != nil {
+		allNodes = append(allNodes, s.elTable.GetNodesByDistance(localID, msg.Distances, 8)...)
+	}
+	if serveCL && s.clTable != nil {
+		allNodes = append(allNodes, s.clTable.GetNodesByDistance(localID, msg.Distances, 8)...)
 	}
 
 	// Filter nodes based on protocol support (only return v5-capable nodes)
@@ -1180,6 +1260,10 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 
 // checkAndAddNode performs admission checks and adds node to appropriate table.
 func (s *Service) checkAndAddNode(n *v5node.Node) bool {
+	if s.enrManager == nil {
+		return false
+	}
+
 	// Determine layer
 	isEL, _ := s.enrManager.FilterELNode(n.Record())
 	isCL := s.enrManager.FilterCLNode(n.Record())
@@ -1236,9 +1320,95 @@ func (s *Service) filterNodesForRequester(nodeList []*nodes.Node, requester *net
 	return filtered
 }
 
-// LocalNode returns the local node.
+// LocalNode returns the primary identity's local node.
 func (s *Service) LocalNode() *v5node.Node {
 	return s.localNode
+}
+
+// StartTime returns when the service started running.
+func (s *Service) StartTime() time.Time {
+	return s.startTime
+}
+
+// ELLocalNode returns the EL identity's local node (nil if EL disabled).
+func (s *Service) ELLocalNode() *v5node.Node {
+	if id := s.elIdentity(); id != nil {
+		return id.localNode
+	}
+	return nil
+}
+
+// CLLocalNode returns the CL identity's local node (nil if CL disabled).
+func (s *Service) CLLocalNode() *v5node.Node {
+	if id := s.clIdentity(); id != nil {
+		return id.localNode
+	}
+	return nil
+}
+
+// HasSeparateIdentities reports whether EL and CL run under distinct node IDs.
+func (s *Service) HasSeparateIdentities() bool {
+	return s.elIdentity() != nil && s.clIdentity() != nil && s.elIdentity() != s.clIdentity()
+}
+
+// strippedENR returns the base64 ENR for the given identity's node with the named
+// fields removed and the record re-signed by that identity's key. The live
+// sequence number is kept deliberately: a peer seeded from this record keeps it
+// (discv5 only adopts a strictly-higher seq), so the stripped fields stay absent
+// for that peer rather than being overwritten by the next live update.
+func (s *Service) strippedENR(node *v5node.Node, drop ...string) (string, error) {
+	if node == nil {
+		return "", fmt.Errorf("nil node")
+	}
+	for _, id := range s.identities {
+		if id.localNode != node {
+			continue
+		}
+		rec, err := node.Record().Clone()
+		if err != nil {
+			return "", err
+		}
+		for _, key := range drop {
+			rec.Delete(key)
+		}
+		if err := rec.Sign(id.key); err != nil {
+			return "", err
+		}
+		return rec.EncodeBase64()
+	}
+	return "", fmt.Errorf("no identity for node")
+}
+
+// GenericENR returns the base64 ENR for the given identity's node with the fork
+// fields (eth/eth2) removed. This is the record to commit to static bootnode
+// lists, which omit fork filtering so the bootnode is accepted regardless of the
+// client's fork state; the bootnode still advertises the full fork-filtered ENR
+// for live discovery.
+func (s *Service) GenericENR(node *v5node.Node) (string, error) {
+	return s.strippedENR(node, "eth", "eth2")
+}
+
+// ELENR returns the EL identity's ENR with the CL-only eth2 field removed — the
+// record to hand to EL clients, some of which reject an ENR carrying eth2. In
+// shared-key mode this strips eth2 from the combined record; with separate keys
+// the EL record already omits eth2, so the strip is a no-op. Empty if EL is
+// disabled.
+func (s *Service) ELENR() (string, error) {
+	node := s.ELLocalNode()
+	if node == nil {
+		return "", fmt.Errorf("EL not enabled")
+	}
+	return s.strippedENR(node, "eth2")
+}
+
+// CLENR returns the CL identity's ENR with the EL-only eth field removed. Empty
+// if CL is disabled. See ELENR for the shared- vs separate-key behavior.
+func (s *Service) CLENR() (string, error) {
+	node := s.CLLocalNode()
+	if node == nil {
+		return "", fmt.Errorf("CL not enabled")
+	}
+	return s.strippedENR(node, "eth")
 }
 
 // ELTable returns the EL routing table (may be nil if EL disabled).
@@ -1302,58 +1472,70 @@ func (s *Service) onPongReceived(remoteID []byte, sourceIP net.IP, reportedIP ne
 		return
 	}
 
-	// Report to IP discovery service with source IP
+	// Split sockets observe different external ports, which would split the
+	// IP-discovery vote across IP:port buckets and prevent consensus. Bucket
+	// them under one port instead; the per-identity advertised port is applied
+	// in updateENRWithDiscoveredIP, which ignores the discovered port when
+	// identities don't share a socket.
+	port := reportedPort
+	if !s.singleSocket() {
+		port = s.primaryIdentity().enrPort
+	}
+
 	reporterIDStr := fmt.Sprintf("%x", remoteID[:8])
-	s.ipDiscovery.ReportIP(reportedIP, reportedPort, reporterIDStr, sourceIP)
+	s.ipDiscovery.ReportIP(reportedIP, port, reporterIDStr, sourceIP)
 }
 
-// updateENRWithDiscoveredIP updates the local ENR with the discovered external IP.
+// updateENRWithDiscoveredIP updates every identity's ENR with the discovered IP.
 func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.localNode == nil {
-		return
-	}
+	// The discovered port can only be attributed to a layer when all identities
+	// share one socket; otherwise each keeps its configured port.
+	sharedSocket := s.singleSocket()
 
-	// Get current ENR
-	currentENR := s.localNode.Record()
+	for _, id := range s.identities {
+		if id.localNode == nil {
+			continue
+		}
 
-	// Check if IP/port has actually changed
-	currentIP := currentENR.IP()
-	currentPort := currentENR.UDP()
-	if currentIP != nil && currentIP.Equal(ip) && currentPort == port {
-		s.config.Logger.Debug("IP discovery: no change in external IP")
-		return
-	}
+		advPort := id.enrPort
+		if sharedSocket {
+			advPort = port
+		}
 
-	s.config.Logger.WithFields(map[string]interface{}{
-		"ip":     ip.String(),
-		"port":   port,
-		"isIPv6": isIPv6,
-	}).Info("IP discovery: consensus reached, updating ENR")
+		current := id.localNode.Record()
+		var err error
+		if isIPv6 {
+			if curIP := current.IP6(); curIP != nil && curIP.Equal(ip) && current.UDP6() == advPort {
+				continue
+			}
+			err = id.enrManager.UpdateENRWithIP6(ip, advPort)
+		} else {
+			if curIP := current.IP(); curIP != nil && curIP.Equal(ip) && current.UDP() == advPort {
+				continue
+			}
+			err = id.enrManager.UpdateENRWithIP(ip, advPort)
+		}
+		if err != nil {
+			s.config.Logger.WithError(err).Error("failed to update ENR with discovered IP")
+			continue
+		}
 
-	// Update the ENR with the new IP/port
-	// The ENR manager will handle signing and incrementing the sequence number
-	var err error
-	if isIPv6 {
-		err = s.enrManager.UpdateENRWithIP6(ip, port)
-	} else {
-		err = s.enrManager.UpdateENRWithIP(ip, port)
-	}
+		s.config.Logger.WithFields(map[string]interface{}{
+			"ip":     ip.String(),
+			"port":   advPort,
+			"isIPv6": isIPv6,
+		}).Info("IP discovery: consensus reached, updated ENR")
 
-	if err != nil {
-		s.config.Logger.WithError(err).Error("failed to update ENR with discovered IP")
-		return
-	}
+		if err := s.storeENR(id.storeKey, id.localNode.Record()); err != nil {
+			s.config.Logger.WithError(err).Warn("failed to store updated ENR")
+		}
 
-	// Store the updated ENR
-	if err := s.storeENR(s.localNode.Record()); err != nil {
-		s.config.Logger.WithError(err).Warn("failed to store updated ENR")
-	}
-
-	// Update discv4 service's local ENR if enabled
-	if s.discv4Service != nil {
-		s.discv4Service.SetLocalENR(s.localNode.Record())
+		// Keep the discv4 service's ENR in sync (EL identity only).
+		if id.servesEL && s.discv4Service != nil {
+			s.discv4Service.SetLocalENR(id.localNode.Record())
+		}
 	}
 }

@@ -534,9 +534,11 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 	// Build PING message
 	ping := &Ping{
-		Version:    4,
-		From:       NewEndpoint(h.config.LocalAddr, uint16(h.config.LocalAddr.Port)),
-		To:         NewEndpoint(n.Addr(), uint16(n.Addr().Port)),
+		Version: 4,
+		// A bootnode serves no RLPx, so it advertises tcp-port 0; the recipient's
+		// tcp is not the sender's to set (spec: to = [ip, udp-port, 0]).
+		From:       NewEndpoint(h.config.LocalAddr, 0),
+		To:         NewEndpoint(n.Addr(), 0),
 		Expiration: MakeExpiration(h.config.ExpirationWindow),
 	}
 
@@ -696,7 +698,7 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 // sendPong sends a PONG response.
 func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, replyTok []byte) error {
 	pong := &Pong{
-		To:         NewEndpoint(addr, uint16(addr.Port)),
+		To:         NewEndpoint(addr, 0),
 		ReplyTok:   replyTok,
 		Expiration: MakeExpiration(h.config.ExpirationWindow),
 	}

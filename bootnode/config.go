@@ -45,8 +45,25 @@ type Config struct {
 	// ENRIP6 is the IPv6 address to advertise in ENR (optional)
 	ENRIP6 net.IP
 
+	// ENRIPProvided/ENRIP6Provided record whether the advertised IP was explicitly
+	// configured (vs auto-detected). An explicit address is authoritative and
+	// overrides a stored ENR on restart; an auto-detected one does not, so a
+	// learned/discovered address survives.
+	ENRIPProvided  bool
+	ENRIP6Provided bool
+
 	// ENRPort is the UDP port to advertise in ENR (default: same as BindPort)
 	ENRPort uint16
+
+	// Per-layer overrides for migrating from separate EL and CL bootnodes that
+	// have distinct node keys. Any field left zero falls back to the shared
+	// value above.
+	ELPrivateKey *ecdsa.PrivateKey
+	CLPrivateKey *ecdsa.PrivateKey
+	ELBindPort   uint16
+	CLBindPort   uint16
+	ELENRPort    uint16
+	CLENRPort    uint16
 
 	// Execution Layer configuration
 
@@ -141,10 +158,6 @@ func DefaultConfig() *Config {
 
 // Validate checks if the configuration is valid.
 func (c *Config) Validate() error {
-	if c.PrivateKey == nil {
-		return fmt.Errorf("private key is required")
-	}
-
 	if c.Database == nil {
 		return fmt.Errorf("database is required")
 	}
@@ -152,6 +165,20 @@ func (c *Config) Validate() error {
 	// Must have at least one layer enabled
 	if c.ELConfig == nil && c.CLConfig == nil {
 		return fmt.Errorf("at least one of ELConfig or CLConfig must be set")
+	}
+
+	if c.HasEL() && c.elKey() == nil {
+		return fmt.Errorf("private key is required (set --private-key or --el-private-key)")
+	}
+	if c.HasCL() && c.clKey() == nil {
+		return fmt.Errorf("private key is required (set --private-key or --cl-private-key)")
+	}
+
+	// A node ID is derived from its key, so EL and CL sharing a key are one
+	// identity and cannot be split across different ports.
+	if c.HasEL() && c.HasCL() && sameKey(c.elKey(), c.clKey()) &&
+		(c.elBindPort() != c.clBindPort() || c.elENRPort() != c.clENRPort()) {
+		return fmt.Errorf("EL and CL share a key but use different ports; separate ports require separate keys (set --el-private-key/--cl-private-key)")
 	}
 
 	// Validate EL config if provided
@@ -244,4 +271,61 @@ func (c *Config) HasEL() bool {
 // HasCL returns true if CL support is enabled.
 func (c *Config) HasCL() bool {
 	return c.CLConfig != nil
+}
+
+func (c *Config) elKey() *ecdsa.PrivateKey {
+	if c.ELPrivateKey != nil {
+		return c.ELPrivateKey
+	}
+	return c.PrivateKey
+}
+
+func (c *Config) clKey() *ecdsa.PrivateKey {
+	if c.CLPrivateKey != nil {
+		return c.CLPrivateKey
+	}
+	return c.PrivateKey
+}
+
+func (c *Config) elBindPort() uint16 {
+	if c.ELBindPort != 0 {
+		return c.ELBindPort
+	}
+	return c.BindPort
+}
+
+func (c *Config) clBindPort() uint16 {
+	if c.CLBindPort != 0 {
+		return c.CLBindPort
+	}
+	return c.BindPort
+}
+
+// elENRPort prefers an explicit per-layer bind port over the shared ENR port,
+// so --el-port alone is also advertised.
+func (c *Config) elENRPort() uint16 {
+	if c.ELENRPort != 0 {
+		return c.ELENRPort
+	}
+	if c.ELBindPort != 0 {
+		return c.ELBindPort
+	}
+	if c.ENRPort != 0 {
+		return c.ENRPort
+	}
+	return c.BindPort
+}
+
+// clENRPort returns the CL identity's advertised port (see elENRPort).
+func (c *Config) clENRPort() uint16 {
+	if c.CLENRPort != 0 {
+		return c.CLENRPort
+	}
+	if c.CLBindPort != 0 {
+		return c.CLBindPort
+	}
+	if c.ENRPort != 0 {
+		return c.ENRPort
+	}
+	return c.BindPort
 }
