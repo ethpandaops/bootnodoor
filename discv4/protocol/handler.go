@@ -337,7 +337,7 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 	// Match to pending request
 	req := h.getPendingRequest(string(pong.ReplyTok))
 	if req != nil {
-		req.ResponseChan <- pong
+		h.deliverResponse(req, pong)
 	}
 
 	// Check if remote node has newer ENR
@@ -463,7 +463,7 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 			h.pendingNeighborsMu.Unlock()
 
 			if finalPending != nil {
-				matchedReq.ResponseChan <- finalPending.Nodes
+				h.deliverResponse(matchedReq, finalPending.Nodes)
 			}
 		}()
 	}
@@ -522,7 +522,7 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 	// Match to pending request
 	req := h.getPendingRequest(string(resp.ReplyTok))
 	if req != nil {
-		req.ResponseChan <- resp.Record
+		h.deliverResponse(req, resp.Record)
 	}
 
 	return nil
@@ -865,6 +865,20 @@ func (h *Handler) removePendingRequest(hash string) {
 	h.requestsMu.Lock()
 	delete(h.requests, hash)
 	h.requestsMu.Unlock()
+}
+
+// deliverResponse hands a response to a waiting request without blocking.
+//
+// ResponseChan is buffered (size 1) and read at most once by the waiter. A
+// duplicate, replayed or late response therefore finds the buffer full or the
+// waiter already gone. Sending directly would park the packet-dispatch
+// goroutine forever, so an unauthenticated peer could leak goroutines by
+// replaying responses. The non-blocking send drops the extra response instead.
+func (h *Handler) deliverResponse(req *PendingRequest, resp interface{}) {
+	select {
+	case req.ResponseChan <- resp:
+	default:
+	}
 }
 
 // Cleanup
