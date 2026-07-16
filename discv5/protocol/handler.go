@@ -704,6 +704,10 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 		}
 	}
 
+	if sess.GetNode() == nil && remoteNode != nil {
+		sess.SetNode(remoteNode)
+	}
+
 	h.config.Sessions.Put(sess)
 
 	// Call OnHandshakeComplete callback for outgoing handshake
