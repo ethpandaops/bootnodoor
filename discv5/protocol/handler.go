@@ -1686,13 +1686,20 @@ func (h *Handler) requestENRUpdate(n *node.Node) {
 				return
 			}
 
-			// The NODES response handler will automatically update the ENR in our table
 			nodesMsg, ok := resp.Message.(*Nodes)
-			if ok && len(nodesMsg.Records) > 0 {
+			if !ok {
 				h.config.Logger.WithFields(logrus.Fields{
 					"nodeID": n.ID().String()[:16],
-					"count":  len(nodesMsg.Records),
-				}).Debug("handler: received ENR update")
+					"type":   fmt.Sprintf("%T", resp.Message),
+				}).Debug("handler: ENR update returned unexpected response")
+				return
+			}
+
+			if h.applyENRUpdate(n, nodesMsg.Records) {
+				h.config.Logger.WithFields(logrus.Fields{
+					"nodeID": n.ID().String()[:16],
+					"seq":    n.Record().Seq(),
+				}).Debug("handler: installed ENR update")
 			}
 
 		case <-time.After(5 * time.Second):
@@ -1701,6 +1708,40 @@ func (h *Handler) requestENRUpdate(n *node.Node) {
 			}).Debug("handler: ENR update request timed out")
 		}
 	}()
+}
+
+// applyENRUpdate installs the newest valid record returned by a distance-zero
+// FINDNODE request. A peer must not be able to replace its session record with
+// another node's ENR, even though the response itself matched the pending request.
+func (h *Handler) applyENRUpdate(n *node.Node, records []*enr.Record) bool {
+	var newest *enr.Record
+
+	for _, record := range records {
+		candidate, err := node.New(record)
+		if err != nil {
+			h.config.Logger.WithError(err).Debug("handler: ignoring invalid ENR update")
+			continue
+		}
+		if candidate.ID() != n.ID() {
+			h.config.Logger.WithFields(logrus.Fields{
+				"nodeID":   n.ID().String()[:16],
+				"recordID": candidate.ID().String()[:16],
+			}).Debug("handler: ignoring ENR update for a different node")
+			continue
+		}
+		if newest == nil || record.Seq() > newest.Seq() {
+			newest = record
+		}
+	}
+
+	if newest == nil || !n.UpdateENR(newest) {
+		return false
+	}
+
+	if h.config.OnNodeUpdate != nil {
+		h.config.OnNodeUpdate(n)
+	}
+	return true
 }
 
 // SendFindNode sends a FINDNODE request.
