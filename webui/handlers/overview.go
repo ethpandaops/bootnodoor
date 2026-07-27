@@ -364,13 +364,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	if elConfig := fh.bootnodeService.ELConfig(); elConfig != nil {
 		if enrMgr := fh.bootnodeService.ENRManager(); enrMgr != nil {
 			if elFilter := enrMgr.GetELFilter(); elFilter != nil {
-				// Get genesis time from config
-				genesisTime := uint64(0)
-				if fh.bootnodeService.ELConfig() != nil {
-					// Note: We'd need the genesis time here, defaulting to 0
-				}
-
-				allForksWithNames := elFilter.GetAllForkIDsWithNames(genesisTime)
+				allForksWithNames := elFilter.GetAllForkIDsWithNames()
 				pageData.ELForks = make([]ForkInfo, 0, len(allForksWithNames))
 				for _, fork := range allForksWithNames {
 					// Format activation point

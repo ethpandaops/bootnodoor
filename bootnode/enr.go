@@ -1,9 +1,12 @@
 package bootnode
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"fmt"
+	"math"
 	"net"
+	"time"
 
 	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
@@ -63,7 +66,19 @@ func NewENRManager(cfg *Config, key *ecdsa.PrivateKey, localNode *v5node.Node, s
 	return manager
 }
 
+// StaticHead returns the head a bootnode evaluates fork schedules at. It
+// tracks no chain, so every block-scheduled fork counts as passed (exact on
+// post-merge networks, which can only schedule forks by time) and the time
+// head is the wall clock.
+func StaticHead() (block, timestamp uint64) {
+	return math.MaxUint64 - 1, uint64(time.Now().Unix())
+}
+
 // UpdateENR updates the local ENR with current eth and eth2 fields.
+//
+// It is a no-op when the computed fields already match the published record,
+// so periodic callers do not churn the sequence number (peers re-fetch a
+// record on every bump).
 //
 // This should be called:
 //   - On startup
@@ -77,6 +92,8 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 	if err != nil {
 		return fmt.Errorf("failed to clone ENR: %w", err)
 	}
+
+	changed := false
 
 	// A bootnode serves no TCP, so never advertise tcp/tcp6 — including any
 	// inherited from an ENR persisted by an older, TCP-advertising version.
@@ -98,24 +115,43 @@ func (m *ENRManager) UpdateENR(currentBlock, currentTime uint64) error {
 		}
 		newRecord.Set("eth", ethField)
 
-		m.config.Logger.WithField("forkID", forkID.String()).Debug("updated ENR with eth field")
-	} else {
+		if current, ok := record.Eth(); !ok || len(current) == 0 ||
+			current[0].ForkID != forkID.Hash || current[0].NextForkEpoch != forkID.Next {
+			changed = true
+			m.config.Logger.WithField("forkID", forkID.String()).Debug("updated ENR with eth field")
+		}
+	} else if record.Has("eth") {
 		// Drop any stale eth field (e.g. inherited from a reused shared ENR).
 		newRecord.Delete("eth")
+		changed = true
 	}
 
 	if m.servesCL && m.config.HasCL() {
 		eth2Field := m.clFilter.ComputeEth2Field()
 		newRecord.Set("eth2", eth2Field)
 
-		// eth2Field is []byte, extract first 4 bytes as fork digest for logging
-		var forkDigest [4]byte
-		if len(eth2Field) >= 4 {
-			copy(forkDigest[:], eth2Field[0:4])
+		var currentEth2 []byte
+		if err := record.Get("eth2", &currentEth2); err != nil || !bytes.Equal(currentEth2, eth2Field) {
+			changed = true
+
+			// eth2Field is []byte, extract first 4 bytes as fork digest for logging
+			var forkDigest [4]byte
+			if len(eth2Field) >= 4 {
+				copy(forkDigest[:], eth2Field[0:4])
+			}
+			m.config.Logger.WithField("forkDigest", fmt.Sprintf("%#x", forkDigest)).Debug("updated ENR with eth2 field")
 		}
-		m.config.Logger.WithField("forkDigest", fmt.Sprintf("%#x", forkDigest)).Debug("updated ENR with eth2 field")
-	} else {
+	} else if record.Has("eth2") {
 		newRecord.Delete("eth2")
+		changed = true
+	}
+
+	if record.Has("tcp") || record.Has("tcp6") {
+		changed = true
+	}
+
+	if !changed {
+		return nil
 	}
 
 	// Increment sequence number

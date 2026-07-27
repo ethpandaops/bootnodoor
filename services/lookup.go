@@ -55,6 +55,22 @@ type LookupService struct {
 	lookupsV4        int // Lookups using v4
 }
 
+// AdmissionResult reports why a discovered node was or was not admitted, so
+// fork-filter rejections stay distinguishable from pool-capacity rejections.
+type AdmissionResult int
+
+const (
+	// AdmissionAccepted means the node was admitted to the table.
+	AdmissionAccepted AdmissionResult = iota
+
+	// AdmissionRejectedFilter means the node failed fork validation.
+	AdmissionRejectedFilter
+
+	// AdmissionRejectedPool means the node passed validation but the table
+	// declined it (capacity, per-IP limit, or self).
+	AdmissionRejectedPool
+)
+
 // Config contains configuration for the lookup service.
 type Config struct {
 	// LocalNode is our node information
@@ -88,7 +104,7 @@ type Config struct {
 
 	// OnNodeFound is called when a new node is discovered during lookup
 	// The callback should handle admission checks and add the node if valid
-	OnNodeFound func(*nodedb.Node) bool
+	OnNodeFound func(*nodedb.Node) AdmissionResult
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
@@ -455,9 +471,18 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 
 	// Add discovered nodes via callback (handles admission checks)
 	var addedNodes []*nodedb.Node
+	var rejectedFilter, rejectedPool int
 	for _, n := range allDiscovered {
-		if ls.config.OnNodeFound != nil && ls.config.OnNodeFound(n) {
+		if ls.config.OnNodeFound == nil {
+			continue
+		}
+		switch ls.config.OnNodeFound(n) {
+		case AdmissionAccepted:
 			addedNodes = append(addedNodes, n)
+		case AdmissionRejectedFilter:
+			rejectedFilter++
+		case AdmissionRejectedPool:
+			rejectedPool++
 		}
 	}
 
@@ -467,10 +492,11 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 	ls.mu.Unlock()
 
 	ls.config.Logger.WithFields(logrus.Fields{
-		"target":     target,
-		"discovered": len(allDiscovered),
-		"accepted":   len(addedNodes),
-		"rejected":   len(allDiscovered) - len(addedNodes),
+		"target":        target,
+		"discovered":    len(allDiscovered),
+		"accepted":      len(addedNodes),
+		"rejected_fork": rejectedFilter,
+		"rejected_pool": rejectedPool,
 	}).Info("lookup complete")
 
 	return addedNodes, nil

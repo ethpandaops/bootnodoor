@@ -153,7 +153,8 @@ func New(cfg *Config) (*Service, error) {
 		}
 
 		id.enrManager = NewENRManager(cfg, id.key, localNode, id.servesEL, id.servesCL)
-		if uerr := id.enrManager.UpdateENR(0, 0); uerr != nil {
+		headBlock, headTime := StaticHead()
+		if uerr := id.enrManager.UpdateENR(headBlock, headTime); uerr != nil {
 			cfg.Logger.WithError(uerr).Warn("failed to update ENR with eth/eth2 fields")
 		} else if serr := s.storeENR(id.storeKey, localNode.Record()); serr != nil {
 			cfg.Logger.WithError(serr).Warn("failed to store updated ENR")
@@ -253,15 +254,23 @@ func New(cfg *Config) (*Service, error) {
 			Layer:         db.LayerEL,
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) bool {
+			OnNodeFound: func(n *nodes.Node) services.AdmissionResult {
 				// Filter by fork ID before adding to table
 				if n.Record() != nil && s.enrManager != nil {
-					if isEL, _ := s.enrManager.FilterELNode(n.Record()); !isEL {
+					isEL, forkID := s.enrManager.FilterELNode(n.Record())
+					if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+						elFilter.RecordAdmission(isEL, forkID)
+					}
+					if !isEL {
+						cfg.Logger.WithFields(logrus.Fields{
+							"peerID": n.PeerID(),
+							"eth":    forkID.String(),
+						}).Debug("EL lookup admission rejected: incompatible fork id")
 						// Mark as bad node
 						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
 							cfg.Logger.WithError(err).Debug("failed to store bad node")
 						}
-						return false
+						return services.AdmissionRejectedFilter
 					}
 				}
 
@@ -300,14 +309,14 @@ func New(cfg *Config) (*Service, error) {
 				}
 
 				// Attempt to add to EL table
-				added := s.elTable.Add(n)
-				if added {
-					// Remove from bad nodes list if it was previously bad
-					if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
-						cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-					}
+				if !s.elTable.Add(n) {
+					return services.AdmissionRejectedPool
 				}
-				return added
+				// Remove from bad nodes list if it was previously bad
+				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
+					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
+				}
+				return services.AdmissionAccepted
 			},
 			Logger: cfg.Logger.WithField("service", "el-lookup"),
 		})
@@ -336,7 +345,7 @@ func New(cfg *Config) (*Service, error) {
 			Layer:         db.LayerCL,
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) bool {
+			OnNodeFound: func(n *nodes.Node) services.AdmissionResult {
 				// Filter by fork digest before adding to table
 				if n.Record() != nil && s.enrManager != nil {
 					if !s.enrManager.FilterCLNode(n.Record()) {
@@ -344,18 +353,18 @@ func New(cfg *Config) (*Service, error) {
 						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
 							cfg.Logger.WithError(err).Debug("failed to store bad node")
 						}
-						return false
+						return services.AdmissionRejectedFilter
 					}
 				}
 				// Attempt to add to CL table
-				added := s.clTable.Add(n)
-				if added {
-					// Remove from bad nodes list if it was previously bad
-					if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
-						cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-					}
+				if !s.clTable.Add(n) {
+					return services.AdmissionRejectedPool
 				}
-				return added
+				// Remove from bad nodes list if it was previously bad
+				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
+					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
+				}
+				return services.AdmissionAccepted
 			},
 			Logger: cfg.Logger.WithField("service", "cl-lookup"),
 		})
@@ -605,6 +614,7 @@ func (s *Service) maintenanceLoop() {
 	supportCheck := time.NewTicker(30 * time.Minute)     // Check protocol support every 30 minutes
 	badNodesCleanup := time.NewTicker(24 * time.Hour)    // Cleanup bad nodes once per day
 	enrRequestCleanup := time.NewTicker(1 * time.Minute) // Cleanup stale ENR requests every minute
+	forkRefresh := time.NewTicker(1 * time.Minute)       // Re-publish eth/eth2 when a fork activates
 
 	defer tableMaintenance.Stop()
 	defer alivenessCheck.Stop()
@@ -612,6 +622,7 @@ func (s *Service) maintenanceLoop() {
 	defer supportCheck.Stop()
 	defer badNodesCleanup.Stop()
 	defer enrRequestCleanup.Stop()
+	defer forkRefresh.Stop()
 
 	for {
 		select {
@@ -635,7 +646,50 @@ func (s *Service) maintenanceLoop() {
 
 		case <-enrRequestCleanup.C:
 			s.cleanupStaleENRRequests()
+
+		case <-forkRefresh.C:
+			s.refreshForkENR()
 		}
+	}
+}
+
+// refreshForkENR re-publishes the eth/eth2 ENR fields when a fork activates
+// while running. Nothing else refreshes them, so without this a long-lived
+// bootnode keeps advertising a stale fork id past every scheduled transition.
+// UpdateENR is a no-op when nothing changed, so the sequence number only moves
+// at real transitions.
+func (s *Service) refreshForkENR() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	headBlock, headTime := StaticHead()
+
+	for _, id := range s.identities {
+		if id.localNode == nil || id.enrManager == nil {
+			continue
+		}
+		// Advance the CL accept set first so the recomputed eth2 field carries
+		// the new digest.
+		if clFilter := id.enrManager.GetCLFilter(); clFilter != nil {
+			clFilter.Update()
+		}
+
+		beforeSeq := id.localNode.Record().Seq()
+		if err := id.enrManager.UpdateENR(headBlock, headTime); err != nil {
+			s.config.Logger.WithError(err).Error("failed to refresh fork fields in ENR")
+			continue
+		}
+		if id.localNode.Record().Seq() == beforeSeq {
+			continue
+		}
+
+		if err := s.storeENR(id.storeKey, id.localNode.Record()); err != nil {
+			s.config.Logger.WithError(err).Warn("failed to store refreshed ENR")
+		}
+		if id.servesEL && s.discv4Service != nil {
+			s.discv4Service.SetLocalENR(id.localNode.Record())
+		}
+		s.config.Logger.WithField("seq", id.localNode.Record().Seq()).Info("fork transition: re-published ENR fork fields")
 	}
 }
 
@@ -869,7 +923,11 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 
 	// Filter by fork ID before adding
 	if s.enrManager != nil {
-		if isEL, forkID := s.enrManager.FilterELNode(record); !isEL {
+		isEL, forkID := s.enrManager.FilterELNode(record)
+		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+			elFilter.RecordAdmission(isEL, forkID)
+		}
+		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", v5.ID().Bytes()[:8]),
 				"eth":    forkID,
@@ -925,7 +983,11 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 
 	// Filter by fork ID before adding
 	if s.enrManager != nil {
-		if isEL, forkID := s.enrManager.FilterELNode(enrRecord); !isEL {
+		isEL, forkID := s.enrManager.FilterELNode(enrRecord)
+		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+			elFilter.RecordAdmission(isEL, forkID)
+		}
+		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", nodeID[:8]),
 				"eth":    forkID,
@@ -1236,6 +1298,9 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	// Filter the node using ENR manager (EL-only for discv4)
 	if s.enrManager != nil {
 		filter, forkID := s.enrManager.FilterELNode(n.ENR())
+		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+			elFilter.RecordAdmission(filter, forkID)
+		}
 		if !filter {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
@@ -1268,8 +1333,11 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	}
 
 	// Determine layer
-	isEL, _ := s.enrManager.FilterELNode(n.Record())
+	isEL, elForkID := s.enrManager.FilterELNode(n.Record())
 	isCL := s.enrManager.FilterCLNode(n.Record())
+	if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+		elFilter.RecordAdmission(isEL, elForkID)
+	}
 
 	// Add to appropriate table(s)
 	added := false

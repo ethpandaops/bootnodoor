@@ -134,6 +134,12 @@ func LoadConfig(path string) (*Config, error) {
 
 	cfg.rawConfig = rawConfig
 
+	// GetBlobParamsForEpoch's early break and addBPOForks' naming both assume
+	// an ascending schedule; the YAML carries no ordering guarantee.
+	sort.SliceStable(cfg.BlobSchedule, func(i, j int) bool {
+		return cfg.BlobSchedule[i].Epoch < cfg.BlobSchedule[j].Epoch
+	})
+
 	// Extract fork data dynamically from the map
 	if err := cfg.extractForkData(rawConfig); err != nil {
 		return nil, fmt.Errorf("failed to extract fork data: %w", err)
@@ -524,28 +530,52 @@ func (c *Config) GetForkDigestForEpoch(epoch uint64) ForkDigest {
 	return c.GetForkDigest(forkVersion, blobParams)
 }
 
+// currentEpochNow computes the current epoch from genesis time and wall
+// clock. The second return is false when no genesis time is configured.
+func (c *Config) currentEpochNow() (uint64, bool) {
+	genesisTime := c.GetGenesisTime()
+	if genesisTime == 0 {
+		return 0, false
+	}
+	currentTime := uint64(time.Now().Unix())
+	secondsPerSlot := c.SecondsPerSlot
+	if secondsPerSlot == 0 {
+		secondsPerSlot = 12
+	}
+	return uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, c.GetSlotsPerEpoch())), true
+}
+
+// forkBoundaryEpochs returns every epoch at which the wire digest can change:
+// genesis, each registered fork (including BPO pseudo-forks), and each blob
+// schedule boundary. Sorted ascending, deduplicated.
+func (c *Config) forkBoundaryEpochs() []uint64 {
+	seen := map[uint64]bool{0: true}
+	epochs := []uint64{0}
+	add := func(epoch uint64) {
+		if epoch != math.MaxUint64 && !seen[epoch] {
+			seen[epoch] = true
+			epochs = append(epochs, epoch)
+		}
+	}
+	for _, fork := range c.getForks() {
+		add(fork.epoch)
+	}
+	for _, entry := range c.BlobSchedule {
+		add(entry.Epoch)
+	}
+	sort.Slice(epochs, func(i, j int) bool { return epochs[i] < epochs[j] })
+	return epochs
+}
+
 // GetCurrentForkDigest returns the fork digest for the current epoch.
 //
 // Calculates the current epoch based on genesis time and returns the appropriate fork digest.
 func (c *Config) GetCurrentForkDigest() ForkDigest {
-	// Get genesis time
-	genesisTime := c.GetGenesisTime()
-	if genesisTime == 0 {
+	currentEpoch, ok := c.currentEpochNow()
+	if !ok {
 		// No genesis time, fall back to latest fork with realistic epoch
 		return c.getFallbackForkDigest()
 	}
-
-	// Calculate current epoch
-	currentTime := uint64(time.Now().Unix())
-	slotsPerEpoch := c.GetSlotsPerEpoch()
-	secondsPerSlot := c.SecondsPerSlot
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12 // Default
-	}
-
-	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
-
-	// Return fork digest for current epoch
 	return c.GetForkDigestForEpoch(currentEpoch)
 }
 
@@ -554,86 +584,44 @@ func (c *Config) GetGenesisForkDigest() ForkDigest {
 	return c.GetForkDigest(c.genesisForkVersion, nil)
 }
 
-// GetPreviousForkDigest returns the fork digest for the previous fork before the current one.
-// Returns the genesis fork digest if there is no previous fork.
+// previousBoundaryEpoch returns the boundary epoch immediately before the
+// currently active one, and whether such a boundary exists.
+func (c *Config) previousBoundaryEpoch() (uint64, bool) {
+	currentEpoch, ok := c.currentEpochNow()
+	if !ok {
+		return 0, false
+	}
+	var passed []uint64
+	for _, epoch := range c.forkBoundaryEpochs() {
+		if epoch > currentEpoch {
+			break
+		}
+		passed = append(passed, epoch)
+	}
+	if len(passed) < 2 {
+		return 0, false
+	}
+	return passed[len(passed)-2], true
+}
+
+// GetPreviousForkDigest returns the wire digest that was current before the
+// active boundary, computed on the same enumeration as GetAllForkDigests.
+// Returns the genesis fork digest if there is no previous boundary.
 func (c *Config) GetPreviousForkDigest() ForkDigest {
-	// Get genesis time
-	genesisTime := c.GetGenesisTime()
-	if genesisTime == 0 {
-		// No genesis time, return genesis fork digest
+	epoch, ok := c.previousBoundaryEpoch()
+	if !ok {
 		return c.GetGenesisForkDigest()
 	}
-
-	// Calculate current epoch
-	currentTime := uint64(time.Now().Unix())
-	slotsPerEpoch := c.GetSlotsPerEpoch()
-	secondsPerSlot := c.SecondsPerSlot
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
-	}
-	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
-
-	// Find the fork before the current one by iterating through forks in forward order
-	forks := c.getForks()
-	var currentFork *forkDefinition
-	var previousFork *forkDefinition
-
-	for i := 0; i < len(forks); i++ {
-		fork := forks[i]
-		if currentEpoch >= fork.epoch {
-			// This fork is active, remember it as current
-			previousFork = currentFork // The last current becomes previous
-			currentFork = &forks[i]    // This is now current
-		}
-	}
-
-	// Return the previous fork if it exists
-	if previousFork != nil {
-		return c.GetForkDigest(previousFork.parsedVersion, nil)
-	}
-
-	// No previous fork, return genesis
-	return c.GetGenesisForkDigest()
+	return c.GetForkDigestForEpoch(epoch)
 }
 
 // GetPreviousForkName returns the name of the previous fork before the current one.
 func (c *Config) GetPreviousForkName() string {
-	// Get genesis time
-	genesisTime := c.GetGenesisTime()
-	if genesisTime == 0 {
+	epoch, ok := c.previousBoundaryEpoch()
+	if !ok {
 		return "Phase0"
 	}
-
-	// Calculate current epoch
-	currentTime := uint64(time.Now().Unix())
-	slotsPerEpoch := c.GetSlotsPerEpoch()
-	secondsPerSlot := c.SecondsPerSlot
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
-	}
-	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
-
-	// Find the fork before the current one by iterating through forks in forward order
-	forks := c.getForks()
-	var currentFork *forkDefinition
-	var previousFork *forkDefinition
-
-	for i := 0; i < len(forks); i++ {
-		fork := forks[i]
-		if currentEpoch >= fork.epoch {
-			// This fork is active, remember it as current
-			previousFork = currentFork // The last current becomes previous
-			currentFork = &forks[i]    // This is now current
-		}
-	}
-
-	// Return the previous fork name if it exists
-	if previousFork != nil {
-		return previousFork.name
-	}
-
-	// No previous fork, return Phase0
-	return "Phase0"
+	return c.GetForkNameAtEpoch(epoch)
 }
 
 // getFallbackForkDigest returns the latest fork with a realistic epoch.
@@ -665,57 +653,43 @@ type ForkDigestInfo struct {
 	ForkVersion [4]byte
 }
 
-// GetAllForkDigests returns all possible fork digests for this config.
-//
-// This is useful for creating filters that accept nodes from multiple forks.
-// Note: For Fulu+ forks with blob schedules, this returns multiple digests per fork.
+// GetAllForkDigests returns every fork digest that can appear on the wire
+// for this config: one per boundary epoch, computed through the same
+// GetForkDigestForEpoch path that produces the live current digest. Digests
+// for same-epoch intermediate forks (never current on the wire) are
+// intentionally not included.
 func (c *Config) GetAllForkDigests() []ForkDigest {
 	var digests []ForkDigest
-
-	// Genesis (epoch 0) - use genesis fork version
-	digests = append(digests, c.GetForkDigest(c.genesisForkVersion, nil))
-
-	// All forks (including BPOs) - use their specific fork versions
-	for _, fork := range c.getForks() {
-		if fork.epoch != math.MaxUint64 {
-			// Get blob parameters active at this fork's epoch (if any)
-			blobParams := c.GetBlobParamsForEpoch(fork.epoch)
-			digests = append(digests, c.GetForkDigest(fork.parsedVersion, blobParams))
+	seen := make(map[ForkDigest]bool)
+	for _, epoch := range c.forkBoundaryEpochs() {
+		digest := c.GetForkDigestForEpoch(epoch)
+		if !seen[digest] {
+			seen[digest] = true
+			digests = append(digests, digest)
 		}
 	}
-
 	return digests
 }
 
-// GetAllForkDigestInfos returns all fork digests with their metadata.
+// GetAllForkDigestInfos returns all wire-valid fork digests with their
+// metadata, on the same boundary enumeration as GetAllForkDigests.
 func (c *Config) GetAllForkDigestInfos() []ForkDigestInfo {
 	var infos []ForkDigestInfo
-
-	// Add Genesis (epoch 0)
-	infos = append(infos, ForkDigestInfo{
-		Digest:      c.GetForkDigest(c.genesisForkVersion, nil),
-		Name:        "Phase0/Genesis",
-		Epoch:       0,
-		BlobParams:  nil,
-		ForkVersion: c.genesisForkVersion,
-	})
-
-	// Add all forks (including BPOs) - they're already in the correct order
-	for _, fork := range c.getForks() {
-		if fork.epoch != math.MaxUint64 {
-			// Get blob parameters active at this fork's epoch (if any)
-			blobParams := c.GetBlobParamsForEpoch(fork.epoch)
-
-			infos = append(infos, ForkDigestInfo{
-				Digest:      c.GetForkDigest(fork.parsedVersion, blobParams),
-				Name:        fork.name,
-				Epoch:       fork.epoch,
-				BlobParams:  blobParams,
-				ForkVersion: fork.parsedVersion,
-			})
+	seen := make(map[ForkDigest]bool)
+	for _, epoch := range c.forkBoundaryEpochs() {
+		digest := c.GetForkDigestForEpoch(epoch)
+		if seen[digest] {
+			continue
 		}
+		seen[digest] = true
+		infos = append(infos, ForkDigestInfo{
+			Digest:      digest,
+			Name:        c.GetForkNameAtEpoch(epoch),
+			Epoch:       epoch,
+			BlobParams:  c.GetBlobParamsForEpoch(epoch),
+			ForkVersion: c.GetForkVersionAtEpoch(epoch),
+		})
 	}
-
 	return infos
 }
 
