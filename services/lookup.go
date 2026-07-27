@@ -131,6 +131,81 @@ func (ls *LookupService) isLocal(id [32]byte) bool {
 	return false
 }
 
+// discoveries accumulates the records observed during a single lookup, keeping
+// the highest-sequence record per node plus the order nodes were first seen in.
+type discoveries struct {
+	table map[node.ID]*nodedb.Node
+	best  map[node.ID]*nodedb.Node
+	order []node.ID
+}
+
+func newDiscoveries(tableNodes []*nodedb.Node) *discoveries {
+	// Live entries, not a sequence snapshot: Add mutates these same objects, so
+	// a refresh landing mid-lookup must not leave us admitting a stale record.
+	table := make(map[node.ID]*nodedb.Node, len(tableNodes))
+	for _, n := range tableNodes {
+		table[n.ID()] = n
+	}
+
+	return &discoveries{
+		table: table,
+		best:  make(map[node.ID]*nodedb.Node),
+	}
+}
+
+// admit yields the best record per node in first-observation order. Order is
+// preserved because the table applies capacity and per-IP limits as nodes
+// arrive, so which record gets a slot depends on when it is offered.
+func (d *discoveries) admit() []*nodedb.Node {
+	out := make([]*nodedb.Node, 0, len(d.order))
+
+	for _, id := range d.order {
+		n := d.best[id]
+		if known, ok := d.table[id]; ok && n.Record().Seq() <= known.Record().Seq() {
+			continue
+		}
+		out = append(out, n)
+	}
+
+	return out
+}
+
+// noteDiscovered records a discovered node, reporting whether it is new to us
+// and therefore worth querying in the next round. Eligibility is settled before
+// d.best is consulted so a later duplicate cannot bypass the known-node gate.
+func (ls *LookupService) noteDiscovered(d *discoveries, n *nodedb.Node) bool {
+	id := n.ID()
+	if ls.isLocal(id) {
+		return false
+	}
+
+	rec := n.Record()
+	if rec == nil {
+		return false
+	}
+
+	// Only discv5 relays a peer's signed record; a v4 wrapper's ENR was fetched
+	// by dialing the peer, which is exactly what a stale peer is unreachable
+	// for, and re-admitting one re-runs the blocking v5 support probe.
+	known, isKnown := d.table[id]
+	if isKnown && (!n.HasV5() || rec.Seq() <= known.Record().Seq()) {
+		return false
+	}
+
+	if prev, ok := d.best[id]; ok {
+		if rec.Seq() > prev.Record().Seq() {
+			d.best[id] = n
+		}
+
+		return false
+	}
+
+	d.best[id] = n
+	d.order = append(d.order, id)
+
+	return !isKnown
+}
+
 // NewLookupService creates a new lookup service.
 func NewLookupService(cfg Config) *LookupService {
 	if cfg.Alpha <= 0 {
@@ -185,22 +260,9 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 		return nil, fmt.Errorf("no nodes in table to query")
 	}
 
-	// Track all discovered nodes and which ones we've queried
-	seen := make(map[node.ID]bool)
+	disc := newDiscoveries(allNodes)
 	queried := make(map[node.ID]bool)
-	var allDiscovered []*nodedb.Node
 	var mu sync.Mutex
-
-	// Add existing table nodes to the candidate pool
-	for _, n := range allNodes {
-		seen[n.ID()] = true
-	}
-
-	// Mark ourselves as seen so our own record can never enter the candidate
-	// set, the discovered set, or the admission callback.
-	for _, id := range ls.config.LocalIDs {
-		seen[id] = true
-	}
 
 	// For iterative lookup, we need a list of candidates sorted by distance to target
 	// Start with closest nodes from our table
@@ -238,7 +300,6 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 		// Query nodes in parallel for this round
 		var wg sync.WaitGroup
 		roundDiscovered := make([]*nodedb.Node, 0)
-		var roundMu sync.Mutex
 
 		for _, n := range toQuery {
 			wg.Add(1)
@@ -248,8 +309,12 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 				// Mark as queried
 				mu.Lock()
 				queried[n.ID()] = true
-				ls.queryHistory[n.ID()] = time.Now()
 				mu.Unlock()
+
+				// queryHistory outlives this lookup and is read under ls.mu.
+				ls.mu.Lock()
+				ls.queryHistory[n.ID()] = time.Now()
+				ls.mu.Unlock()
 
 				// Calculate distances
 				var distances []uint
@@ -272,9 +337,9 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 				// Try discv5 first if available
 				var discoveredNodes []*nodedb.Node
 				if v5Node := n.V5(); v5Node != nil && ls.config.V5Handler != nil {
-					mu.Lock()
+					ls.mu.Lock()
 					ls.lookupsV5++
-					mu.Unlock()
+					ls.mu.Unlock()
 
 					respChan, err := ls.config.V5Handler.SendFindNode(v5Node, distances)
 					if err != nil {
@@ -328,9 +393,9 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 
 				// Try discv4 fallback if no v5 results and v4 is available
 				if len(discoveredNodes) == 0 && n.V4() != nil && ls.config.V4Service != nil {
-					mu.Lock()
+					ls.mu.Lock()
 					ls.lookupsV4++
-					mu.Unlock()
+					ls.mu.Unlock()
 
 					v4Node := n.V4()
 					// Convert target to []byte for v4
@@ -440,22 +505,13 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 					discoveredNodes = append(discoveredNodes, nodesWithENR...)
 				}
 
-				// Add discovered nodes to round results
-				roundMu.Lock()
+				mu.Lock()
 				for _, newNode := range discoveredNodes {
-					// Skip if already seen
-					mu.Lock()
-					alreadySeen := seen[newNode.ID()]
-					if !alreadySeen {
-						seen[newNode.ID()] = true
-					}
-					mu.Unlock()
-
-					if !alreadySeen {
+					if ls.noteDiscovered(disc, newNode) {
 						roundDiscovered = append(roundDiscovered, newNode)
 					}
 				}
-				roundMu.Unlock()
+				mu.Unlock()
 			}(n)
 		}
 
@@ -465,11 +521,6 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 			"round":      round,
 			"discovered": len(roundDiscovered),
 		}).Debug("lookup round complete")
-
-		// Add this round's discoveries to the total
-		mu.Lock()
-		allDiscovered = append(allDiscovered, roundDiscovered...)
-		mu.Unlock()
 
 		// Check context before next round
 		select {
@@ -493,16 +544,18 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 		}
 	}
 
+	admitted := disc.admit()
+
 	ls.config.Logger.WithFields(logrus.Fields{
 		"target":     target,
 		"queried":    len(queried),
-		"discovered": len(allDiscovered),
+		"discovered": len(admitted),
 	}).Debug("lookup queries complete")
 
 	// Add discovered nodes via callback (handles admission checks)
 	var addedNodes []*nodedb.Node
 	var rejectedFilter, rejectedPool, rejectedLayer int
-	for _, n := range allDiscovered {
+	for _, n := range admitted {
 		if ls.config.OnNodeFound == nil {
 			continue
 		}
@@ -519,13 +572,13 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 	}
 
 	ls.mu.Lock()
-	ls.nodesDiscovered += len(allDiscovered)
+	ls.nodesDiscovered += len(admitted)
 	ls.lookupsCompleted++
 	ls.mu.Unlock()
 
 	ls.config.Logger.WithFields(logrus.Fields{
 		"target":         target,
-		"discovered":     len(allDiscovered),
+		"discovered":     len(admitted),
 		"accepted":       len(addedNodes),
 		"rejected_fork":  rejectedFilter,
 		"rejected_layer": rejectedLayer,
