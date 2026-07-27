@@ -262,7 +262,7 @@ func New(cfg *Config) (*Service, error) {
 						// execution node on the wrong fork. Counting those as
 						// fork rejections would make a healthy dual-layer network
 						// look like a fork-compatibility failure.
-						if _, hasEth := n.Record().Eth(); !hasEth {
+						if !n.Record().Has("eth") {
 							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "not_el"); err != nil {
 								cfg.Logger.WithError(err).Debug("failed to store bad node")
 							}
@@ -362,8 +362,7 @@ func New(cfg *Config) (*Service, error) {
 					if !s.enrManager.FilterCLNode(n.Record()) {
 						// No eth2 entry means an execution node, not a consensus
 						// node on the wrong digest; keep the two distinguishable.
-						var eth2 []byte
-						if err := n.Record().Get("eth2", &eth2); err != nil {
+						if !n.Record().Has("eth2") {
 							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "not_cl"); err != nil {
 								cfg.Logger.WithError(err).Debug("failed to store bad node")
 							}
@@ -1219,9 +1218,16 @@ func (s *Service) onNodeSeenV4(n *v4node.Node, timestamp time.Time) {
 	if s.elTable != nil && s.elNodeDB != nil {
 		// Look up the generic node from the table
 		if genericNode := s.elTable.Get(n.ID()); genericNode != nil {
-			// Node exists, just update last seen
 			genericNode.SetLastSeen(timestamp) // This marks it dirty
 			s.elNodeDB.QueueUpdate(genericNode)
+
+			// A known node still needs its record re-checked. PONG triggers an
+			// ENR refresh on the handler's node, but nothing propagates that to
+			// the table, so without this the table serves the peer's pre-fork
+			// record for the rest of its lifetime.
+			if rec := n.ENR(); rec != nil && rec.Seq() > genericNode.Record().Seq() {
+				s.checkAndAddNodeV4(n)
+			}
 			return
 		}
 
@@ -1346,7 +1352,7 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	// Filter the node using ENR manager (EL-only for discv4)
 	if s.enrManager != nil {
 		filter, forkID := s.enrManager.FilterELNode(n.ENR())
-		if _, hasEth := n.ENR().Eth(); hasEth {
+		if n.ENR().Has("eth") {
 			if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
 				elFilter.RecordAdmission(filter, forkID)
 			}
@@ -1390,7 +1396,7 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	// Only an execution record is an execution admission decision; counting
 	// consensus nodes here made the rejection counter track cross-layer
 	// traffic, which on a dual-layer network is most of what arrives.
-	if _, hasEth := n.Record().Eth(); hasEth {
+	if n.Record().Has("eth") {
 		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
 			elFilter.RecordAdmission(isEL, elForkID)
 		}
