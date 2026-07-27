@@ -383,6 +383,11 @@ func (s *Service) LocalEnode() string {
 	return en.String()
 }
 
+// Handler returns the underlying protocol handler.
+func (s *Service) Handler() *protocol.Handler {
+	return s.handler
+}
+
 // Statistics
 
 // Stats returns service statistics.

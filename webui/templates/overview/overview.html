@@ -626,8 +626,8 @@
                   <td class="text-end"><span class="badge rounded-pill text-bg-danger" data-stat="filter-rejected-invalid">{{ .FilterRejectedInvalid }}</span></td>
                 </tr>
                 <tr>
-                  <td class="text-muted">Rejected (Expired)</td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary" data-stat="filter-rejected-expired">{{ .FilterRejectedExpired }}</span></td>
+                  <td class="text-muted">Accepted (Historical)</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary" data-stat="filter-accepted-historical">{{ .FilterAcceptedHistorical }}</span></td>
                 </tr>
               </tbody>
             </table>
@@ -877,7 +877,7 @@
           updateValue('[data-stat="filter-accepted-current"]', data.FilterAcceptedCurrent);
           updateValue('[data-stat="filter-accepted-old"]', data.FilterAcceptedOld);
           updateValue('[data-stat="filter-rejected-invalid"]', data.FilterRejectedInvalid);
-          updateValue('[data-stat="filter-rejected-expired"]', data.FilterRejectedExpired);
+          updateValue('[data-stat="filter-accepted-historical"]', data.FilterAcceptedHistorical);
         }
       })
       .catch(function(error) {

@@ -1050,8 +1050,22 @@ func (h *Handler) incrementFindnodeResponsesRecv() {
 	h.statsMu.Unlock()
 }
 
-// Stats returns current statistics.
-func (h *Handler) Stats() map[string]interface{} {
+// HandlerStats is a snapshot of the handler's counters.
+type HandlerStats struct {
+	PacketsReceived       uint64
+	PacketsSent           uint64
+	InvalidPackets        uint64
+	ExpiredPackets        uint64
+	UnbondedFindnode      uint64
+	FindnodeRequestsRecv  uint64
+	FindnodeResponsesRecv uint64
+	KnownNodes            int
+	PendingRequests       int
+	PendingNeighbors      int
+}
+
+// GetStats returns current statistics.
+func (h *Handler) GetStats() HandlerStats {
 	h.nodesMu.RLock()
 	knownNodes := len(h.nodes)
 	h.nodesMu.RUnlock()
@@ -1065,16 +1079,34 @@ func (h *Handler) Stats() map[string]interface{} {
 	h.statsMu.RLock()
 	defer h.statsMu.RUnlock()
 
+	return HandlerStats{
+		PacketsReceived:       h.packetsReceived,
+		PacketsSent:           h.packetsSent,
+		InvalidPackets:        h.invalidPackets,
+		ExpiredPackets:        h.expiredPackets,
+		UnbondedFindnode:      h.unbondedFindnode,
+		FindnodeRequestsRecv:  h.findnodeRequestsRecv,
+		FindnodeResponsesRecv: h.findnodeResponsesRecv,
+		KnownNodes:            knownNodes,
+		PendingRequests:       pendingRequests,
+		PendingNeighbors:      pendingNeighbors,
+	}
+}
+
+// Stats returns current statistics as a map, for callers that render it
+// generically.
+func (h *Handler) Stats() map[string]interface{} {
+	s := h.GetStats()
 	return map[string]interface{}{
-		"packets_received":        h.packetsReceived,
-		"packets_sent":            h.packetsSent,
-		"invalid_packets":         h.invalidPackets,
-		"expired_packets":         h.expiredPackets,
-		"unbonded_findnode":       h.unbondedFindnode,
-		"findnode_requests_recv":  h.findnodeRequestsRecv,
-		"findnode_responses_recv": h.findnodeResponsesRecv,
-		"known_nodes":             knownNodes,
-		"pending_requests":        pendingRequests,
-		"pending_neighbors":       pendingNeighbors,
+		"packets_received":        s.PacketsReceived,
+		"packets_sent":            s.PacketsSent,
+		"invalid_packets":         s.InvalidPackets,
+		"expired_packets":         s.ExpiredPackets,
+		"unbonded_findnode":       s.UnbondedFindnode,
+		"findnode_requests_recv":  s.FindnodeRequestsRecv,
+		"findnode_responses_recv": s.FindnodeResponsesRecv,
+		"known_nodes":             s.KnownNodes,
+		"pending_requests":        s.PendingRequests,
+		"pending_neighbors":       s.PendingNeighbors,
 	}
 }

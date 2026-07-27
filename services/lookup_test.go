@@ -2,7 +2,9 @@ package services
 
 import (
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	v4node "github.com/ethpandaops/bootnodoor/discv4/node"
@@ -85,5 +87,54 @@ func TestIsLocalCoversBothIdentities(t *testing.T) {
 	ls4 := quietLookupService([][32]byte{v4Self.ID()})
 	if !ls4.isLocal(v4Self.ID()) {
 		t.Fatal("a discv4 local id was not recognized as self")
+	}
+}
+
+// TestPingServiceStatsRace exercises the counters from many goroutines while a
+// reader polls GetStats, which is what the web UI handler does.
+func TestPingServiceStatsRace(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+	ps := NewPingService(nil, nil, logger)
+
+	var writers, reader sync.WaitGroup
+	stop := make(chan struct{})
+
+	reader.Add(1)
+	go func() {
+		defer reader.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = ps.GetStats()
+			}
+		}
+	}()
+
+	for i := 0; i < 4; i++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for j := 0; j < 200; j++ {
+				ps.countPingSent()
+				ps.countProtocol(j%2 == 0)
+				ps.countPong(time.Millisecond)
+				ps.countTimeout()
+			}
+		}()
+	}
+
+	writers.Wait()
+	close(stop)
+	reader.Wait()
+
+	stats := ps.GetStats()
+	if stats.PingsSent != 800 || stats.PongsReceived != 800 || stats.PingTimeouts != 800 {
+		t.Fatalf("counters lost updates: %+v", stats)
+	}
+	if stats.PingsV5+stats.PingsV4 != 800 {
+		t.Fatalf("protocol counters = %d+%d, want 800 total", stats.PingsV5, stats.PingsV4)
 	}
 }

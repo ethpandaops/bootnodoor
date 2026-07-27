@@ -71,7 +71,6 @@ type OverviewPageData struct {
 
 	// Routing table stats (combined)
 	TableSize     int
-	BucketsFilled int // Deprecated for flat table
 	ActiveNodes   int
 	InactiveNodes int
 
@@ -112,11 +111,11 @@ type OverviewPageData struct {
 	FindNodeReceived  int
 
 	// Fork filter stats
-	FilterAcceptedCurrent int
-	FilterAcceptedOld     int
-	FilterRejectedInvalid int
-	FilterRejectedExpired int
-	FilterTotalChecks     int
+	FilterAcceptedCurrent    int
+	FilterAcceptedOld        int
+	FilterRejectedInvalid    int
+	FilterAcceptedHistorical int
+	FilterTotalChecks        int
 
 	// Database stats
 	DBQueueSize        int
@@ -133,7 +132,6 @@ type TableStats struct {
 	ActiveNodes   int
 	InactiveNodes int
 	TotalNodes    int
-	BucketsFilled int
 }
 
 type OldDigestInfo struct {
@@ -334,7 +332,6 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 			ActiveNodes:   elStats.ActiveNodes,
 			InactiveNodes: elInactiveNodes,
 			TotalNodes:    elStats.TotalNodes,
-			BucketsFilled: elStats.BucketsFilled,
 		}
 		// Update combined stats
 		pageData.ActiveNodes += elStats.ActiveNodes
@@ -352,7 +349,6 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 			ActiveNodes:   clStats.ActiveNodes,
 			InactiveNodes: clInactiveNodes,
 			TotalNodes:    clStats.TotalNodes,
-			BucketsFilled: clStats.BucketsFilled,
 		}
 		// Update combined stats
 		pageData.ActiveNodes += clStats.ActiveNodes
@@ -478,9 +474,54 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 		}
 	}
 
-	// Note: Detailed stats (lookups, pings, sessions, etc.) are not available
-	// through the public API of the new bootnode service. These would need to be
-	// exposed through additional methods if required.
+	stats := fh.bootnodeService.GetStats()
+
+	pageData.LookupsStarted = stats.Lookups.LookupsStarted
+	pageData.LookupsCompleted = stats.Lookups.LookupsCompleted
+	pageData.LookupsFailed = stats.Lookups.LookupsFailed
+
+	pageData.PingsSent = stats.Ping.PingsSent
+	pageData.PongsReceived = stats.Ping.PongsReceived
+	pageData.PingSuccessRate = stats.Ping.SuccessRate
+
+	pageData.SessionsTotal = stats.Sessions.Total
+	pageData.SessionsActive = stats.Sessions.Active
+	pageData.SessionsExpired = stats.Sessions.Expired
+
+	pageData.PendingHandshakes = stats.Discv5.PendingHandshakes
+	pageData.PendingChallenges = stats.Discv5.PendingChallenges
+
+	// Packet totals come from the transport so both protocols are counted; the
+	// discv5-specific views stay on the handler counters.
+	pageData.PacketsReceived = int(stats.Packets.PacketsReceived)
+	pageData.PacketsSent = int(stats.Packets.PacketsSent)
+	pageData.InvalidPackets = stats.Discv5.InvalidPackets + int(stats.Discv4.InvalidPackets)
+	pageData.FilteredResponses = stats.Discv5.FilteredResponses
+	pageData.FindNodeReceived = stats.Discv5.FindNodeReceived + int(stats.Discv4.FindnodeRequestsRecv)
+
+	if enrMgr := fh.bootnodeService.ENRManager(); enrMgr != nil {
+		if clFilter := enrMgr.GetCLFilter(); clFilter != nil {
+			filterStats := clFilter.GetStats()
+			pageData.NetworkName = clFilter.GetNetworkName()
+			pageData.CurrentFork = clFilter.GetCurrentFork()
+			pageData.CurrentDigest = clFilter.GetCurrentDigest()
+			pageData.PreviousFork = clFilter.GetPreviousForkName()
+			pageData.PreviousDigest = clFilter.GetPreviousForkDigest()
+			pageData.GenesisDigest = clFilter.GetGenesisForkDigest()
+			pageData.GracePeriod = clFilter.GetGracePeriod()
+			pageData.FilterAcceptedCurrent = filterStats.AcceptedCurrent
+			pageData.FilterAcceptedOld = filterStats.AcceptedOld
+			pageData.FilterAcceptedHistorical = filterStats.AcceptedHistorical
+			pageData.FilterRejectedInvalid = filterStats.RejectedInvalid
+			pageData.FilterTotalChecks = filterStats.TotalChecks
+		} else if elFilter := enrMgr.GetELFilter(); elFilter != nil {
+			// EL-only bootnode: the fork panel shows execution admission instead.
+			elStats := elFilter.GetStats()
+			pageData.FilterAcceptedCurrent = int(elStats.Accepted)
+			pageData.FilterRejectedInvalid = int(elStats.Rejected)
+			pageData.FilterTotalChecks = int(elStats.TotalChecks)
+		}
+	}
 
 	return pageData, nil
 }
