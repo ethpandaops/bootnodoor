@@ -11,6 +11,7 @@ package enr
 
 import (
 	"crypto/ecdsa"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -393,7 +394,7 @@ func (r *Record) Eth2() (*Eth2ENRData, bool) {
 	// Eth2 field format:
 	// - Bytes 0-3: Current fork digest
 	// - Bytes 4-7: Next fork version
-	// - Bytes 8-15: Next fork epoch (big endian)
+	// - Bytes 8-15: Next fork epoch (SSZ uint64, little endian)
 	if len(eth2Bytes) < 16 {
 		return nil, false
 	}
@@ -401,16 +402,7 @@ func (r *Record) Eth2() (*Eth2ENRData, bool) {
 	var eth2Data Eth2ENRData
 	copy(eth2Data.ForkDigest[:], eth2Bytes[0:4])
 	copy(eth2Data.NextForkVersion[:], eth2Bytes[4:8])
-
-	// Decode next fork epoch (big endian)
-	eth2Data.NextForkEpoch = uint64(eth2Bytes[8])<<56 |
-		uint64(eth2Bytes[9])<<48 |
-		uint64(eth2Bytes[10])<<40 |
-		uint64(eth2Bytes[11])<<32 |
-		uint64(eth2Bytes[12])<<24 |
-		uint64(eth2Bytes[13])<<16 |
-		uint64(eth2Bytes[14])<<8 |
-		uint64(eth2Bytes[15])
+	eth2Data.NextForkEpoch = binary.LittleEndian.Uint64(eth2Bytes[8:16])
 
 	return &eth2Data, true
 }

@@ -1337,19 +1337,19 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 		return false
 	}
 
-	// Check if node already exists in table
-	if existingNode := s.elTable.Get(n.ID()); existingNode != nil {
-		s.config.Logger.WithFields(logrus.Fields{
-			"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
-		}).Debug("Discv4 node already in EL table, skipping add")
-		return false
-	}
+	// A node already in the table still needs its record re-checked: Add()
+	// installs a newer ENR, which is how a peer's post-fork eth entry reaches
+	// the table. Returning early here left the pre-fork record in place and
+	// served it to every FINDNODE querier.
+	alreadyKnown := s.elTable.Get(n.ID()) != nil
 
 	// Filter the node using ENR manager (EL-only for discv4)
 	if s.enrManager != nil {
 		filter, forkID := s.enrManager.FilterELNode(n.ENR())
-		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-			elFilter.RecordAdmission(filter, forkID)
+		if _, hasEth := n.ENR().Eth(); hasEth {
+			if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+				elFilter.RecordAdmission(filter, forkID)
+			}
 		}
 		if !filter {
 			s.config.Logger.WithFields(logrus.Fields{
@@ -1366,10 +1366,12 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 
 	// Try to add to table
 	if s.elTable.Add(genericNode) {
-		s.config.Logger.WithFields(logrus.Fields{
-			"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
-			"addr":   n.Addr().String(),
-		}).Info("Added discv4 node to EL table")
+		if !alreadyKnown {
+			s.config.Logger.WithFields(logrus.Fields{
+				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
+				"addr":   n.Addr().String(),
+			}).Info("Added discv4 node to EL table")
+		}
 		return true
 	}
 
@@ -1385,8 +1387,13 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	// Determine layer
 	isEL, elForkID := s.enrManager.FilterELNode(n.Record())
 	isCL := s.enrManager.FilterCLNode(n.Record())
-	if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-		elFilter.RecordAdmission(isEL, elForkID)
+	// Only an execution record is an execution admission decision; counting
+	// consensus nodes here made the rejection counter track cross-layer
+	// traffic, which on a dual-layer network is most of what arrives.
+	if _, hasEth := n.Record().Eth(); hasEth {
+		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+			elFilter.RecordAdmission(isEL, elForkID)
+		}
 	}
 
 	// Add to appropriate table(s)

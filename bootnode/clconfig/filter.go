@@ -232,8 +232,10 @@ func (f *ForkDigestFilter) Update() {
 		f.currentForkDigest = newDigest
 		f.lastUpdate = time.Now()
 
-		// Log would go here
-		// logger.Info("Fork activated", "old", oldDigest, "new", newDigest)
+		if f.logger != nil {
+			f.logger.Debugf("CL fork activated: digest %s -> %s (previous digest accepted for %s)",
+				oldDigest.String(), newDigest.String(), f.gracePeriod)
+		}
 	}
 
 	// Clean up expired old digests
@@ -343,6 +345,13 @@ func (f *ForkDigestFilter) nextForkInfo() ([4]byte, uint64) {
 	currentForkVersion := f.config.GetForkVersionAtEpoch(currentEpoch)
 
 	for _, fork := range f.config.getForks() {
+		// An unscheduled fork is not an upcoming one. Returning its version
+		// published a next_fork_version for a fork that may never activate,
+		// where the spec wants the current version once next_fork_epoch is
+		// FAR_FUTURE_EPOCH.
+		if fork.epoch == farFutureEpoch {
+			continue
+		}
 		if fork.epoch > currentEpoch {
 			return fork.parsedVersion, fork.epoch
 		}

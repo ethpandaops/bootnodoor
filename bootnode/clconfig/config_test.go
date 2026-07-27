@@ -1,6 +1,7 @@
 package clconfig
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -114,5 +115,28 @@ BLOB_SCHEDULE:
 	}
 	if got := cfg.GetBlobParamsForEpoch(150); got == nil || got.MaxBlobsPerBlock != 12 {
 		t.Fatalf("blob params at 150 = %+v, want the epoch-100 entry (12)", got)
+	}
+}
+
+// TestEncodeETH2FieldEpochIsLittleEndian pins the SSZ encoding of
+// ENRForkID.next_fork_epoch. A big-endian epoch is byte-identical when the
+// value is FAR_FUTURE_EPOCH, so only a scheduled fork exposes the difference —
+// which is why every all-forks-at-genesis devnet missed this.
+func TestEncodeETH2FieldEpochIsLittleEndian(t *testing.T) {
+	digest := ForkDigest{0xaa, 0xbb, 0xcc, 0xdd}
+	version := [4]byte{0x70, 0x00, 0x00, 0x38}
+
+	field := EncodeETH2Field(digest, version, 5)
+	if len(field) != 16 {
+		t.Fatalf("eth2 field = %d bytes, want 16", len(field))
+	}
+	want := []byte{0x05, 0, 0, 0, 0, 0, 0, 0}
+	if !bytes.Equal(field[8:16], want) {
+		t.Fatalf("next_fork_epoch bytes = % x, want % x (little-endian 5)", field[8:16], want)
+	}
+
+	// FAR_FUTURE_EPOCH is palindromic, so it must round-trip either way.
+	if got := EncodeETH2Field(digest, version, ^uint64(0)); !bytes.Equal(got[8:16], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
+		t.Fatalf("far-future epoch bytes = % x", got[8:16])
 	}
 }

@@ -799,8 +799,11 @@ func EncodeETH2Field(currentDigest ForkDigest, nextForkVersion [4]byte, nextFork
 	// Next fork version (bytes 4-7)
 	copy(field[4:8], nextForkVersion[:])
 
-	// Next fork epoch (bytes 8-15, big endian)
-	binary.BigEndian.PutUint64(field[8:16], nextForkEpoch)
+	// Bytes 8-15: the eth2 entry is an SSZ ENRForkID, so the epoch is a
+	// little-endian uint64. Big-endian reads identically when the epoch is
+	// FAR_FUTURE_EPOCH, which is why this went unnoticed until a fork was
+	// actually scheduled.
+	binary.LittleEndian.PutUint64(field[8:16], nextForkEpoch)
 
 	return field
 }
