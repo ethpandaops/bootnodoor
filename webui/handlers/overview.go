@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -514,6 +515,15 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 			pageData.CurrentDigest = clFilter.GetCurrentDigest()
 			pageData.PreviousFork = clFilter.GetPreviousForkName()
 			pageData.PreviousDigest = clFilter.GetPreviousForkDigest()
+			for digest, remaining := range clFilter.GetOldForkDigests() {
+				pageData.OldDigests = append(pageData.OldDigests, OldDigestInfo{
+					Digest:    digest.String(),
+					Remaining: remaining,
+				})
+			}
+			sort.Slice(pageData.OldDigests, func(i, j int) bool {
+				return pageData.OldDigests[i].Remaining > pageData.OldDigests[j].Remaining
+			})
 			pageData.GenesisDigest = clFilter.GetGenesisForkDigest()
 			pageData.GracePeriod = clFilter.GetGracePeriod()
 			pageData.FilterAcceptedCurrent = filterStats.AcceptedCurrent
