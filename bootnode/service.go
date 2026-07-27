@@ -257,10 +257,20 @@ func New(cfg *Config) (*Service, error) {
 				// Filter by fork ID before adding to table
 				if n.Record() != nil && s.enrManager != nil {
 					isEL, forkID := s.enrManager.FilterELNode(n.Record())
-					if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-						elFilter.RecordAdmission(isEL, forkID)
-					}
 					if !isEL {
+						// A record with no eth entry is a consensus node, not an
+						// execution node on the wrong fork. Counting those as
+						// fork rejections would make a healthy dual-layer network
+						// look like a fork-compatibility failure.
+						if _, hasEth := n.Record().Eth(); !hasEth {
+							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "not_el"); err != nil {
+								cfg.Logger.WithError(err).Debug("failed to store bad node")
+							}
+							return services.AdmissionRejectedLayer
+						}
+						if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+							elFilter.RecordAdmission(false, forkID)
+						}
 						cfg.Logger.WithFields(logrus.Fields{
 							"peerID": n.PeerID(),
 							"eth":    forkID.String(),
@@ -270,6 +280,9 @@ func New(cfg *Config) (*Service, error) {
 							cfg.Logger.WithError(err).Debug("failed to store bad node")
 						}
 						return services.AdmissionRejectedFilter
+					}
+					if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
+						elFilter.RecordAdmission(true, forkID)
 					}
 				}
 
@@ -347,6 +360,15 @@ func New(cfg *Config) (*Service, error) {
 				// Filter by fork digest before adding to table
 				if n.Record() != nil && s.enrManager != nil {
 					if !s.enrManager.FilterCLNode(n.Record()) {
+						// No eth2 entry means an execution node, not a consensus
+						// node on the wrong digest; keep the two distinguishable.
+						var eth2 []byte
+						if err := n.Record().Get("eth2", &eth2); err != nil {
+							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "not_cl"); err != nil {
+								cfg.Logger.WithError(err).Debug("failed to store bad node")
+							}
+							return services.AdmissionRejectedLayer
+						}
 						// Mark as bad node
 						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
 							cfg.Logger.WithError(err).Debug("failed to store bad node")

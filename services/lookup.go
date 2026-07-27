@@ -63,8 +63,15 @@ const (
 	// AdmissionAccepted means the node was admitted to the table.
 	AdmissionAccepted AdmissionResult = iota
 
-	// AdmissionRejectedFilter means the node failed fork validation.
+	// AdmissionRejectedFilter means the node is on this layer but announced an
+	// incompatible fork.
 	AdmissionRejectedFilter
+
+	// AdmissionRejectedLayer means the node serves the other layer, so this
+	// lookup was never a candidate for it. On a dual-layer network most
+	// discovered nodes land here, which is healthy and must not be read as a
+	// fork-compatibility problem.
+	AdmissionRejectedLayer
 
 	// AdmissionRejectedPool means the node passed validation but the table
 	// declined it (capacity, per-IP limit, or self).
@@ -494,7 +501,7 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 
 	// Add discovered nodes via callback (handles admission checks)
 	var addedNodes []*nodedb.Node
-	var rejectedFilter, rejectedPool int
+	var rejectedFilter, rejectedPool, rejectedLayer int
 	for _, n := range allDiscovered {
 		if ls.config.OnNodeFound == nil {
 			continue
@@ -506,6 +513,8 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 			rejectedFilter++
 		case AdmissionRejectedPool:
 			rejectedPool++
+		case AdmissionRejectedLayer:
+			rejectedLayer++
 		}
 	}
 
@@ -515,11 +524,12 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 	ls.mu.Unlock()
 
 	ls.config.Logger.WithFields(logrus.Fields{
-		"target":        target,
-		"discovered":    len(allDiscovered),
-		"accepted":      len(addedNodes),
-		"rejected_fork": rejectedFilter,
-		"rejected_pool": rejectedPool,
+		"target":         target,
+		"discovered":     len(allDiscovered),
+		"accepted":       len(addedNodes),
+		"rejected_fork":  rejectedFilter,
+		"rejected_layer": rejectedLayer,
+		"rejected_pool":  rejectedPool,
 	}).Info("lookup complete")
 
 	return addedNodes, nil

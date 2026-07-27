@@ -110,12 +110,19 @@ type OverviewPageData struct {
 	FilteredResponses int
 	FindNodeReceived  int
 
-	// Fork filter stats
+	// CL fork digest filter stats
 	FilterAcceptedCurrent    int
 	FilterAcceptedOld        int
 	FilterRejectedInvalid    int
 	FilterAcceptedHistorical int
 	FilterTotalChecks        int
+
+	// EL fork ID admission stats. Independent of the CL counters above: a
+	// dual-layer bootnode runs both filters, so neither can stand in for the
+	// other.
+	ELFilterAccepted    int
+	ELFilterRejected    int
+	ELFilterTotalChecks int
 
 	// Database stats
 	DBQueueSize        int
@@ -514,12 +521,12 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 			pageData.FilterAcceptedHistorical = filterStats.AcceptedHistorical
 			pageData.FilterRejectedInvalid = filterStats.RejectedInvalid
 			pageData.FilterTotalChecks = filterStats.TotalChecks
-		} else if elFilter := enrMgr.GetELFilter(); elFilter != nil {
-			// EL-only bootnode: the fork panel shows execution admission instead.
+		}
+		if elFilter := enrMgr.GetELFilter(); elFilter != nil {
 			elStats := elFilter.GetStats()
-			pageData.FilterAcceptedCurrent = int(elStats.Accepted)
-			pageData.FilterRejectedInvalid = int(elStats.Rejected)
-			pageData.FilterTotalChecks = int(elStats.TotalChecks)
+			pageData.ELFilterAccepted = int(elStats.Accepted)
+			pageData.ELFilterRejected = int(elStats.Rejected)
+			pageData.ELFilterTotalChecks = int(elStats.TotalChecks)
 		}
 	}
 
