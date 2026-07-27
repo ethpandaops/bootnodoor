@@ -11,6 +11,92 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// TestResolveHandshakeSender covers the optional-record rule from discv5 v5.1:
+// a peer may answer our WHOAREYOU without repeating its ENR, and rejecting that
+// would break bonding with exactly the peers whose records we already hold.
+func TestResolveHandshakeSender(t *testing.T) {
+	key := generateKey(t)
+	record := signedRecord(t, key, 4, nil)
+	known, err := node.New(record)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	encoded, err := record.EncodeRLP()
+	if err != nil {
+		t.Fatalf("encode record: %v", err)
+	}
+
+	otherKey := generateKey(t)
+	otherNode, err := node.New(signedRecord(t, otherKey, 1, nil))
+	if err != nil {
+		t.Fatalf("create other node: %v", err)
+	}
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	tests := []struct {
+		name      string
+		enrBytes  []byte
+		challenge *PendingChallenge
+		source    node.ID
+		wantErr   bool
+	}{
+		{
+			name:     "record in handshake is used",
+			enrBytes: encoded,
+			source:   known.ID(),
+		},
+		{
+			name:      "record omitted falls back to the challenge",
+			challenge: &PendingChallenge{KnownNode: known},
+			source:    known.ID(),
+		},
+		{
+			name:      "record omitted with nothing to fall back to",
+			challenge: &PendingChallenge{},
+			source:    known.ID(),
+			wantErr:   true,
+		},
+		{
+			name:     "record belongs to a different node than claimed",
+			enrBytes: encoded,
+			source:   otherNode.ID(),
+			wantErr:  true,
+		},
+		{
+			name:      "fallback belongs to a different node than claimed",
+			challenge: &PendingChallenge{KnownNode: known},
+			source:    otherNode.ID(),
+			wantErr:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, pubKey, err := resolveHandshakeSender(tc.enrBytes, tc.challenge, tc.source, logger)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error, got a resolved sender")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if got == nil {
+				t.Fatal("resolved a key but no node; the session would have nothing to refresh")
+			}
+			if node.PubkeyToID(pubKey) != tc.source {
+				t.Fatal("resolved key does not derive the claimed source ID")
+			}
+		})
+	}
+}
+
 func TestApplyENRUpdateInstallsNewestMatchingRecord(t *testing.T) {
 	key := generateKey(t)
 	currentRecord := signedRecord(t, key, 1, nil)
