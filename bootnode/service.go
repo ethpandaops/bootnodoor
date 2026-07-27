@@ -243,9 +243,8 @@ func New(cfg *Config) (*Service, error) {
 
 	// Create lookup services for enabled layers
 	if cfg.HasEL() && s.elTable != nil {
-		localNode := nodes.NewFromV5(s.localNode, s.elNodeDB)
 		s.elLookupService = services.NewLookupService(services.Config{
-			LocalNode:     localNode,
+			LocalIDs:      s.localIDs(),
 			NodeDB:        s.elNodeDB,
 			Table:         s.elTable,
 			V5Handler:     s.getV5Handler(),
@@ -324,7 +323,6 @@ func New(cfg *Config) (*Service, error) {
 
 	if cfg.HasCL() && s.clTable != nil {
 		clID := s.clIdentity()
-		localNode := nodes.NewFromV5(clID.localNode, s.clNodeDB)
 		// CL discovery runs under the CL identity's discv5 handler. discv4 is
 		// EL-only, so only attach it when one shared identity serves both layers.
 		var clV5Handler *v5protocol.Handler
@@ -336,7 +334,7 @@ func New(cfg *Config) (*Service, error) {
 			clV4Service = s.getV4Service()
 		}
 		s.clLookupService = services.NewLookupService(services.Config{
-			LocalNode:     localNode,
+			LocalIDs:      s.localIDs(),
 			NodeDB:        s.clNodeDB,
 			Table:         s.clTable,
 			V5Handler:     clV5Handler,
@@ -653,6 +651,18 @@ func (s *Service) maintenanceLoop() {
 	}
 }
 
+// localIDs returns the node IDs of every discovery identity, so discovery can
+// exclude our own records from candidate sets.
+func (s *Service) localIDs() [][32]byte {
+	ids := make([][32]byte, 0, len(s.identities))
+	for _, id := range s.identities {
+		if id.localNode != nil {
+			ids = append(ids, id.localNode.ID())
+		}
+	}
+	return ids
+}
+
 // refreshForkENR re-publishes the eth/eth2 ENR fields when a fork activates
 // while running. Nothing else refreshes them, so without this a long-lived
 // bootnode keeps advertising a stale fork id past every scheduled transition.
@@ -939,8 +949,11 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 	// Create generic node and add to table
 	genericNode := nodes.NewFromV5(v5, s.elNodeDB)
 	if s.elTable != nil {
+		if !s.elTable.Add(genericNode) {
+			s.config.Logger.Debug("ENR bootnode not admitted to table, not persisting")
+			return
+		}
 		s.config.Logger.Info("added ENR bootnode to table")
-		s.elTable.Add(genericNode)
 
 		// Persist to database
 		if s.elNodeDB != nil {
@@ -969,6 +982,15 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	}
 
 	nodeID := v4Node.ID()
+
+	// Never dial ourselves: our own enode in the bootnode list would otherwise
+	// race our handshake challenges against our own identity.
+	for _, local := range s.localIDs() {
+		if local == nodeID {
+			s.config.Logger.WithField("enode", enodeURL).Debug("skipping bootnode: it is our own identity")
+			return
+		}
+	}
 
 	// Request ENR from the node
 	s.config.Logger.WithField("enode", enodeURL).Debug("requesting ENR from enode bootnode")
@@ -1003,8 +1025,11 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	genericNode.IncrementSuccess()
 
 	if s.elTable != nil {
+		if !s.elTable.Add(genericNode) {
+			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("enode bootnode not admitted to table, not persisting")
+			return
+		}
 		s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Info("added enode bootnode to table")
-		s.elTable.Add(genericNode)
 
 		// Persist to database
 		if s.elNodeDB != nil {
@@ -1055,8 +1080,11 @@ func (s *Service) connectCLBootnodes() {
 		// Create generic node and add to table
 		genericNode := nodes.NewFromV5(v5, s.clNodeDB)
 		if s.clTable != nil {
+			if !s.clTable.Add(genericNode) {
+				s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("CL bootnode not admitted to table, not persisting")
+				continue
+			}
 			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Info("added CL ENR bootnode to table")
-			s.clTable.Add(genericNode)
 
 			// Persist to database
 			if s.clNodeDB != nil {

@@ -204,6 +204,12 @@ func (t *FlatTable) LoadInitialNodesFromDB() error {
 		if len(t.activeNodes) >= t.maxActiveNodes {
 			break
 		}
+		// Add applies this check; a persisted record of ourselves would
+		// otherwise sit in the pool for the whole process lifetime and be
+		// dialed by every lookup round.
+		if n.ID() == t.localID {
+			continue
+		}
 		if _, exists := t.activeNodes[n.ID()]; exists {
 			continue
 		}

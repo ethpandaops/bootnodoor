@@ -73,8 +73,11 @@ const (
 
 // Config contains configuration for the lookup service.
 type Config struct {
-	// LocalNode is our node information
-	LocalNode *nodedb.Node
+	// LocalIDs are our own node IDs. A peer that returns one of our records in
+	// a NODES/NEIGHBORS response would otherwise make us dial ourselves every
+	// round, racing our own handshake challenges. There is one ID per discovery
+	// identity, so two when separate EL and CL keys are configured.
+	LocalIDs [][32]byte
 
 	// NodeDB is the node database
 	NodeDB *nodedb.NodeDB
@@ -108,6 +111,17 @@ type Config struct {
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
+}
+
+// isLocal reports whether id belongs to one of our own identities. The
+// parameter is the raw array so both discv4 and discv5 node IDs can be passed.
+func (ls *LookupService) isLocal(id [32]byte) bool {
+	for _, local := range ls.config.LocalIDs {
+		if local == id {
+			return true
+		}
+	}
+	return false
 }
 
 // NewLookupService creates a new lookup service.
@@ -173,6 +187,12 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 	// Add existing table nodes to the candidate pool
 	for _, n := range allNodes {
 		seen[n.ID()] = true
+	}
+
+	// Mark ourselves as seen so our own record can never enter the candidate
+	// set, the discovered set, or the admission callback.
+	for _, id := range ls.config.LocalIDs {
+		seen[id] = true
 	}
 
 	// For iterative lookup, we need a list of candidates sorted by distance to target
@@ -333,6 +353,9 @@ func (ls *LookupService) lookupInternal(ctx context.Context, target node.ID, k i
 					nodesWithENR := make([]*nodedb.Node, 0, len(nodes))
 
 					for _, v4n := range nodes {
+						if ls.isLocal(v4n.ID()) {
+							continue
+						}
 						enrWg.Add(1)
 						go func(v4n *v4node.Node) {
 							defer enrWg.Done()
@@ -558,10 +581,10 @@ func (ls *LookupService) selectNodesToQuery(candidates []*nodedb.Node, queried m
 		return nil
 	}
 
-	// Filter out already queried nodes
+	// Filter out already queried nodes and ourselves
 	var unqueried []*nodedb.Node
 	for _, n := range candidates {
-		if !queried[n.ID()] {
+		if !queried[n.ID()] && !ls.isLocal(n.ID()) {
 			unqueried = append(unqueried, n)
 		}
 	}

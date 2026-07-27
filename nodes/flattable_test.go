@@ -94,3 +94,60 @@ func TestLoadInitialNodesFromDBRespectsSoftCap(t *testing.T) {
 		t.Fatalf("active pool holds %d nodes after bulk load, want the soft cap 2", got)
 	}
 }
+
+// TestLoadInitialNodesFromDBSkipsSelf verifies a persisted record of ourselves
+// is not loaded into the active pool, where every lookup round would dial it.
+func TestLoadInitialNodesFromDBSkipsSelf(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	database := db.NewDatabase(&db.SqliteDatabaseConfig{File: ":memory:"}, logger)
+	if err := database.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.ApplyEmbeddedDbSchema(-2); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ndb := NewNodeDB(ctx, database, db.LayerCL, logger)
+
+	selfNode := NewFromV5(makeV5At(t, net.IPv4(10, 9, 0, 1)), ndb)
+	selfNode.MarkDirty(DirtyFull)
+	if err := ndb.QueueUpdate(selfNode); err != nil {
+		t.Fatal(err)
+	}
+	other := NewFromV5(makeV5At(t, net.IPv4(10, 9, 0, 2)), ndb)
+	other.MarkDirty(DirtyFull)
+	if err := ndb.QueueUpdate(other); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for ndb.Count() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of 2 nodes persisted", ndb.Count())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	table, err := NewFlatTable(FlatTableConfig{DB: ndb, LocalID: selfNode.ID(), MaxActiveNodes: 10, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := table.LoadInitialNodesFromDB(); err != nil {
+		t.Fatal(err)
+	}
+
+	table.mu.RLock()
+	_, selfLoaded := table.activeNodes[selfNode.ID()]
+	count := len(table.activeNodes)
+	table.mu.RUnlock()
+	if selfLoaded {
+		t.Fatal("our own persisted record was loaded into the active pool")
+	}
+	if count != 1 {
+		t.Fatalf("active pool holds %d nodes, want only the non-self node", count)
+	}
+}
