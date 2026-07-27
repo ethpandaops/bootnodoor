@@ -442,9 +442,26 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		return nil
 	}
 
-	// Convert nodes
+	// Accumulate the response, keyed by the sender's node ID. The cap is
+	// enforced before decoding so records past it are not persisted in the
+	// global node map either.
+	key := string(fromNode.IDBytes())
+
+	h.pendingNeighborsMu.Lock()
+	pending := h.pendingNeighbors[key]
+	firstPacket := pending == nil
+	if firstPacket {
+		pending = &PendingNeighborsResponse{CreatedAt: time.Now()}
+		h.pendingNeighbors[key] = pending
+	}
+	room := maxNeighborsPerResponse - len(pending.Nodes)
+	h.pendingNeighborsMu.Unlock()
+
 	nodes := make([]*node.Node, 0, len(neighbors.Nodes))
 	for _, n := range neighbors.Nodes {
+		if len(nodes) >= room {
+			break
+		}
 		pubkey, err := DecodePubkey(crypto.S256(), n.ID)
 		if err != nil {
 			logrus.WithError(err).Debug("Invalid node public key in NEIGHBORS")
@@ -460,23 +477,16 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		nodes = append(nodes, h.getOrCreateNode(nodeID, pubkey, addr))
 	}
 
-	// Accumulate the response, keyed by the sender's node ID.
-	key := string(fromNode.IDBytes())
-
 	h.pendingNeighborsMu.Lock()
-	pending := h.pendingNeighbors[key]
-	firstPacket := pending == nil
-	if firstPacket {
-		pending = &PendingNeighborsResponse{CreatedAt: time.Now()}
-		h.pendingNeighbors[key] = pending
-	}
-	// Cap the accumulated nodes so a burst of NEIGHBORS cannot grow the entry
-	// without bound. Extra nodes past the cap are dropped.
-	if room := maxNeighborsPerResponse - len(pending.Nodes); room > 0 {
-		if len(nodes) > room {
-			nodes = nodes[:room]
+	// Re-check the cap: a concurrent packet may have filled the entry while we
+	// were decoding outside the lock.
+	if p := h.pendingNeighbors[key]; p != nil {
+		if r := maxNeighborsPerResponse - len(p.Nodes); r > 0 {
+			if len(nodes) > r {
+				nodes = nodes[:r]
+			}
+			p.Nodes = append(p.Nodes, nodes...)
 		}
-		pending.Nodes = append(pending.Nodes, nodes...)
 	}
 	h.pendingNeighborsMu.Unlock()
 
@@ -643,12 +653,14 @@ func (h *Handler) Findnode(n *node.Node, target []byte) ([]*node.Node, error) {
 		return nil, fmt.Errorf("encode error: %w", err)
 	}
 
-	// Register pending request
+	// Register pending request. Removal is deferred so every exit path clears
+	// it: a completed request left in the map keeps matching later NEIGHBORS
+	// from that node and reopens collection windows until cleanup runs.
 	req := h.addPendingRequest(hash, n, FindnodePacket)
+	defer h.removePendingRequest(string(hash))
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
-		h.removePendingRequest(string(hash))
 		return nil, err
 	}
 
@@ -663,11 +675,9 @@ func (h *Handler) Findnode(n *node.Node, target []byte) ([]*node.Node, error) {
 		}
 		return nil, fmt.Errorf("unexpected response type")
 	case <-time.After(h.config.RequestTimeout * 3): // Longer timeout for multi-packet responses
-		h.removePendingRequest(string(hash))
 		n.MarkTimeout()
 		return nil, fmt.Errorf("timeout")
 	case <-h.ctx.Done():
-		h.removePendingRequest(string(hash))
 		return nil, h.ctx.Err()
 	}
 }
@@ -838,8 +848,11 @@ func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net
 		return n
 	}
 
-	// Create new node
+	// Create new node. Stamp last-seen with the insertion time: a node learned
+	// from a NEIGHBORS record has never sent us a packet, and a zero timestamp
+	// would make cleanup evict it on its next run regardless of NodeTTL.
 	n = node.New(pubkey, addr)
+	n.UpdateLastSeen()
 
 	// Bound the map so an unauthenticated flood of distinct node IDs (for
 	// example fabricated NEIGHBORS records) cannot grow it without limit. Stale

@@ -142,3 +142,101 @@ func TestCleanupEvictsStalePendingNeighbors(t *testing.T) {
 		t.Error("fresh pending entry was wrongly evicted")
 	}
 }
+
+// TestNeighborsCapAppliesBeforeNodePersistence verifies records past the
+// per-response cap are not persisted in the global node map either, so a
+// queried peer cannot grow memory by flooding unique records.
+func TestNeighborsCapAppliesBeforeNodePersistence(t *testing.T) {
+	h, cancel := newNeighborsHandler(t)
+	defer cancel()
+
+	from := makeDiscv4Node(t)
+	h.addPendingRequest([]byte("req"), from, FindnodePacket)
+
+	if err := h.handleNeighbors(from, from.Addr(), makeNeighbors(t, maxNeighborsPerResponse+20)); err != nil {
+		t.Fatal(err)
+	}
+
+	h.nodesMu.RLock()
+	n := len(h.nodes)
+	h.nodesMu.RUnlock()
+	if n != maxNeighborsPerResponse {
+		t.Fatalf("node map persisted %d records, want at most the cap %d", n, maxNeighborsPerResponse)
+	}
+}
+
+// TestFreshNodeSurvivesCleanup verifies a newly created node is not evicted by
+// the next cleanup run before its NodeTTL: creation stamps last-seen, so a
+// node learned from a NEIGHBORS record does not carry a zero timestamp.
+func TestFreshNodeSurvivesCleanup(t *testing.T) {
+	h, cancel := newNeighborsHandler(t)
+	defer cancel()
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	id := node.PubkeyToID(&key.PublicKey)
+	h.getOrCreateNode(id, &key.PublicKey, &net.UDPAddr{IP: net.IPv4(9, 9, 9, 9), Port: 30303})
+
+	h.cleanup()
+
+	if h.GetNode(id) == nil {
+		t.Fatal("fresh unbonded node was evicted before NodeTTL")
+	}
+}
+
+type stubTransport struct{}
+
+func (stubTransport) SendTo([]byte, *net.UDPAddr) error { return nil }
+
+func (stubTransport) Send([]byte, *net.UDPAddr, *net.UDPAddr) error { return nil }
+
+// TestFindnodeRemovesCompletedRequest verifies a delivered FINDNODE leaves no
+// pending request behind, so later NEIGHBORS from the same node cannot keep
+// matching it and reopening collection windows.
+func TestFindnodeRemovesCompletedRequest(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := NewHandler(ctx, HandlerConfig{PrivateKey: key}, stubTransport{})
+
+	to := makeDiscv4Node(t)
+	to.MarkPongReceived(time.Hour)
+	target := EncodePubkey(&key.PublicKey)
+
+	type result struct {
+		nodes []*node.Node
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		nodes, err := h.Findnode(to, target[:])
+		done <- result{nodes, err}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for h.findPendingFindnode(to.ID()) == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("pending FINDNODE never registered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := h.handleNeighbors(to, to.Addr(), makeNeighbors(t, 3)); err != nil {
+		t.Fatal(err)
+	}
+
+	res := <-done
+	if res.err != nil || len(res.nodes) != 3 {
+		t.Fatalf("Findnode = %d nodes, %v", len(res.nodes), res.err)
+	}
+	h.requestsMu.RLock()
+	remaining := len(h.requests)
+	h.requestsMu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("%d pending requests remain after a completed FINDNODE, want 0", remaining)
+	}
+}
