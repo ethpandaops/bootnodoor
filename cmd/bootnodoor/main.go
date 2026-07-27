@@ -350,6 +350,12 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 			}
 			logger.WithField("genesisTime", clGenesisTime).Info("calculated CL genesis time from config")
 		} else {
+			// The override has to reach the config, or every epoch-derived value
+			// (current digest, next-fork info, the published eth2 entry) keeps
+			// using the YAML time and can land on the wrong side of a fork.
+			if err := clConfig.SetGenesisTime(clGenesisTime); err != nil {
+				return fmt.Errorf("failed to set CL genesis time: %w", err)
+			}
 			logger.WithField("genesisTime", clGenesisTime).Info("using provided CL genesis time")
 		}
 

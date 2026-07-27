@@ -69,6 +69,10 @@ type Handler struct {
 	pendingNeighborsMu sync.RWMutex
 	pendingNeighbors   map[string]*PendingNeighborsResponse
 
+	// Local ENR, replaceable while running (fork transitions, IP discovery)
+	localENRMu sync.RWMutex
+	localENR   *enr.Record
+
 	// Statistics
 	statsMu               sync.RWMutex
 	packetsReceived       uint64
@@ -85,7 +89,9 @@ type HandlerConfig struct {
 	// PrivateKey is our node's private key
 	PrivateKey *ecdsa.PrivateKey
 
-	// LocalENR is our node's ENR record (optional)
+	// LocalENR is our node's ENR record (optional). It seeds the handler's
+	// record; SetLocalENR replaces it while running, so handler code must read
+	// LocalRecord() rather than this field.
 	LocalENR *enr.Record
 
 	// LocalAddr is our listening address
@@ -219,6 +225,7 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 		nodes:            make(map[node.ID]*node.Node),
 		requests:         make(map[string]*PendingRequest),
 		pendingNeighbors: make(map[string]*PendingNeighborsResponse),
+		localENR:         config.LocalENR,
 	}
 
 	// Start cleanup goroutine
@@ -596,8 +603,8 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 	}
 
 	// Add ENR sequence if we have an ENR
-	if h.config.LocalENR != nil {
-		ping.ENRSeq = h.config.LocalENR.Seq()
+	if rec := h.LocalRecord(); rec != nil {
+		ping.ENRSeq = rec.Seq()
 	}
 
 	// Encode packet
@@ -753,8 +760,8 @@ func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPA
 	}
 
 	// Add ENR sequence if we have an ENR
-	if h.config.LocalENR != nil {
-		pong.ENRSeq = h.config.LocalENR.Seq()
+	if rec := h.LocalRecord(); rec != nil {
+		pong.ENRSeq = rec.Seq()
 	}
 
 	packet, _, err := Encode(h.config.PrivateKey, pong)
@@ -817,13 +824,14 @@ func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net
 
 // sendENRResponse sends an ENRRESPONSE.
 func (h *Handler) sendENRResponse(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, replyTok []byte) error {
-	if h.config.LocalENR == nil {
+	rec := h.LocalRecord()
+	if rec == nil {
 		return fmt.Errorf("no local ENR configured")
 	}
 
 	resp := &ENRResponse{
 		ReplyTok: replyTok,
-		Record:   h.config.LocalENR,
+		Record:   rec,
 	}
 
 	packet, _, err := Encode(h.config.PrivateKey, resp)
@@ -1109,4 +1117,20 @@ func (h *Handler) Stats() map[string]interface{} {
 		"pending_requests":        s.PendingRequests,
 		"pending_neighbors":       s.PendingNeighbors,
 	}
+}
+
+// LocalRecord returns the ENR the handler currently advertises.
+func (h *Handler) LocalRecord() *enr.Record {
+	h.localENRMu.RLock()
+	defer h.localENRMu.RUnlock()
+	return h.localENR
+}
+
+// SetLocalENR replaces the advertised ENR in place, so a fork transition or an
+// IP-discovery update does not have to rebuild the handler and lose its bonds,
+// known nodes, pending requests and stats.
+func (h *Handler) SetLocalENR(record *enr.Record) {
+	h.localENRMu.Lock()
+	h.localENR = record
+	h.localENRMu.Unlock()
 }
