@@ -144,6 +144,15 @@ type PendingNeighborsResponse struct {
 	// Nodes accumulated so far
 	Nodes []*node.Node
 
+	// Reserved counts nodes a handler has claimed room for but may not have
+	// appended yet. Reserving before decoding makes the persistence cap exact
+	// even when packets are dispatched concurrently.
+	Reserved int
+
+	// Closed marks a delivered entry. Packets processed after delivery must
+	// not reserve against it; cleanup evicts the tombstone by CreatedAt.
+	Closed bool
+
 	// CreatedAt is when we received the first packet
 	CreatedAt time.Time
 }
@@ -442,24 +451,31 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		return nil
 	}
 
-	// Accumulate the response, keyed by the sender's node ID. The cap is
-	// enforced before decoding so records past it are not persisted in the
-	// global node map either.
-	key := string(fromNode.IDBytes())
+	// Accumulate the response, keyed by the matched request's hash so each
+	// FINDNODE gets exactly one entry and a fresh request never collides with
+	// a delivered one. Room is reserved before decoding, so records past the
+	// cap are never persisted in the global node map, even when packets are
+	// dispatched concurrently.
+	key := string(matchedReq.RequestHash)
 
 	h.pendingNeighborsMu.Lock()
 	pending := h.pendingNeighbors[key]
+	if pending != nil && pending.Closed {
+		h.pendingNeighborsMu.Unlock()
+		return nil
+	}
 	firstPacket := pending == nil
 	if firstPacket {
 		pending = &PendingNeighborsResponse{CreatedAt: time.Now()}
 		h.pendingNeighbors[key] = pending
 	}
-	room := maxNeighborsPerResponse - len(pending.Nodes)
+	take := min(len(neighbors.Nodes), maxNeighborsPerResponse-pending.Reserved)
+	pending.Reserved += take
 	h.pendingNeighborsMu.Unlock()
 
-	nodes := make([]*node.Node, 0, len(neighbors.Nodes))
+	nodes := make([]*node.Node, 0, take)
 	for _, n := range neighbors.Nodes {
-		if len(nodes) >= room {
+		if len(nodes) >= take {
 			break
 		}
 		pubkey, err := DecodePubkey(crypto.S256(), n.ID)
@@ -478,15 +494,8 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 	}
 
 	h.pendingNeighborsMu.Lock()
-	// Re-check the cap: a concurrent packet may have filled the entry while we
-	// were decoding outside the lock.
-	if p := h.pendingNeighbors[key]; p != nil {
-		if r := maxNeighborsPerResponse - len(p.Nodes); r > 0 {
-			if len(nodes) > r {
-				nodes = nodes[:r]
-			}
-			p.Nodes = append(p.Nodes, nodes...)
-		}
+	if p := h.pendingNeighbors[key]; p != nil && !p.Closed {
+		p.Nodes = append(p.Nodes, nodes...)
 	}
 	h.pendingNeighborsMu.Unlock()
 
@@ -499,11 +508,15 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 
 			h.pendingNeighborsMu.Lock()
 			finalPending := h.pendingNeighbors[key]
-			delete(h.pendingNeighbors, key)
+			var collected []*node.Node
+			if finalPending != nil {
+				finalPending.Closed = true
+				collected = finalPending.Nodes
+			}
 			h.pendingNeighborsMu.Unlock()
 
 			if finalPending != nil {
-				h.deliverResponse(matchedReq, finalPending.Nodes)
+				h.deliverResponse(matchedReq, collected)
 			}
 		}()
 	}
@@ -593,12 +606,12 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 		return nil, fmt.Errorf("encode error: %w", err)
 	}
 
-	// Register pending request
+	// Register pending request; removal is deferred so every exit path clears it.
 	req := h.addPendingRequest(hash, n, PingPacket)
+	defer h.removePendingRequest(string(hash))
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
-		h.removePendingRequest(string(hash))
 		return nil, err
 	}
 
@@ -619,11 +632,9 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 		}
 		return nil, fmt.Errorf("unexpected response type")
 	case <-time.After(h.config.RequestTimeout):
-		h.removePendingRequest(string(hash))
 		n.MarkTimeout()
 		return nil, fmt.Errorf("timeout")
 	case <-h.ctx.Done():
-		h.removePendingRequest(string(hash))
 		return nil, h.ctx.Err()
 	}
 }
@@ -706,12 +717,12 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 		return nil, fmt.Errorf("encode error: %w", err)
 	}
 
-	// Register pending request
+	// Register pending request; removal is deferred so every exit path clears it.
 	pendingReq := h.addPendingRequest(hash, n, ENRRequestPacket)
+	defer h.removePendingRequest(string(hash))
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
-		h.removePendingRequest(string(hash))
 		return nil, err
 	}
 
@@ -726,11 +737,9 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 		}
 		return nil, fmt.Errorf("unexpected response type")
 	case <-time.After(h.config.RequestTimeout):
-		h.removePendingRequest(string(hash))
 		n.MarkTimeout()
 		return nil, fmt.Errorf("timeout")
 	case <-h.ctx.Done():
-		h.removePendingRequest(string(hash))
 		return nil, h.ctx.Err()
 	}
 }
@@ -1043,6 +1052,16 @@ func (h *Handler) incrementFindnodeResponsesRecv() {
 
 // Stats returns current statistics.
 func (h *Handler) Stats() map[string]interface{} {
+	h.nodesMu.RLock()
+	knownNodes := len(h.nodes)
+	h.nodesMu.RUnlock()
+	h.requestsMu.RLock()
+	pendingRequests := len(h.requests)
+	h.requestsMu.RUnlock()
+	h.pendingNeighborsMu.RLock()
+	pendingNeighbors := len(h.pendingNeighbors)
+	h.pendingNeighborsMu.RUnlock()
+
 	h.statsMu.RLock()
 	defer h.statsMu.RUnlock()
 
@@ -1054,8 +1073,8 @@ func (h *Handler) Stats() map[string]interface{} {
 		"unbonded_findnode":       h.unbondedFindnode,
 		"findnode_requests_recv":  h.findnodeRequestsRecv,
 		"findnode_responses_recv": h.findnodeResponsesRecv,
-		"known_nodes":             len(h.nodes),
-		"pending_requests":        len(h.requests),
-		"pending_neighbors":       len(h.pendingNeighbors),
+		"known_nodes":             knownNodes,
+		"pending_requests":        pendingRequests,
+		"pending_neighbors":       pendingNeighbors,
 	}
 }

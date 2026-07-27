@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -84,7 +85,7 @@ func TestNeighborsAccumulationCapped(t *testing.T) {
 	}
 
 	h.pendingNeighborsMu.RLock()
-	pending := h.pendingNeighbors[string(from.IDBytes())]
+	pending := h.pendingNeighbors["req"]
 	h.pendingNeighborsMu.RUnlock()
 	if pending == nil {
 		t.Fatal("expected a pending entry for the matched FINDNODE")
@@ -238,5 +239,81 @@ func TestFindnodeRemovesCompletedRequest(t *testing.T) {
 	h.requestsMu.RUnlock()
 	if remaining != 0 {
 		t.Fatalf("%d pending requests remain after a completed FINDNODE, want 0", remaining)
+	}
+}
+
+// TestNeighborsPersistenceCapExactUnderConcurrency verifies that packets
+// processed on concurrent dispatch goroutines cannot jointly persist more than
+// the cap: room is reserved under the lock before any record is decoded.
+func TestNeighborsPersistenceCapExactUnderConcurrency(t *testing.T) {
+	h, cancel := newNeighborsHandler(t)
+	defer cancel()
+
+	from := makeDiscv4Node(t)
+	h.addPendingRequest([]byte("req"), from, FindnodePacket)
+
+	packets := make([]*Neighbors, 6)
+	for i := range packets {
+		packets[i] = makeNeighbors(t, maxNeighborsPerResponse)
+	}
+
+	var wg sync.WaitGroup
+	for _, pkt := range packets {
+		wg.Add(1)
+		go func(p *Neighbors) {
+			defer wg.Done()
+			if err := h.handleNeighbors(from, from.Addr(), p); err != nil {
+				t.Errorf("handleNeighbors: %v", err)
+			}
+		}(pkt)
+	}
+	wg.Wait()
+
+	h.nodesMu.RLock()
+	persisted := len(h.nodes)
+	h.nodesMu.RUnlock()
+	if persisted != maxNeighborsPerResponse {
+		t.Fatalf("node map persisted %d records under concurrent packets, want exactly the cap %d", persisted, maxNeighborsPerResponse)
+	}
+}
+
+// TestNeighborsAfterDeliveryPersistNothing verifies the delivered entry is
+// tombstoned rather than deleted: a packet processed after the collection
+// window must not reopen accumulation or persist records.
+func TestNeighborsAfterDeliveryPersistNothing(t *testing.T) {
+	h, cancel := newNeighborsHandler(t)
+	defer cancel()
+
+	from := makeDiscv4Node(t)
+	req := h.addPendingRequest([]byte("req"), from, FindnodePacket)
+
+	if err := h.handleNeighbors(from, from.Addr(), makeNeighbors(t, 2)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-req.ResponseChan:
+	case <-time.After(2 * time.Second):
+		t.Fatal("collected nodes were not delivered")
+	}
+
+	h.nodesMu.RLock()
+	before := len(h.nodes)
+	h.nodesMu.RUnlock()
+
+	if err := h.handleNeighbors(from, from.Addr(), makeNeighbors(t, 5)); err != nil {
+		t.Fatal(err)
+	}
+
+	h.nodesMu.RLock()
+	after := len(h.nodes)
+	h.nodesMu.RUnlock()
+	if after != before {
+		t.Fatalf("a post-delivery packet persisted %d records, want 0", after-before)
+	}
+	h.pendingNeighborsMu.RLock()
+	pending := h.pendingNeighbors["req"]
+	h.pendingNeighborsMu.RUnlock()
+	if pending == nil || !pending.Closed || len(pending.Nodes) != 2 {
+		t.Fatalf("tombstone state = %+v, want closed with the delivered 2 nodes", pending)
 	}
 }

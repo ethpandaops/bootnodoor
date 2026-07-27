@@ -141,6 +141,8 @@ func (n *Node) PublicKey() *ecdsa.PublicKey {
 
 // ENR returns the node's ENR record.
 func (n *Node) ENR() *enr.Record {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.enr
 }
 
@@ -400,6 +402,8 @@ type NodeStats struct {
 
 // Record returns the node's ENR record.
 func (n *Node) Record() *enr.Record {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.enr
 }
 
@@ -428,21 +432,22 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 	}
 
 	// Update our ENR
-	if newRecord.Seq() > n.enr.Seq() {
-		n.enr = newRecord
+	n.mu.Lock()
+	if newRecord.Seq() <= n.enr.Seq() {
+		n.mu.Unlock()
+		return false
+	}
+	n.enr = newRecord
+	v5 := n.v5Node
+	n.mu.Unlock()
 
-		// Update v5 node if available
-		n.mu.RLock()
-		v5 := n.v5Node
-		n.mu.RUnlock()
-		if v5 != nil {
-			v5.UpdateENR(newRecord)
-		}
-
-		return true
+	// Update v5 node if available - outside the lock so n.mu never nests with
+	// the v5 node's own mutex.
+	if v5 != nil {
+		v5.UpdateENR(newRecord)
 	}
 
-	return false
+	return true
 }
 
 // NeedsPing checks if the node needs a liveness check.

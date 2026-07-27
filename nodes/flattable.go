@@ -199,6 +199,11 @@ func (t *FlatTable) LoadInitialNodesFromDB() error {
 	defer t.mu.Unlock()
 
 	for _, n := range randomNodes {
+		// The transport may have admitted nodes before this bulk load runs, so
+		// stop at the soft cap instead of stacking a full load on top of them.
+		if len(t.activeNodes) >= t.maxActiveNodes {
+			break
+		}
 		if _, exists := t.activeNodes[n.ID()]; exists {
 			continue
 		}
