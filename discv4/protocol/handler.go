@@ -146,9 +146,6 @@ type PendingNeighborsResponse struct {
 
 	// CreatedAt is when we received the first packet
 	CreatedAt time.Time
-
-	// LastRecv is when we received the last packet
-	LastRecv time.Time
 }
 
 const (
@@ -164,7 +161,8 @@ const (
 	// cleanupInterval is how often we run cleanup
 	cleanupInterval = 5 * time.Second
 
-	// neighborsTimeout is how long to wait for additional NEIGHBORS packets
+	// neighborsTimeout is how long a pending NEIGHBORS entry may live before
+	// cleanup evicts it as a backstop.
 	neighborsTimeout = 2 * time.Second
 
 	// defaultMaxNodes is the default cap on tracked nodes. It bounds memory
@@ -175,6 +173,15 @@ const (
 	// defaultNodeTTL is how long an unbonded node is retained since it was last
 	// seen before it becomes eligible for eviction.
 	defaultNodeTTL = 5 * time.Minute
+
+	// neighborsCollectWindow is how long we accumulate multi-packet NEIGHBORS
+	// before delivering the collected nodes to the waiting FINDNODE.
+	neighborsCollectWindow = 100 * time.Millisecond
+
+	// maxNeighborsPerResponse caps the nodes accumulated for one FINDNODE. A
+	// discv4 FINDNODE returns at most one k-bucket, so anything beyond this is a
+	// flood and is dropped.
+	maxNeighborsPerResponse = 16
 )
 
 // NewHandler creates a new protocol handler.
@@ -427,6 +434,14 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 
 	h.incrementFindnodeResponsesRecv()
 
+	// Only accept NEIGHBORS in response to a FINDNODE we actually sent to this
+	// node. Dropping unsolicited NEIGHBORS prevents a peer we never queried from
+	// making us accumulate node records without bound.
+	matchedReq := h.findPendingFindnode(fromNode.ID())
+	if matchedReq == nil {
+		return nil
+	}
+
 	// Convert nodes
 	nodes := make([]*node.Node, 0, len(neighbors.Nodes))
 	for _, n := range neighbors.Nodes {
@@ -442,45 +457,35 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		}
 
 		nodeID := node.PubkeyToID(pubkey)
-		discoveredNode := h.getOrCreateNode(nodeID, pubkey, addr)
-		nodes = append(nodes, discoveredNode)
+		nodes = append(nodes, h.getOrCreateNode(nodeID, pubkey, addr))
 	}
 
-	// Try to match to pending request
-	// We use the sender's node ID as the key for pending FINDNODE requests
+	// Accumulate the response, keyed by the sender's node ID.
 	key := string(fromNode.IDBytes())
 
 	h.pendingNeighborsMu.Lock()
 	pending := h.pendingNeighbors[key]
-	if pending == nil {
-		pending = &PendingNeighborsResponse{
-			Nodes:     nodes,
-			CreatedAt: time.Now(),
-			LastRecv:  time.Now(),
-		}
+	firstPacket := pending == nil
+	if firstPacket {
+		pending = &PendingNeighborsResponse{CreatedAt: time.Now()}
 		h.pendingNeighbors[key] = pending
-	} else {
+	}
+	// Cap the accumulated nodes so a burst of NEIGHBORS cannot grow the entry
+	// without bound. Extra nodes past the cap are dropped.
+	if room := maxNeighborsPerResponse - len(pending.Nodes); room > 0 {
+		if len(nodes) > room {
+			nodes = nodes[:room]
+		}
 		pending.Nodes = append(pending.Nodes, nodes...)
-		pending.LastRecv = time.Now()
 	}
 	h.pendingNeighborsMu.Unlock()
 
-	// Check if we have a pending request waiting for this
-	h.requestsMu.RLock()
-	var matchedReq *PendingRequest
-	for _, req := range h.requests {
-		if req.PacketType == FindnodePacket && req.ToNode.ID() == fromNode.ID() {
-			matchedReq = req
-			break
-		}
-	}
-	h.requestsMu.RUnlock()
-
-	if matchedReq != nil {
-		// Deliver accumulated nodes after a short delay
-		// (in case more NEIGHBORS packets arrive)
+	// Deliver once, after a short window that lets multi-packet responses
+	// arrive. Only the first packet schedules delivery, so a flood cannot spawn
+	// a goroutine per packet.
+	if firstPacket {
 		go func() {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(neighborsCollectWindow)
 
 			h.pendingNeighborsMu.Lock()
 			finalPending := h.pendingNeighbors[key]
@@ -894,6 +899,19 @@ func (h *Handler) getPendingRequest(hash string) *PendingRequest {
 	return h.requests[hash]
 }
 
+// findPendingFindnode returns a pending FINDNODE request awaiting a response
+// from the given node, or nil if none exists.
+func (h *Handler) findPendingFindnode(id node.ID) *PendingRequest {
+	h.requestsMu.RLock()
+	defer h.requestsMu.RUnlock()
+	for _, req := range h.requests {
+		if req.PacketType == FindnodePacket && req.ToNode != nil && req.ToNode.ID() == id {
+			return req
+		}
+	}
+	return nil
+}
+
 // removePendingRequest removes a pending request.
 func (h *Handler) removePendingRequest(hash string) {
 	h.requestsMu.Lock()
@@ -948,7 +966,7 @@ func (h *Handler) cleanup() {
 	// Clean up old pending neighbors
 	h.pendingNeighborsMu.Lock()
 	for key, pending := range h.pendingNeighbors {
-		if now.Sub(pending.LastRecv) > neighborsTimeout {
+		if now.Sub(pending.CreatedAt) > neighborsTimeout {
 			delete(h.pendingNeighbors, key)
 		}
 	}
