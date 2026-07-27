@@ -195,7 +195,14 @@ func (t *FlatTable) LoadInitialNodesFromDB() error {
 	// Load random nodes from DB to bootstrap the active pool
 	randomNodes := t.db.LoadRandomNodes(t.maxActiveNodes)
 
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	for _, n := range randomNodes {
+		if _, exists := t.activeNodes[n.ID()]; exists {
+			continue
+		}
+
 		if t.ipLimiter.CanAdd(n) {
 			t.activeNodes[n.ID()] = n
 			t.ipLimiter.Add(n)

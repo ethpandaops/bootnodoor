@@ -1046,12 +1046,15 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 			// Look up the generic node from the table
 			if genericNode := s.elTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
+				// Get falls back to the DB, so Add re-admits demoted nodes
+				s.elTable.Add(genericNode)
 				s.elNodeDB.QueueUpdate(genericNode)
 			}
 		} else if s.enrManager.FilterCLNode(n.Record()) && s.clTable != nil && s.clNodeDB != nil {
 			// Look up the generic node from the table
 			if genericNode := s.clTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
+				s.clTable.Add(genericNode)
 				s.clNodeDB.QueueUpdate(genericNode)
 			}
 		}
