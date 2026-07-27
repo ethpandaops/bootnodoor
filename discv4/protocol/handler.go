@@ -100,6 +100,16 @@ type HandlerConfig struct {
 	// ExpirationWindow is the acceptable time range for packet expiration (default 20s)
 	ExpirationWindow time.Duration
 
+	// MaxNodes is the maximum number of nodes to track (default 50000).
+	// Once reached, new nodes are handled but not retained until a slot frees up,
+	// keeping memory bounded under floods of distinct node IDs.
+	MaxNodes int
+
+	// NodeTTL is how long an unbonded node is retained since it was last seen
+	// before it becomes eligible for eviction (default 5 minutes). Bonded nodes
+	// are kept until their bond expires.
+	NodeTTL time.Duration
+
 	// Callbacks (all optional)
 	OnPing         OnPingCallback
 	OnPongReceived OnPongReceivedCallback
@@ -156,6 +166,15 @@ const (
 
 	// neighborsTimeout is how long to wait for additional NEIGHBORS packets
 	neighborsTimeout = 2 * time.Second
+
+	// defaultMaxNodes is the default cap on tracked nodes. It bounds memory
+	// against floods of distinct node IDs (for example fabricated NEIGHBORS
+	// records) that would otherwise grow the map without limit.
+	defaultMaxNodes = 50000
+
+	// defaultNodeTTL is how long an unbonded node is retained since it was last
+	// seen before it becomes eligible for eviction.
+	defaultNodeTTL = 5 * time.Minute
 )
 
 // NewHandler creates a new protocol handler.
@@ -169,6 +188,12 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 	}
 	if config.ExpirationWindow == 0 {
 		config.ExpirationWindow = defaultExpirationWindow
+	}
+	if config.MaxNodes == 0 {
+		config.MaxNodes = defaultMaxNodes
+	}
+	if config.NodeTTL == 0 {
+		config.NodeTTL = defaultNodeTTL
 	}
 
 	h := &Handler{
@@ -810,6 +835,15 @@ func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net
 
 	// Create new node
 	n = node.New(pubkey, addr)
+
+	// Bound the map so an unauthenticated flood of distinct node IDs (for
+	// example fabricated NEIGHBORS records) cannot grow it without limit. Stale
+	// unbonded entries are reclaimed by cleanup; until a slot frees up we still
+	// return the node so the packet is handled, but we do not retain it.
+	if len(h.nodes) >= h.config.MaxNodes {
+		return n
+	}
+
 	h.nodes[id] = n
 	return n
 }
@@ -919,6 +953,17 @@ func (h *Handler) cleanup() {
 		}
 	}
 	h.pendingNeighborsMu.Unlock()
+
+	// Evict stale, unbonded nodes so the map stays bounded. Bonded nodes are
+	// kept until their bond expires, after which IsBonded reports false and they
+	// become eligible here.
+	h.nodesMu.Lock()
+	for id, n := range h.nodes {
+		if !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
+			delete(h.nodes, id)
+		}
+	}
+	h.nodesMu.Unlock()
 }
 
 // Statistics
