@@ -1019,18 +1019,16 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 	if s.enrManager != nil {
 		nodeID := n.ID()
 
-		// Serve-all pools a node into every table, so refresh last-seen wherever it
-		// actually lives rather than by classification. Classified mode is
-		// EL-xor-CL, so the CL filter only runs when the EL one declines.
+		// Both layers, independently, as checkAndAddNode admits them: a dual-layer
+		// record becomes two node objects with their own last-seen, so refreshing
+		// only one lets the other age out while the peer is actively talking.
 		var isEL, isCL bool
 		if s.config.ServeAll {
 			isEL = s.elTable != nil
 			isCL = s.clTable != nil
 		} else {
 			isEL, _ = s.enrManager.ClassifyELNode(n.Record())
-			if !isEL {
-				isCL = s.enrManager.ClassifyCLNode(n.Record())
-			}
+			isCL = s.enrManager.ClassifyCLNode(n.Record())
 		}
 
 		if isEL && s.elTable != nil && s.elNodeDB != nil {
