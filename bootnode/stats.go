@@ -25,8 +25,6 @@ type Stats struct {
 
 // Discv5Stats is the deliberate subset of protocol.HandlerStats the web UI renders, summed per identity.
 type Discv5Stats struct {
-	PacketsReceived   int
-	PacketsSent       int
 	InvalidPackets    int
 	FilteredResponses int
 	FindNodeReceived  int
@@ -72,8 +70,6 @@ func (s *Service) GetStats() Stats {
 		if id.discv5Service != nil {
 			if h := id.discv5Service.Handler(); h != nil {
 				d := h.GetStats()
-				out.Discv5.PacketsReceived += d.PacketsReceived
-				out.Discv5.PacketsSent += d.PacketsSent
 				out.Discv5.InvalidPackets += d.InvalidPackets
 				out.Discv5.FilteredResponses += d.FilteredResponses
 				out.Discv5.FindNodeReceived += d.FindNodeReceived
