@@ -134,7 +134,7 @@ func (d *Database) UpsertNode(tx *sqlx.Tx, node *Node) error {
 	_, err := tx.Exec(`
 		INSERT INTO nodes (nodeid, layer, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active, enr, has_v4, has_v5, success_count, failure_count, avg_rtt)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-		ON CONFLICT(nodeid) DO UPDATE SET
+		ON CONFLICT(nodeid, layer) DO UPDATE SET
 			ip = excluded.ip,
 			ipv6 = excluded.ipv6,
 			port = excluded.port,
@@ -159,7 +159,7 @@ func (d *Database) UpdateNodeENR(tx *sqlx.Tx, layer NodeLayer, nodeID []byte, ip
 	_, err := tx.Exec(`
 		INSERT INTO nodes (nodeid, layer, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active, enr, has_v4, has_v5, success_count, failure_count, avg_rtt)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, $9, $10, $11, 0, 0, 0)
-		ON CONFLICT(nodeid) DO UPDATE SET
+		ON CONFLICT(nodeid, layer) DO UPDATE SET
 			ip = excluded.ip,
 			ipv6 = excluded.ipv6,
 			port = excluded.port,
