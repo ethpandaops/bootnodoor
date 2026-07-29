@@ -28,6 +28,7 @@ type NodeDB struct {
 	updateQueue     chan *Node
 	updateQueueSet  map[[32]byte]*Node // Tracks pending updates by nodeID
 	updateQueueLock sync.Mutex
+	closing         bool // Set under updateQueueLock so no write is accepted after Close starts draining
 
 	// Stats tracking
 	stats     NodeDBStats
@@ -77,6 +78,10 @@ func (ndb *NodeDB) QueueUpdate(n *Node) error {
 
 	ndb.updateQueueLock.Lock()
 	defer ndb.updateQueueLock.Unlock()
+
+	if ndb.closing {
+		return fmt.Errorf("node db is closing")
+	}
 
 	// Check if there's already a pending update for this node
 	if _, ok := ndb.updateQueueSet[nodeID]; ok {
@@ -128,7 +133,7 @@ func (ndb *NodeDB) processUpdateQueue() {
 	for {
 		select {
 		case <-ndb.ctx.Done():
-			// Process remaining batch
+			batch = ndb.drainQueue(batch)
 			if len(batch) > 0 {
 				ndb.batchUpdate(batch)
 			}
@@ -150,6 +155,18 @@ func (ndb *NodeDB) processUpdateQueue() {
 				ndb.batchUpdate(batch)
 				batch = batch[:0]
 			}
+		}
+	}
+}
+
+// drainQueue moves everything currently queued into batch without blocking.
+func (ndb *NodeDB) drainQueue(batch []*Node) []*Node {
+	for {
+		select {
+		case node := <-ndb.updateQueue:
+			batch = append(batch, node)
+		default:
+			return batch
 		}
 	}
 }
@@ -349,6 +366,14 @@ func (ndb *NodeDB) upsertNodeTx(tx *sqlx.Tx, n *Node) error {
 		lastSeen.Int64 = stats.LastSeen.Unix()
 	}
 
+	// The DirtyFull branch clears every other flag once this upsert runs, so a
+	// DirtyLastActive set alongside it would otherwise be dropped.
+	lastActive := sql.NullInt64{}
+	if t := n.LastActive(); !t.IsZero() {
+		lastActive.Valid = true
+		lastActive.Int64 = t.Unix()
+	}
+
 	// Extract fork digest based on layer
 	var forkDigest []byte
 	if ndb.layer == db.LayerEL {
@@ -383,7 +408,7 @@ func (ndb *NodeDB) upsertNodeTx(tx *sqlx.Tx, n *Node) error {
 		ForkDigest:   forkDigest,
 		FirstSeen:    firstSeen,
 		LastSeen:     lastSeen,
-		LastActive:   sql.NullInt64{}, // Updated separately
+		LastActive:   lastActive,
 		ENR:          enrBytes,
 		HasV4:        n.HasV4(),
 		HasV5:        n.HasV5(),
@@ -541,9 +566,21 @@ func (ndb *NodeDB) LoadRandom(limit int) ([]*Node, error) {
 }
 
 // Close stops the update queue processor and waits for pending updates.
+//
+// The processor exits on context cancellation, and Stop cancels before calling
+// here, so a producer can still enqueue after the processor is gone. Refusing
+// new work first and flushing afterwards is what makes that write-or-reject
+// rather than a silent drop.
 func (ndb *NodeDB) Close() {
-	// Wait for queue processor to finish
+	ndb.updateQueueLock.Lock()
+	ndb.closing = true
+	ndb.updateQueueLock.Unlock()
+
 	ndb.wg.Wait()
+
+	if batch := ndb.drainQueue(nil); len(batch) > 0 {
+		ndb.batchUpdate(batch)
+	}
 }
 
 // GetStats returns current database statistics.

@@ -267,6 +267,9 @@ func (t *FlatTable) Add(n *Node) bool {
 
 			// Queue ENR update (preserves stats)
 			existing.MarkDirty(DirtyENR)
+			if err := t.db.QueueUpdate(existing); err != nil {
+				t.logger.WithError(err).WithField("peerID", existing.PeerID()).Debug("failed to queue ENR update")
+			}
 
 			if t.nodeChangedCallback != nil {
 				t.nodeChangedCallback(existing)
@@ -332,6 +335,9 @@ func (t *FlatTable) Add(n *Node) bool {
 	// Queue ENR update to DB and mark as active
 	n.MarkDirty(DirtyENR)
 	n.SetLastActive(time.Now())
+	if err := t.db.QueueUpdate(n); err != nil {
+		t.logger.WithError(err).WithField("peerID", n.PeerID()).Debug("failed to queue admitted node")
+	}
 
 	if t.nodeChangedCallback != nil {
 		t.nodeChangedCallback(n)
