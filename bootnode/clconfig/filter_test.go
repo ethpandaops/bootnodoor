@@ -75,11 +75,11 @@ func TestNextForkInfoFallsBackToFarFuture(t *testing.T) {
 	}
 }
 
-// TestFilterSkipsRecordsWithoutEth2: a record with no eth2 entry is an
+// TestAdmitSkipsRecordsWithoutEth2: a record with no eth2 entry is an
 // execution node, not an invalid consensus node, so it must not move any
-// counter (mirrors the EL side's RecordELAdmission gate). A malformed eth2
+// counter (mirrors the EL side's AdmitELNode gate). A malformed eth2
 // entry still counts as invalid.
-func TestFilterSkipsRecordsWithoutEth2(t *testing.T) {
+func TestAdmitSkipsRecordsWithoutEth2(t *testing.T) {
 	cfg := &Config{
 		SecondsPerSlot:      12,
 		customSlotsPerEpoch: 32,
@@ -104,7 +104,7 @@ func TestFilterSkipsRecordsWithoutEth2(t *testing.T) {
 		t.Fatalf("sign: %v", err)
 	}
 
-	if filter.Filter(noEth2) {
+	if filter.Admit(noEth2) {
 		t.Fatal("record without eth2 passed the CL filter")
 	}
 	stats := filter.GetStats()
@@ -122,7 +122,7 @@ func TestFilterSkipsRecordsWithoutEth2(t *testing.T) {
 		t.Fatalf("sign: %v", err)
 	}
 
-	if filter.Filter(malformed) {
+	if filter.Admit(malformed) {
 		t.Fatal("malformed eth2 passed the CL filter")
 	}
 	stats = filter.GetStats()
@@ -140,7 +140,7 @@ func TestFilterSkipsRecordsWithoutEth2(t *testing.T) {
 		t.Fatalf("sign: %v", err)
 	}
 
-	if filter.Filter(undecodable) {
+	if filter.Admit(undecodable) {
 		t.Fatal("undecodable eth2 passed the CL filter")
 	}
 	stats = filter.GetStats()

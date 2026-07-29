@@ -54,7 +54,7 @@ func TestUpdateENR_ELOnlyDropsInheritedEth2(t *testing.T) {
 		t.Fatalf("createLocalNode: %v", err)
 	}
 
-	if err := NewENRManager(cfg, key, ln, true, false).UpdateENR(0, 0); err != nil {
+	if _, err := NewENRManager(cfg, key, ln, true, false).UpdateENR(0, 0); err != nil {
 		t.Fatalf("UpdateENR: %v", err)
 	}
 
@@ -79,7 +79,7 @@ func TestUpdateENR_DropsUnservedFields(t *testing.T) {
 		t.Fatalf("createLocalNode: %v", err)
 	}
 
-	if err := NewENRManager(cfg, key, ln, false, false).UpdateENR(0, 0); err != nil {
+	if _, err := NewENRManager(cfg, key, ln, false, false).UpdateENR(0, 0); err != nil {
 		t.Fatalf("UpdateENR: %v", err)
 	}
 
@@ -95,7 +95,7 @@ func TestUpdateENR_DropsUnservedFields(t *testing.T) {
 
 // A record without an eth entry is a consensus node, not a wrong-fork
 // execution node, so it must not move the EL admission counters.
-func TestRecordELAdmission_SkipsRecordsWithoutEth(t *testing.T) {
+func TestAdmitELNode_SkipsRecordsWithoutEth(t *testing.T) {
 	cfg := &Config{Logger: quietLogger(), ELConfig: &elconfig.ChainConfig{}, ELGenesisHash: [32]byte{1, 2, 3}, ELGenesisTime: 1000}
 	key := mustKey(t)
 	ln, err := createLocalNode(cfg, key, net.ParseIP("1.2.3.4"), nil, 9000, nil)
@@ -105,16 +105,22 @@ func TestRecordELAdmission_SkipsRecordsWithoutEth(t *testing.T) {
 	m := NewENRManager(cfg, key, ln, true, false)
 
 	clOnly := storedENRWith(t, key, map[string][]byte{"eth2": {0xaa, 0xbb, 0xcc, 0xdd}})
-	m.RecordELAdmission(clOnly, false, elconfig.ForkID{})
+	m.AdmitELNode(clOnly)
 	if got := m.GetELFilter().GetStats().TotalChecks; got != 0 {
 		t.Fatalf("TotalChecks = %d after CL-only record, want 0", got)
 	}
 
 	elRec := storedENRWith(t, key, map[string][]byte{"eth": {0x01, 0x02, 0x03, 0x04}})
-	m.RecordELAdmission(elRec, false, elconfig.ForkID{})
+	m.AdmitELNode(elRec)
 	stats := m.GetELFilter().GetStats()
 	if stats.TotalChecks != 1 || stats.Rejected != 1 {
 		t.Fatalf("stats = %+v after eth record, want 1 check / 1 rejection", stats)
+	}
+
+	// The pure path must stay silent on the same records.
+	m.ClassifyELNode(elRec)
+	if got := m.GetELFilter().GetStats().TotalChecks; got != 1 {
+		t.Fatalf("TotalChecks = %d after ClassifyELNode, want 1 (unchanged)", got)
 	}
 }
 
@@ -578,7 +584,7 @@ func TestUpdateENR_PublishesCurrentEraForkID(t *testing.T) {
 
 	mgr := NewENRManager(cfg, key, ln, true, false)
 	headBlock, headTime := StaticHead()
-	if err := mgr.UpdateENR(headBlock, headTime); err != nil {
+	if _, err := mgr.UpdateENR(headBlock, headTime); err != nil {
 		t.Fatalf("UpdateENR: %v", err)
 	}
 
@@ -612,13 +618,13 @@ func TestUpdateENR_NoSeqBumpWhenUnchanged(t *testing.T) {
 
 	mgr := NewENRManager(cfg, key, ln, true, false)
 	headBlock, headTime := StaticHead()
-	if err := mgr.UpdateENR(headBlock, headTime); err != nil {
+	if _, err := mgr.UpdateENR(headBlock, headTime); err != nil {
 		t.Fatalf("first UpdateENR: %v", err)
 	}
 	seq := ln.Record().Seq()
 
 	for i := 0; i < 3; i++ {
-		if err := mgr.UpdateENR(StaticHead()); err != nil {
+		if _, err := mgr.UpdateENR(StaticHead()); err != nil {
 			t.Fatalf("repeat UpdateENR: %v", err)
 		}
 	}
@@ -725,7 +731,7 @@ func TestServeAll_LeavesAdmissionCountersUntouched(t *testing.T) {
 }
 
 // A node present in both tables must be served once, not once per table.
-func TestDedupeByID(t *testing.T) {
+func TestFilterNodesForRequesterDedupes(t *testing.T) {
 	s := newServeAllTestService(t, true)
 
 	rec := storedENRWith(t, mustKey(t), nil)
@@ -738,12 +744,13 @@ func TestDedupeByID(t *testing.T) {
 	b := nodes.NewFromV5(v5, s.elNodeDB)
 	other := nodes.NewFromV5(mustV5Node(t), s.elNodeDB)
 
-	got := dedupeByID([]*nodes.Node{a, b, other, a})
+	requester := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 30303}
+	got := s.filterNodesForRequester([]*nodes.Node{a, b, other, a}, requester, true)
 	if len(got) != 2 {
-		t.Fatalf("dedupeByID returned %d nodes, want 2", len(got))
+		t.Fatalf("filterNodesForRequester returned %d nodes, want 2", len(got))
 	}
 	if got[0].ID() != a.ID() || got[1].ID() != other.ID() {
-		t.Errorf("dedupeByID did not keep first occurrences in order")
+		t.Errorf("filterNodesForRequester did not keep first occurrences in order")
 	}
 }
 

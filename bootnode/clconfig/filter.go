@@ -65,15 +65,8 @@ type Logger interface {
 //   - config: CL configuration for computing fork digests
 //   - gracePeriod: How long to accept old fork digests (0 = default 60 minutes)
 //
-// Example:
-//
-//	config, _ := LoadConfig("config.yaml")
-//	filter := NewForkDigestFilter(config, 60*time.Minute)
-//
-//	// Use as admission filter
-//	service, _ := discv5.New(&discv5.Config{
-//	    AdmissionFilter: filter.Filter(),
-//	})
+// Call Admit from admission paths and Matches from per-packet classification;
+// only Admit moves the stats counters.
 func NewForkDigestFilter(config *Config, gracePeriod time.Duration) *ForkDigestFilter {
 	if gracePeriod <= 0 {
 		gracePeriod = DefaultGracePeriod
@@ -105,109 +98,135 @@ func (f *ForkDigestFilter) SetLogger(logger Logger) {
 	f.logger = logger
 }
 
-// Filter returns an ENR admission filter function.
+// clOutcome is the result of evaluating one record's fork digest. Each value
+// maps to exactly one stats bucket, except outcomeNotCL which is deliberately
+// uncounted.
+type clOutcome int
+
+const (
+	// outcomeNotCL is a record with no eth2 entry: an execution node, not a
+	// broken consensus node, so it must not move the CL counters.
+	outcomeNotCL clOutcome = iota
+	outcomeUndecodable
+	outcomeUnparsable
+	outcomeCurrent
+	outcomeOldInGrace
+	outcomeHistorical
+	outcomeUnknownDigest
+)
+
+func (o clOutcome) accepted() bool {
+	return o == outcomeCurrent || o == outcomeOldInGrace || o == outcomeHistorical
+}
+
+// classify evaluates a record's fork digest, touching neither stats nor logs.
 //
-// This filter accepts ALL historically valid fork digests:
-//   - Current fork digest
-//   - Old fork digests (within grace period)
-//   - Any historically valid fork digest from the network
-//
-// Nodes with old digests are accepted into the routing table and will be
-// pinged, which triggers ENR updates. Use ResponseFilter() to exclude them
-// from FINDNODE responses.
-//
-// Example:
-//
-//	filter := NewForkDigestFilter(config, 60*time.Minute)
-//	service, _ := discv5.New(&discv5.Config{
-//	    AdmissionFilter: filter.Filter(),
-//	    ResponseFilter: filter.ResponseFilter(),
-//	})
-func (f *ForkDigestFilter) Filter(record *enr.Record) bool {
-	// No eth2 entry means an execution node, not an invalid consensus node:
-	// reject without moving counters (mirrors RecordELAdmission's eth gate).
-	// A present but undecodable entry is a broken consensus node: that counts.
+// The digest lookups run inside one read-lock: Update mutates oldForkDigests, so
+// publishing that map outside the lock and indexing it later is a concurrent
+// map read/write, which aborts the process rather than returning an error.
+func (f *ForkDigestFilter) classify(record *enr.Record) (clOutcome, ForkDigest, error) {
+	if record == nil {
+		return outcomeNotCL, ForkDigest{}, nil
+	}
+
 	var eth2Data []byte
 	if err := record.Get("eth2", &eth2Data); err != nil {
 		if !record.Has("eth2") {
-			return false
+			return outcomeNotCL, ForkDigest{}, nil
 		}
-		f.mu.Lock()
-		f.totalChecks++
+		return outcomeUndecodable, ForkDigest{}, err
+	}
+
+	forkDigest, err := ParseETH2Field(eth2Data)
+	if err != nil {
+		return outcomeUnparsable, ForkDigest{}, err
+	}
+
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if forkDigest == f.currentForkDigest {
+		return outcomeCurrent, forkDigest, nil
+	}
+
+	if activationTime, exists := f.oldForkDigests[forkDigest]; exists {
+		if time.Since(activationTime) <= f.gracePeriod {
+			return outcomeOldInGrace, forkDigest, nil
+		}
+		// Grace period expired but the digest may still be historically valid.
+	}
+
+	if f.historicalDigests[forkDigest] {
+		return outcomeHistorical, forkDigest, nil
+	}
+
+	return outcomeUnknownDigest, forkDigest, nil
+}
+
+// Matches reports whether a record's fork digest is acceptable.
+//
+// It is pure: no counter moves and nothing is logged. Use it for per-packet
+// layer classification, which happens far too often to be a stats signal.
+func (f *ForkDigestFilter) Matches(record *enr.Record) bool {
+	outcome, _, _ := f.classify(record)
+	return outcome.accepted()
+}
+
+// Admit is Matches plus stats: it is the only entry point that moves the
+// counters. Call it from admission paths only, never from layer classification
+// (the same contract as elconfig.ForkFilter.RecordAdmission).
+//
+// This filter accepts ALL historically valid fork digests: the current digest,
+// old digests within the grace period, and any digest from network history.
+// Nodes with old digests are accepted into the routing table and pinged, which
+// triggers ENR updates.
+func (f *ForkDigestFilter) Admit(record *enr.Record) bool {
+	outcome, forkDigest, err := f.classify(record)
+	f.recordOutcome(outcome, forkDigest, err)
+	return outcome.accepted()
+}
+
+// recordOutcome folds one admission outcome into the stats and emits the
+// matching debug line, under a single lock so TotalChecks and the buckets always
+// agree for any GetStats observer.
+func (f *ForkDigestFilter) recordOutcome(outcome clOutcome, forkDigest ForkDigest, err error) {
+	if outcome == outcomeNotCL {
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.totalChecks++
+
+	switch outcome {
+	case outcomeUndecodable:
 		f.rejectedInvalid++
 		if f.logger != nil {
 			f.logger.Debugf("Rejected node: undecodable eth2 field - %v", err)
 		}
-		f.mu.Unlock()
-		return false
-	}
-
-	f.mu.Lock()
-	f.totalChecks++
-	f.mu.Unlock()
-
-	// Parse fork digest (first 4 bytes only)
-	forkDigest, err := ParseETH2Field(eth2Data)
-	if err != nil {
-		// Invalid eth2 field, reject
-		f.mu.Lock()
+	case outcomeUnparsable:
 		f.rejectedInvalid++
 		if f.logger != nil {
 			f.logger.Debugf("Rejected node: invalid eth2 field - %v", err)
 		}
-		f.mu.Unlock()
-		return false
-	}
-
-	f.mu.RLock()
-	currentDigest := f.currentForkDigest
-	oldDigests := f.oldForkDigests
-	gracePeriod := f.gracePeriod
-	historicalDigests := f.historicalDigests
-	f.mu.RUnlock()
-
-	// Check if matches current fork digest
-	if forkDigest == currentDigest {
-		f.mu.Lock()
+	case outcomeCurrent:
 		f.acceptedCurrent++
-		f.mu.Unlock()
-		return true
-	}
-
-	// Check if matches old fork digest within grace period
-	if activationTime, exists := oldDigests[forkDigest]; exists {
-		age := time.Since(activationTime)
-		if age <= gracePeriod {
-			f.mu.Lock()
-			f.acceptedOld++
-			f.mu.Unlock()
-			return true
-		}
-		// Grace period expired but still historically valid - fall through
-	}
-
-	// Check if it's any historically valid fork digest
-	// These nodes will be added to the table and pinged (triggering ENR updates)
-	// but may be excluded from FINDNODE responses via ResponseFilter
-	if historicalDigests[forkDigest] {
-		f.mu.Lock()
+	case outcomeOldInGrace:
+		f.acceptedOld++
+	case outcomeHistorical:
 		f.acceptedHistorical++
 		if f.logger != nil {
-			f.logger.Debugf("Accepted node with historical fork digest: %s (current: %s)", forkDigest.String(), currentDigest.String())
+			f.logger.Debugf("Accepted node with historical fork digest: %s (current: %s)", forkDigest.String(), f.currentForkDigest.String())
 		}
-		f.mu.Unlock()
-		return true
+	case outcomeUnknownDigest:
+		f.rejectedInvalid++
+		if f.logger != nil {
+			f.logger.Debugf("Rejected node: unknown fork digest %s (current: %s, %d historical digests known)",
+				forkDigest.String(), f.currentForkDigest.String(), len(f.historicalDigests))
+		}
+	case outcomeNotCL:
 	}
-
-	// Unknown fork digest, reject
-	f.mu.Lock()
-	f.rejectedInvalid++
-	if f.logger != nil {
-		f.logger.Debugf("Rejected node: unknown fork digest %s (current: %s, %d historical digests known)",
-			forkDigest.String(), currentDigest.String(), len(historicalDigests))
-	}
-	f.mu.Unlock()
-	return false
 }
 
 // Update updates the fork digest based on the current epoch.
@@ -335,18 +354,7 @@ func (f *ForkDigestFilter) ComputeEth2Field() []byte {
 func (f *ForkDigestFilter) nextForkInfo() ([4]byte, uint64) {
 	const farFutureEpoch = ^uint64(0)
 
-	genesisTime := f.config.GetGenesisTime()
-	secondsPerSlot := f.config.SecondsPerSlot
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
-	}
-
-	currentEpoch := uint64(0)
-	if genesisTime > 0 {
-		slotsPerEpoch := f.config.GetSlotsPerEpoch()
-		currentEpoch = uint64(GetCurrentEpoch(genesisTime, uint64(time.Now().Unix()), secondsPerSlot, slotsPerEpoch))
-	}
-
+	currentEpoch, _ := f.config.currentEpochNow()
 	currentForkVersion := f.config.GetForkVersionAtEpoch(currentEpoch)
 
 	for _, fork := range f.config.getForks() {
@@ -369,23 +377,10 @@ func (f *ForkDigestFilter) nextForkInfo() ([4]byte, uint64) {
 
 // GetCurrentFork returns the name of the current fork.
 func (f *ForkDigestFilter) GetCurrentFork() string {
-	// Get genesis time
-	genesisTime := f.config.GetGenesisTime()
-	if genesisTime == 0 {
-		// No genesis time, fallback to "Unknown"
+	currentEpoch, ok := f.config.currentEpochNow()
+	if !ok {
 		return "Unknown"
 	}
-
-	// Calculate current epoch
-	currentTime := uint64(time.Now().Unix())
-	slotsPerEpoch := f.config.GetSlotsPerEpoch()
-	secondsPerSlot := f.config.SecondsPerSlot
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
-	}
-	currentEpoch := uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, slotsPerEpoch))
-
-	// Get fork name for current epoch
 	return f.config.GetForkNameAtEpoch(currentEpoch)
 }
 
@@ -479,15 +474,6 @@ func (f *ForkDigestFilter) GetRejectedInvalid() int {
 	defer f.mu.RUnlock()
 
 	return f.rejectedInvalid
-}
-
-// GetAcceptedHistorical returns the count of nodes accepted on a historical
-// fork digest (valid chain, not the current or grace-period fork).
-func (f *ForkDigestFilter) GetAcceptedHistorical() int {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	return f.acceptedHistorical
 }
 
 // GetTotalChecks returns the total number of filter checks performed.

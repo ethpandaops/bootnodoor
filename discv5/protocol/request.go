@@ -129,6 +129,27 @@ func (rt *RequestTracker) AddRequest(requestID []byte, n *node.Node, msg Message
 	return req.ResponseChan
 }
 
+// respondsTo reports whether resp is the response type request expects.
+//
+// An unknown request type matches nothing: a new request/response pair must be
+// registered here deliberately rather than defaulting to accepting any reply.
+func respondsTo(request, resp Message) bool {
+	if request == nil || resp == nil {
+		return false
+	}
+
+	switch request.Type() {
+	case PingMsg:
+		return resp.Type() == PongMsg
+	case FindNodeMsg:
+		return resp.Type() == NodesMsg
+	case TalkReqMsg:
+		return resp.Type() == TalkRespMsg
+	default:
+		return false
+	}
+}
+
 // MatchResponse matches a response to a pending request.
 //
 // Returns true if the request was matched and notified.
@@ -144,6 +165,14 @@ func (rt *RequestTracker) MatchResponse(requestID []byte, nodeID node.ID, msg Me
 
 	// Verify node ID matches
 	if req.NodeID != nodeID {
+		return false
+	}
+
+	// The response must be the kind this request asked for. Request IDs are ours
+	// but the peer learns them, so without this a PONG can match a pending
+	// FINDNODE: it would both fire the PONG side effects and consume the entry
+	// below, silently stranding the lookup that was waiting on it.
+	if !respondsTo(req.Message, msg) {
 		return false
 	}
 

@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -133,6 +134,12 @@ type PendingRequest struct {
 
 	// ToNode is the destination node
 	ToNode *node.Node
+
+	// DestIP is the IP the request was sent to, snapshotted at send time.
+	// ToNode.Addr() is unusable for verifying a response's origin because
+	// getOrCreateNode rewrites it from every inbound packet, including the
+	// spoofed one a response check is meant to catch.
+	DestIP net.IP
 
 	// PacketType is the type of request
 	PacketType byte
@@ -332,9 +339,11 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 		return err
 	}
 
-	// Mark node as bonded: they pinged us, we ponged them.
-	// This allows THEM to query US with FINDNODE immediately.
-	fromNode.MarkPongReceived(h.config.BondExpiration)
+	// Receiving a PING grants no bond: we ponged whatever address the packet
+	// claimed, which proves nothing if that source was spoofed. Bonding here
+	// would let an attacker bond a victim's address and then have us reflect
+	// NEIGHBORS at it. The bond is established by the reciprocal PING below,
+	// when its PONG comes back from the address we sent it to.
 
 	// IMPORTANT: For bidirectional bonding (required by strict clients like reth for ENRRequest),
 	// we also need to establish that WE can reach THEM, not just that they can reach us.
@@ -375,19 +384,23 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 		return ErrExpired
 	}
 
-	// Mark pong received (establishes bond)
-	fromNode.MarkPongReceived(h.config.BondExpiration)
+	// Nothing below may run for a PONG we did not solicit from this address: it
+	// establishes a bond, casts a vote in the external-IP election that rewrites
+	// our published ENR, and can trigger outbound ENR traffic.
+	req := h.consumePendingPing(pong.ReplyTok, fromNode.ID(), from)
+	if req == nil {
+		return nil
+	}
 
-	// Call OnPongReceived callback with the IP and port reported in the PONG
-	// The To field in PONG contains our address as seen by the remote peer
+	// Bind the bond to the address we proved, not the packet's source.
+	fromNode.MarkPongReceived(h.config.BondExpiration, &net.UDPAddr{IP: req.DestIP, Port: from.Port})
+
+	// The To field in PONG contains our address as seen by the remote peer.
 	if h.config.OnPongReceived != nil && pong.To.IP != nil && pong.To.UDP > 0 {
 		h.config.OnPongReceived(fromNode, pong.To.IP, pong.To.UDP)
 	}
 
-	// Match to pending requests
-	for _, req := range h.getPendingRequests(pong.ReplyTok, fromNode.ID()) {
-		h.deliverResponse(req, pong)
-	}
+	h.deliverResponse(req, pong)
 
 	// Check if remote node has newer ENR
 	if pong.ENRSeq > 0 && fromNode.ENR() != nil {
@@ -414,8 +427,9 @@ func (h *Handler) handleFindnode(fromNode *node.Node, from *net.UDPAddr, localAd
 		return ErrExpired
 	}
 
-	// Check if node is bonded
-	if !fromNode.IsBonded() {
+	// Bonded at this source address specifically: a bond earned elsewhere would
+	// let a spoofed source have us reflect NEIGHBORS at a third party.
+	if !fromNode.IsBondedFrom(from) {
 		h.incrementUnbondedFindnode()
 		logrus.WithField("node_id", fmt.Sprintf("%x", fromNode.IDBytes()[:8])).
 			Debug("Rejected FINDNODE from unbonded node")
@@ -449,8 +463,6 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		return ErrExpired
 	}
 
-	h.incrementFindnodeResponsesRecv()
-
 	// Only accept NEIGHBORS in response to a FINDNODE we actually sent to this
 	// node. Dropping unsolicited NEIGHBORS prevents a peer we never queried from
 	// making us accumulate node records without bound.
@@ -458,6 +470,10 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 	if matchedReq == nil {
 		return nil
 	}
+
+	// Counted after the gate: this reports responses to our queries, so counting
+	// unsolicited packets here would let any peer inflate it.
+	h.incrementFindnodeResponsesRecv()
 
 	// Accumulate the response, keyed by the matched request's hash so each
 	// FINDNODE gets exactly one entry and a fresh request never collides with
@@ -549,8 +565,8 @@ func (h *Handler) handleENRRequest(fromNode *node.Node, from *net.UDPAddr, local
 	// This prevents amplification attacks and matches reth's behavior.
 	// Only respond to ENRRequest if we've established a bidirectional bond:
 	// - We sent them a PING
-	// - They sent us a PONG
-	if !fromNode.IsBonded() {
+	// - They sent us a PONG from this address
+	if !fromNode.IsBondedFrom(from) {
 		logrus.WithFields(logrus.Fields{
 			"from":    from.String(),
 			"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
@@ -943,9 +959,15 @@ func requestKey(hash []byte, id node.ID) string {
 // peer with one already in flight is rejected: NEIGHBORS carries no reply
 // token, so two in-flight FINDNODEs to one peer cannot be told apart.
 func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte) (*PendingRequest, error) {
+	var destIP net.IP
+	if addr := toNode.Addr(); addr != nil && addr.IP != nil {
+		destIP = append(net.IP(nil), addr.IP...)
+	}
+
 	req := &PendingRequest{
 		RequestHash:  hash,
 		ToNode:       toNode,
+		DestIP:       destIP,
 		PacketType:   packetType,
 		CreatedAt:    time.Now(),
 		Timeout:      time.Now().Add(h.config.RequestTimeout),
@@ -971,6 +993,47 @@ func (h *Handler) getPendingRequests(replyTok []byte, id node.ID) []*PendingRequ
 	h.requestsMu.RLock()
 	defer h.requestsMu.RUnlock()
 	return append([]*PendingRequest(nil), h.requests[requestKey(replyTok, id)]...)
+}
+
+// consumePendingPing removes and returns the pending PING this PONG answers, or
+// nil if there is none.
+//
+// Three properties beyond "a token matched" are required before a PONG may
+// mutate state, and all three are enforced here so no caller can forget one:
+//
+//   - from must be the IP the PING was sent to. The token alone proves only that
+//     somebody received that PING; an attacker who receives it at their own
+//     address can replay it with a victim's source and bond the victim.
+//   - the request must be a PING. Peers know the hashes of packets we sent them,
+//     so an ENRREQUEST or FINDNODE hash would otherwise match as a reply token.
+//   - the entry is deleted here, under the same lock, so a replayed PONG finds
+//     nothing and the side effects run at most once per PING.
+func (h *Handler) consumePendingPing(replyTok []byte, id node.ID, from *net.UDPAddr) *PendingRequest {
+	if from == nil || from.IP == nil {
+		return nil
+	}
+
+	key := requestKey(replyTok, id)
+
+	h.requestsMu.Lock()
+	defer h.requestsMu.Unlock()
+
+	reqs := h.requests[key]
+	for i, req := range reqs {
+		if req.PacketType != PingPacket || req.DestIP == nil || !req.DestIP.Equal(from.IP) {
+			continue
+		}
+
+		reqs = slices.Delete(reqs, i, i+1)
+		if len(reqs) == 0 {
+			delete(h.requests, key)
+		} else {
+			h.requests[key] = reqs
+		}
+		return req
+	}
+
+	return nil
 }
 
 // findPendingFindnode returns the pending FINDNODE request awaiting a response
@@ -1004,11 +1067,8 @@ func (h *Handler) removePendingRequest(req *PendingRequest) {
 	defer h.requestsMu.Unlock()
 
 	reqs := h.requests[key]
-	for i, r := range reqs {
-		if r == req {
-			reqs = append(reqs[:i], reqs[i+1:]...)
-			break
-		}
+	if i := slices.Index(reqs, req); i >= 0 {
+		reqs = slices.Delete(reqs, i, i+1)
 	}
 	if len(reqs) == 0 {
 		delete(h.requests, key)
@@ -1055,12 +1115,7 @@ func (h *Handler) cleanup() {
 	// Clean up expired requests
 	h.requestsMu.Lock()
 	for key, reqs := range h.requests {
-		kept := reqs[:0]
-		for _, req := range reqs {
-			if !now.After(req.Timeout) {
-				kept = append(kept, req)
-			}
-		}
+		kept := slices.DeleteFunc(reqs, func(req *PendingRequest) bool { return now.After(req.Timeout) })
 		if len(kept) == 0 {
 			delete(h.requests, key)
 		} else {
@@ -1080,14 +1135,35 @@ func (h *Handler) cleanup() {
 
 	// Evict stale, unbonded nodes so the map stays bounded. Bonded nodes are
 	// kept until their bond expires, after which IsBonded reports false and they
-	// become eligible here.
+	// become eligible here. Scanning under the read lock keeps a full-map sweep
+	// from stalling every inbound packet in getOrCreateNode.
+	stale := h.staleNodes(now)
+	if len(stale) == 0 {
+		return
+	}
+
 	h.nodesMu.Lock()
-	for id, n := range h.nodes {
-		if !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
+	for _, id := range stale {
+		// Re-check: a node may have been seen again since the scan.
+		if n, ok := h.nodes[id]; ok && !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
 			delete(h.nodes, id)
 		}
 	}
 	h.nodesMu.Unlock()
+}
+
+// staleNodes returns the IDs of unbonded nodes past their TTL.
+func (h *Handler) staleNodes(now time.Time) []node.ID {
+	h.nodesMu.RLock()
+	defer h.nodesMu.RUnlock()
+
+	var stale []node.ID
+	for id, n := range h.nodes {
+		if !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
+			stale = append(stale, id)
+		}
+	}
+	return stale
 }
 
 // Statistics

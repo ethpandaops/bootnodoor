@@ -213,7 +213,7 @@ func TestFindnodeRemovesCompletedRequest(t *testing.T) {
 	h := NewHandler(ctx, HandlerConfig{PrivateKey: key}, stubTransport{})
 
 	to := makeDiscv4Node(t)
-	to.MarkPongReceived(time.Hour)
+	to.MarkPongReceived(time.Hour, to.Addr())
 	target := EncodePubkey(&key.PublicKey)
 
 	type result struct {

@@ -75,12 +75,14 @@ type IPDiscovery struct {
 
 // ipReport tracks reports for a specific IP:Port combination
 type ipReport struct {
-	ip          net.IP
-	port        uint16
-	count       int
-	firstSeen   time.Time
-	lastSeen    time.Time
-	reporterIDs []string       // Track which peers reported this (for debugging)
+	ip        net.IP
+	port      uint16
+	count     int
+	firstSeen time.Time
+	lastSeen  time.Time
+	// Counted by identity as well as by source IP: source addresses are
+	// spoofable, so one node ID must not satisfy the thresholds on its own.
+	reporterIDs map[string]int // Track distinct reporter node IDs -> count
 	reporterIPs map[string]int // Track distinct reporter IPs -> count
 }
 
@@ -199,7 +201,7 @@ func (ipd *IPDiscovery) ReportIP(ip net.IP, port uint16, reporterID string, repo
 			ip:          ip,
 			port:        port,
 			firstSeen:   now,
-			reporterIDs: make([]string, 0),
+			reporterIDs: make(map[string]int),
 			reporterIPs: make(map[string]int),
 		}
 		reports[addrKey] = report
@@ -208,7 +210,7 @@ func (ipd *IPDiscovery) ReportIP(ip net.IP, port uint16, reporterID string, repo
 	// Update report
 	report.count++
 	report.lastSeen = now
-	report.reporterIDs = append(report.reporterIDs, reporterID)
+	report.reporterIDs[reporterID]++
 
 	// Track reporter IP
 	reporterIPStr := reporterIP.String()
@@ -328,9 +330,11 @@ func (ipd *IPDiscovery) checkConsensusForFamilyLocked(isIPv6 bool) {
 		if maxRecentAddr != "" && maxRecentAddr != currentAddrKey && maxRecentReport != nil {
 			recentMajority := float64(maxRecentCount) / float64(totalRecentCount)
 			distinctIPCount := len(maxRecentReport.reporterIPs)
+			distinctIDCount := len(maxRecentReport.reporterIDs)
 
-			// Enforce distinct IP threshold for address changes too
-			if recentMajority >= ipd.majorityThreshold && distinctIPCount >= ipd.minDistinctIPs {
+			// Enforce both distinct thresholds for address changes too
+			if recentMajority >= ipd.majorityThreshold &&
+				distinctIPCount >= ipd.minDistinctIPs && distinctIDCount >= ipd.minDistinctIPs {
 				// Address change detected!
 				ipd.logger.WithFields(logrus.Fields{
 					"family":         familyName,
@@ -381,13 +385,15 @@ func (ipd *IPDiscovery) checkConsensusForFamilyLocked(isIPv6 bool) {
 
 	// Check distinct IP count
 	distinctIPCount := len(maxReport.reporterIPs)
-	if distinctIPCount < ipd.minDistinctIPs {
+	distinctIDCount := len(maxReport.reporterIDs)
+	if distinctIPCount < ipd.minDistinctIPs || distinctIDCount < ipd.minDistinctIPs {
 		ipd.logger.WithFields(logrus.Fields{
 			"family":      familyName,
 			"addr":        fmt.Sprintf("%s:%d", maxReport.ip.String(), maxReport.port),
 			"distinctIPs": distinctIPCount,
+			"distinctIDs": distinctIDCount,
 			"minDistinct": ipd.minDistinctIPs,
-		}).Debug("IP discovery: insufficient distinct reporter IPs")
+		}).Debug("IP discovery: insufficient distinct reporters")
 		return
 	}
 

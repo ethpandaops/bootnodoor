@@ -977,8 +977,12 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, rem
 		"nodeID": remoteID,
 	}).Debug("handler: received PONG")
 
-	// Match with pending request
-	h.requests.MatchResponse(msg.RequestID, remoteID, msg)
+	// An unsolicited PONG must not reach the side effects below: OnPongReceived
+	// casts a vote in the external-IP election that rewrites our published ENR,
+	// and the ENR branch triggers outbound traffic.
+	if !h.requests.MatchResponse(msg.RequestID, remoteID, msg) {
+		return nil
+	}
 
 	// Call OnPongReceived callback with the source IP and the IP/port reported in the PONG
 	// The IP and Port fields in PONG contain our address as seen by the remote peer

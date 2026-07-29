@@ -60,7 +60,7 @@ func TestCleanupEvictsStaleUnbondedNodes(t *testing.T) {
 
 	pubBonded, idBonded := makeNodeID(t)
 	bonded := h.getOrCreateNode(idBonded, pubBonded, testAddr())
-	bonded.MarkPongReceived(time.Hour) // establish a live bond
+	bonded.MarkPongReceived(time.Hour, testAddr()) // establish a live bond
 
 	time.Sleep(40 * time.Millisecond) // age both past NodeTTL
 

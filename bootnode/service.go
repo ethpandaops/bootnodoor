@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -163,10 +164,14 @@ func New(cfg *Config) (*Service, error) {
 
 		id.enrManager = NewENRManager(cfg, id.key, localNode, id.servesEL, id.servesCL)
 		headBlock, headTime := StaticHead()
-		if uerr := id.enrManager.UpdateENR(headBlock, headTime); uerr != nil {
+		changed, uerr := id.enrManager.UpdateENR(headBlock, headTime)
+		switch {
+		case uerr != nil:
 			cfg.Logger.WithError(uerr).Warn("failed to update ENR with eth/eth2 fields")
-		} else if serr := s.storeENR(id.storeKey, localNode.Record()); serr != nil {
-			cfg.Logger.WithError(serr).Warn("failed to store updated ENR")
+		case changed:
+			if serr := s.storeENR(id.storeKey, localNode.Record()); serr != nil {
+				cfg.Logger.WithError(serr).Warn("failed to store updated ENR")
+			}
 		}
 	}
 
@@ -603,22 +608,32 @@ func (s *Service) refreshForkENR() {
 			clFilter.Update()
 		}
 
-		beforeSeq := id.localNode.Record().Seq()
-		if err := id.enrManager.UpdateENR(headBlock, headTime); err != nil {
+		changed, err := id.enrManager.UpdateENR(headBlock, headTime)
+		if err != nil {
 			s.config.Logger.WithError(err).Error("failed to refresh fork fields in ENR")
 			continue
 		}
-		if id.localNode.Record().Seq() == beforeSeq {
+		if !changed {
 			continue
 		}
 
-		if err := s.storeENR(id.storeKey, id.localNode.Record()); err != nil {
-			s.config.Logger.WithError(err).Warn("failed to store refreshed ENR")
-		}
-		if id.servesEL && s.discv4Service != nil {
-			s.discv4Service.SetLocalENR(id.localNode.Record())
-		}
+		s.publishENR(id)
 		s.config.Logger.WithField("seq", id.localNode.Record().Seq()).Info("fork transition: re-published ENR fork fields")
+	}
+}
+
+// publishENR persists an identity's current record and pushes it to every
+// service that caches a copy. The discv4 handler answers ENRRESPONSE from its
+// own copy, so skipping it would keep serving a stale record. Callers must
+// hold s.mu.
+func (s *Service) publishENR(id *identity) {
+	record := id.localNode.Record()
+
+	if err := s.storeENR(id.storeKey, record); err != nil {
+		s.config.Logger.WithError(err).Warn("failed to store updated ENR")
+	}
+	if id.servesEL && s.discv4Service != nil {
+		s.discv4Service.SetLocalENR(record)
 	}
 }
 
@@ -843,8 +858,7 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 	// Filter by fork ID before adding. Serve-all must not drop a configured seed:
 	// rejecting the only seed leaves the table empty, so discovery never starts.
 	if !s.config.ServeAll && s.enrManager != nil {
-		isEL, forkID := s.enrManager.FilterELNode(record)
-		s.enrManager.RecordELAdmission(record, isEL, forkID)
+		isEL, forkID := s.enrManager.AdmitELNode(record)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", v5.ID().Bytes()[:8]),
@@ -878,11 +892,9 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 
 	// Never dial ourselves: our own enode in the bootnode list would otherwise
 	// race our handshake challenges against our own identity.
-	for _, local := range s.localIDs() {
-		if local == nodeID {
-			s.config.Logger.WithField("enode", enodeURL).Debug("skipping bootnode: it is our own identity")
-			return
-		}
+	if slices.Contains(s.localIDs(), [32]byte(nodeID)) {
+		s.config.Logger.WithField("enode", enodeURL).Debug("skipping bootnode: it is our own identity")
+		return
 	}
 
 	// Request ENR from the node
@@ -898,8 +910,7 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 
 	// Filter by fork ID before adding
 	if !s.config.ServeAll && s.enrManager != nil {
-		isEL, forkID := s.enrManager.FilterELNode(enrRecord)
-		s.enrManager.RecordELAdmission(enrRecord, isEL, forkID)
+		isEL, forkID := s.enrManager.AdmitELNode(enrRecord)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", nodeID[:8]),
@@ -940,7 +951,7 @@ func (s *Service) connectCLBootnodes() {
 		nodeID := v5.ID()
 
 		// Filter by fork digest before adding
-		if !s.config.ServeAll && s.enrManager != nil && !s.enrManager.FilterCLNode(record) {
+		if !s.config.ServeAll && s.enrManager != nil && !s.enrManager.AdmitCLNode(record) {
 			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR has invalid fork digest, skipping")
 			continue
 		}
@@ -952,14 +963,14 @@ func (s *Service) connectCLBootnodes() {
 }
 
 // addBootnodeToTable admits a configured bootnode to a routing table and
-// persists it, reporting whether it was admitted.
-func (s *Service) addBootnodeToTable(table *nodes.FlatTable, nodeDB *nodes.NodeDB, n *nodes.Node, logger logrus.FieldLogger) bool {
+// persists it.
+func (s *Service) addBootnodeToTable(table *nodes.FlatTable, nodeDB *nodes.NodeDB, n *nodes.Node, logger logrus.FieldLogger) {
 	if table == nil {
-		return false
+		return
 	}
 	if !table.Add(n) {
 		logger.Debug("bootnode not admitted to table, not persisting")
-		return false
+		return
 	}
 	logger.Info("added bootnode to table")
 
@@ -969,8 +980,6 @@ func (s *Service) addBootnodeToTable(table *nodes.FlatTable, nodeDB *nodes.NodeD
 			logger.WithError(err).Debug("failed to queue bootnode for database update")
 		}
 	}
-
-	return true
 }
 
 // loadStoredENR loads the stored ENR from database.
@@ -1016,9 +1025,9 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 			isEL = s.elTable != nil
 			isCL = s.clTable != nil
 		} else {
-			isEL, _ = s.enrManager.FilterELNode(n.Record())
+			isEL, _ = s.enrManager.ClassifyELNode(n.Record())
 			if !isEL {
-				isCL = s.enrManager.FilterCLNode(n.Record())
+				isCL = s.enrManager.ClassifyCLNode(n.Record())
 			}
 		}
 
@@ -1054,8 +1063,8 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	// Serve-all skips this: every requester gets nodes from every served layer.
 	if !s.config.ServeAll && id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
-		serveEL, _ = s.enrManager.FilterELNode(sourceRecord)
-		serveCL = s.enrManager.FilterCLNode(sourceRecord)
+		serveEL, _ = s.enrManager.ClassifyELNode(sourceRecord)
+		serveCL = s.enrManager.ClassifyCLNode(sourceRecord)
 	}
 
 	if serveEL && s.elTable != nil {
@@ -1063,12 +1072,6 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	}
 	if serveCL && s.clTable != nil {
 		allNodes = append(allNodes, s.clTable.GetNodesByDistance(localID, msg.Distances, 8)...)
-	}
-
-	// A node can sit in both tables (any dual-stack peer, and every peer under
-	// serve-all), so serving both layers would return it twice.
-	if serveEL && serveCL {
-		allNodes = dedupeByID(allNodes)
 	}
 
 	// Filter nodes based on protocol support (only return v5-capable nodes)
@@ -1207,24 +1210,19 @@ func (s *Service) requestENRV4(n *v4node.Node) {
 // table.
 func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
 	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
-		isEL, forkID := s.enrManager.FilterELNode(n.Record())
-		s.enrManager.RecordELAdmission(n.Record(), isEL, forkID)
+		isEL, forkID := s.enrManager.AdmitELNode(n.Record())
 		if !isEL {
 			// A record with no eth entry is a consensus node, not an
 			// execution node on the wrong fork.
 			if !n.Record().Has("eth") {
-				if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "not_el"); err != nil {
-					s.config.Logger.WithError(err).Debug("failed to store bad node")
-				}
+				s.markBadNode(n, db.LayerEL, "not_el")
 				return services.AdmissionRejectedLayer
 			}
 			s.config.Logger.WithFields(logrus.Fields{
 				"peerID": n.PeerID(),
 				"eth":    forkID.String(),
 			}).Debug("EL lookup admission rejected: incompatible fork id")
-			if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
-				s.config.Logger.WithError(err).Debug("failed to store bad node")
-			}
+			s.markBadNode(n, db.LayerEL, "invalid_fork_id")
 			return services.AdmissionRejectedFilter
 		}
 	}
@@ -1233,39 +1231,41 @@ func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
 		s.probeV5Support(n)
 	}
 
-	if !s.elTable.Add(n) {
-		return services.AdmissionRejectedPool
-	}
-	if err := s.config.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
-		s.config.Logger.WithError(err).Debug("failed to remove from bad nodes")
-	}
-	return services.AdmissionAccepted
+	return s.admitToTable(n, s.elTable, db.LayerEL)
 }
 
 // admitCLLookupNode decides admission of a lookup-discovered node to the CL
 // table.
 func (s *Service) admitCLLookupNode(n *nodes.Node) services.AdmissionResult {
 	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
-		if !s.enrManager.FilterCLNode(n.Record()) {
+		if !s.enrManager.AdmitCLNode(n.Record()) {
 			// No eth2 entry means an execution node, not a consensus
 			// node on the wrong digest; keep the two distinguishable.
 			if !n.Record().Has("eth2") {
-				if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "not_cl"); err != nil {
-					s.config.Logger.WithError(err).Debug("failed to store bad node")
-				}
+				s.markBadNode(n, db.LayerCL, "not_cl")
 				return services.AdmissionRejectedLayer
 			}
-			if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
-				s.config.Logger.WithError(err).Debug("failed to store bad node")
-			}
+			s.markBadNode(n, db.LayerCL, "invalid_fork_digest")
 			return services.AdmissionRejectedFilter
 		}
 	}
 
-	if !s.clTable.Add(n) {
+	return s.admitToTable(n, s.clTable, db.LayerCL)
+}
+
+// markBadNode records a rejected node so it is not retried on restart.
+func (s *Service) markBadNode(n *nodes.Node, layer db.NodeLayer, reason string) {
+	if err := s.config.Database.StoreBadNode(n.IDBytes(), layer, reason); err != nil {
+		s.config.Logger.WithError(err).Debug("failed to store bad node")
+	}
+}
+
+// admitToTable pools an accepted node and clears any prior bad-node record.
+func (s *Service) admitToTable(n *nodes.Node, table *nodes.FlatTable, layer db.NodeLayer) services.AdmissionResult {
+	if !table.Add(n) {
 		return services.AdmissionRejectedPool
 	}
-	if err := s.config.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
+	if err := s.config.Database.RemoveBadNode(n.IDBytes(), layer); err != nil {
 		s.config.Logger.WithError(err).Debug("failed to remove from bad nodes")
 	}
 	return services.AdmissionAccepted
@@ -1335,8 +1335,7 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 
 	// Filter the node using ENR manager (EL-only for discv4)
 	if !s.config.ServeAll && s.enrManager != nil {
-		filter, forkID := s.enrManager.FilterELNode(n.ENR())
-		s.enrManager.RecordELAdmission(n.ENR(), filter, forkID)
+		filter, forkID := s.enrManager.AdmitELNode(n.ENR())
 		if !filter {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
@@ -1377,10 +1376,8 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 		isEL = s.elTable != nil
 		isCL = s.clTable != nil
 	} else {
-		var elForkID elconfig.ForkID
-		isEL, elForkID = s.enrManager.FilterELNode(n.Record())
-		isCL = s.enrManager.FilterCLNode(n.Record())
-		s.enrManager.RecordELAdmission(n.Record(), isEL, elForkID)
+		isEL, _ = s.enrManager.AdmitELNode(n.Record())
+		isCL = s.enrManager.AdmitCLNode(n.Record())
 	}
 
 	// Add to appropriate table(s)
@@ -1401,23 +1398,10 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	return added
 }
 
-// dedupeByID drops repeat node IDs, keeping the first occurrence.
-func dedupeByID(nodeList []*nodes.Node) []*nodes.Node {
-	seen := make(map[[32]byte]struct{}, len(nodeList))
-	out := nodeList[:0]
-	for _, n := range nodeList {
-		id := n.ID()
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, n)
-	}
-
-	return out
-}
-
-// filterNodesForRequester applies LAN-aware and protocol filtering.
+// filterNodesForRequester applies LAN-aware and protocol filtering. It is the
+// single funnel for both protocols' FINDNODE responses, so it also enforces
+// that a response never repeats a node ID — a node can sit in both tables (any
+// dual-stack peer, and every peer under serve-all).
 func (s *Service) filterNodesForRequester(nodeList []*nodes.Node, requester *net.UDPAddr, needsV5 bool) []*nodes.Node {
 	requesterIsLAN := v5node.IsLANAddress(requester.IP)
 
@@ -1442,6 +1426,11 @@ func (s *Service) filterNodesForRequester(nodeList []*nodes.Node, requester *net
 
 		// WAN requesters only get WAN nodes
 		if !requesterIsLAN && v5node.IsLANAddress(nodeIP) {
+			continue
+		}
+
+		id := n.ID()
+		if slices.ContainsFunc(filtered, func(kept *nodes.Node) bool { return kept.ID() == id }) {
 			continue
 		}
 
@@ -1613,8 +1602,9 @@ func (s *Service) onPongReceived(remoteID []byte, sourceIP net.IP, reportedIP ne
 		port = s.primaryIdentity().enrPort
 	}
 
-	reporterIDStr := fmt.Sprintf("%x", remoteID[:8])
-	s.ipDiscovery.ReportIP(reportedIP, port, reporterIDStr, sourceIP)
+	// The full ID, not a prefix: this keys the distinct-reporter threshold, so a
+	// truncated key would let two peers count as one.
+	s.ipDiscovery.ReportIP(reportedIP, port, fmt.Sprintf("%x", remoteID), sourceIP)
 }
 
 // updateENRWithDiscoveredIP updates every identity's ENR with the discovered IP.
@@ -1660,13 +1650,6 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 			"isIPv6": isIPv6,
 		}).Info("IP discovery: consensus reached, updated ENR")
 
-		if err := s.storeENR(id.storeKey, id.localNode.Record()); err != nil {
-			s.config.Logger.WithError(err).Warn("failed to store updated ENR")
-		}
-
-		// Keep the discv4 service's ENR in sync (EL identity only).
-		if id.servesEL && s.discv4Service != nil {
-			s.discv4Service.SetLocalENR(id.localNode.Record())
-		}
+		s.publishENR(id)
 	}
 }
