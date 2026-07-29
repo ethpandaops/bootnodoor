@@ -254,8 +254,8 @@ func New(cfg *Config) (*Service, error) {
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
 			OnNodeFound: func(n *nodes.Node) bool {
-				// Filter by fork ID before adding to table
-				if n.Record() != nil && s.enrManager != nil {
+				// Filter by fork ID before adding to table (skipped in serve-all).
+				if !cfg.ServeAll && n.Record() != nil && s.enrManager != nil {
 					if isEL, _ := s.enrManager.FilterELNode(n.Record()); !isEL {
 						// Mark as bad node
 						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
@@ -337,8 +337,8 @@ func New(cfg *Config) (*Service, error) {
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
 			OnNodeFound: func(n *nodes.Node) bool {
-				// Filter by fork digest before adding to table
-				if n.Record() != nil && s.enrManager != nil {
+				// Filter by fork digest before adding to table (skipped in serve-all).
+				if !cfg.ServeAll && n.Record() != nil && s.enrManager != nil {
 					if !s.enrManager.FilterCLNode(n.Record()) {
 						// Mark as bad node
 						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
@@ -1042,14 +1042,26 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 	if s.enrManager != nil {
 		nodeID := n.ID()
 
-		if isEL, _ := s.enrManager.FilterELNode(n.Record()); isEL && s.elTable != nil && s.elNodeDB != nil {
-			// Look up the generic node from the table
+		isEL, _ := s.enrManager.FilterELNode(n.Record())
+		isCL := s.enrManager.FilterCLNode(n.Record())
+
+		// Serve-all pools a node into every table, so refresh last-seen wherever it
+		// actually lives (checking both tables) rather than by classification.
+		if s.config.ServeAll {
+			isEL = s.elTable != nil
+			isCL = s.clTable != nil
+		} else if isEL {
+			// Classified mode is EL-xor-CL: keep the original precedence.
+			isCL = false
+		}
+
+		if isEL && s.elTable != nil && s.elNodeDB != nil {
 			if genericNode := s.elTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
 				s.elNodeDB.QueueUpdate(genericNode)
 			}
-		} else if s.enrManager.FilterCLNode(n.Record()) && s.clTable != nil && s.clNodeDB != nil {
-			// Look up the generic node from the table
+		}
+		if isCL && s.clTable != nil && s.clNodeDB != nil {
 			if genericNode := s.clTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
 				s.clNodeDB.QueueUpdate(genericNode)
@@ -1069,7 +1081,8 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	// A shared identity serves both layers under one ID, so classify a known
 	// requester by its ENR and serve only its layer(s); an unclassifiable known
 	// peer gets nothing, an unknown one (no ENR yet) falls through to both.
-	if id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
+	// Serve-all skips this: every requester gets nodes from every served layer.
+	if !s.config.ServeAll && id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
 		serveEL, _ = s.enrManager.FilterELNode(sourceRecord)
 		serveCL = s.enrManager.FilterCLNode(sourceRecord)
@@ -1267,6 +1280,13 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	// Determine layer
 	isEL, _ := s.enrManager.FilterELNode(n.Record())
 	isCL := s.enrManager.FilterCLNode(n.Record())
+
+	// Serve-all: skip classification and pool into every enabled table, so a node
+	// is admitted regardless of whether it advertises an eth/eth2 field.
+	if s.config.ServeAll {
+		isEL = s.elTable != nil
+		isCL = s.clTable != nil
+	}
 
 	// Add to appropriate table(s)
 	added := false

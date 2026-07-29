@@ -112,6 +112,12 @@ type Config struct {
 	// EnableDiscv5 enables Discovery v5 protocol (default: true)
 	EnableDiscv5 bool
 
+	// ServeAll disables EL/CL classification and fork-ID/digest filtering. Every
+	// discovered node is pooled (into every enabled table) and served to every
+	// requester, turning the bootnode into a plain discv5 rendezvous that relays
+	// all peers regardless of eth/eth2 fields. Default: false (classify + filter).
+	ServeAll bool
+
 	// SessionLifetime is the discv5 session lifetime (default: 12 hours)
 	SessionLifetime time.Duration
 
