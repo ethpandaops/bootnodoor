@@ -134,7 +134,7 @@ func (s *Session) RecordSentNonce(nonce []byte) {
 
 	s.sentNonces = append(s.sentNonces, string(nonce))
 	if len(s.sentNonces) > maxSentNonces {
-		s.sentNonces = s.sentNonces[len(s.sentNonces)-maxSentNonces:]
+		s.sentNonces = s.sentNonces[1:]
 	}
 }
 

@@ -139,11 +139,9 @@ func (n *Node) PublicKey() *ecdsa.PublicKey {
 	return n.pubKey
 }
 
-// ENR returns the node's ENR record.
+// ENR returns the node's ENR record. Alias for Record.
 func (n *Node) ENR() *enr.Record {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.enr
+	return n.Record()
 }
 
 // Addr returns the node's UDP address.

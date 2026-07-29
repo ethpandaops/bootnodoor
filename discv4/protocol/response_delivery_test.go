@@ -89,7 +89,7 @@ func TestDuplicateResponsesWaiterGetsOneNoLeak(t *testing.T) {
 	for i := 0; i < dups; i++ {
 		go func() {
 			defer wg.Done()
-			for _, r := range h.getPendingRequests(hash, to.ID()) {
+			for _, r := range h.pendingRequestsFrom(hash, to.ID(), to.Addr(), PingPacket) {
 				h.deliverResponse(r, "pong")
 			}
 		}()

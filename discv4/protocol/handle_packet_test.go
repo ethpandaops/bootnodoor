@@ -21,16 +21,11 @@ func encodeFrom(t *testing.T, key *ecdsa.PrivateKey, msg Packet) ([]byte, []byte
 	return data, hash
 }
 
-func packetHandler(t *testing.T) (*Handler, *recordingTransport, func()) {
-	h, tr, cancel := proofHandler(t)
-	return h, tr, cancel
-}
-
 // A peer's claimed source address must not become the node's canonical address:
 // every sender reads it and sendNeighbors republishes it, so an unauthenticated
 // packet could otherwise steer our traffic and poison what we tell others.
 func TestHandlePacketDoesNotMoveCanonicalAddress(t *testing.T) {
-	h, _, cancel := packetHandler(t)
+	h, _, cancel := proofHandler(t)
 	defer cancel()
 
 	peerKey, err := crypto.GenerateKey()
@@ -59,7 +54,7 @@ func TestHandlePacketDoesNotMoveCanonicalAddress(t *testing.T) {
 // An expired packet must not refresh liveness or fire OnNodeSeen. The node has to
 // pre-exist, because creating one stamps LastSeen.
 func TestHandlePacketExpiredTouchesNothing(t *testing.T) {
-	h, _, cancel := packetHandler(t)
+	h, _, cancel := proofHandler(t)
 	defer cancel()
 
 	seen := 0
@@ -96,7 +91,7 @@ func TestHandlePacketExpiredTouchesNothing(t *testing.T) {
 // An unbonded FINDNODE is refused, so it must not admit the node either — that is
 // the callback which can spawn outbound traffic toward an unproven address.
 func TestHandlePacketUnbondedFindnodeDoesNotAdmit(t *testing.T) {
-	h, _, cancel := packetHandler(t)
+	h, _, cancel := proofHandler(t)
 	defer cancel()
 
 	seen := 0
@@ -124,7 +119,7 @@ func TestHandlePacketUnbondedFindnodeDoesNotAdmit(t *testing.T) {
 // ponged; otherwise it is pinged at its old address forever, never bonds, and is
 // refused service permanently.
 func TestHandlePacketMovedPeerRebondsAtNewAddress(t *testing.T) {
-	h, tr, cancel := packetHandler(t)
+	h, tr, cancel := proofHandler(t)
 	defer cancel()
 
 	peerKey, err := crypto.GenerateKey()

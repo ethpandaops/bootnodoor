@@ -225,7 +225,6 @@ func (f *ForkDigestFilter) recordOutcome(outcome clOutcome, forkDigest ForkDiges
 			f.logger.Debugf("Rejected node: unknown fork digest %s (current: %s, %d historical digests known)",
 				forkDigest.String(), f.currentForkDigest.String(), len(f.historicalDigests))
 		}
-	case outcomeNotCL:
 	}
 }
 
@@ -450,38 +449,6 @@ func (f *ForkDigestFilter) GetOldDigests() map[string]time.Duration {
 	}
 
 	return result
-}
-
-// GetAcceptedCurrent returns the count of nodes accepted with current fork digest.
-func (f *ForkDigestFilter) GetAcceptedCurrent() int {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	return f.acceptedCurrent
-}
-
-// GetAcceptedOld returns the count of nodes accepted with old fork digests.
-func (f *ForkDigestFilter) GetAcceptedOld() int {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	return f.acceptedOld
-}
-
-// GetRejectedInvalid returns the count of nodes rejected due to invalid fork digest.
-func (f *ForkDigestFilter) GetRejectedInvalid() int {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	return f.rejectedInvalid
-}
-
-// GetTotalChecks returns the total number of filter checks performed.
-func (f *ForkDigestFilter) GetTotalChecks() int {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	return f.totalChecks
 }
 
 // GetPreviousForkDigest returns the previous fork digest as a hex string.

@@ -140,10 +140,9 @@ type PendingRequest struct {
 	// ToNode is the destination node
 	ToNode *node.Node
 
-	// DestIP is the IP the request was sent to, snapshotted at send time.
-	// ToNode.Addr() is unusable for verifying a response's origin because
-	// lookupOrCreateNode deliberately never rewrites it, but the node object can
-	// still be re-addressed by a proven promotion between send and response.
+	// DestIP is the IP the request was sent to, snapshotted at send time; see
+	// lookupOrCreateNode. ToNode.Addr() cannot serve here because promoteAddr can
+	// move it between send and response.
 	DestIP net.IP
 
 	// PacketType is the type of request
@@ -362,7 +361,6 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 	lastPingSent := fromNode.LastPingSent()
 	timeSinceLastPing := time.Since(lastPingSent)
 
-	// Only spawn goroutine if we're actually going to ping (don't create unnecessary goroutines)
 	if timeSinceLastPing > 100*time.Millisecond {
 		// Ping the source we just ponged, not the canonical address: a peer that
 		// moved is only reachable at its new address, and its PONG from there is
@@ -986,10 +984,9 @@ func (h *Handler) lookupOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *
 	return n
 }
 
-// promoteAddr installs a proven endpoint as n's canonical address.
-//
-// Only handlePong may call this, and only for the address a matched PING was sent
-// to — see lookupOrCreateNode for why nothing else may move it.
+// promoteAddr installs a proven endpoint as n's canonical address. Only
+// handlePong may call it, for the address a matched PING was sent to; see
+// lookupOrCreateNode for why nothing else may move it.
 func (h *Handler) promoteAddr(n *node.Node, proven *net.UDPAddr) {
 	if n == nil || proven == nil || proven.IP == nil {
 		return
@@ -1017,12 +1014,11 @@ func (h *Handler) noteSeen(n *node.Node) {
 	n.IncrementPacketsReceived()
 }
 
-// noteProven is noteSeen plus OnNodeSeen, which admits the node to the routing
-// table and can spawn outbound PING/ENRREQUEST traffic toward it. It requires a
-// proven or solicited source.
+// noteProven fires OnNodeSeen, which admits the node to the routing table and can
+// spawn outbound PING/ENRREQUEST traffic toward it. It requires a proven or
+// solicited source, so it sits behind each handler's gate while noteSeen runs
+// ahead of it.
 func (h *Handler) noteProven(n *node.Node) {
-	h.noteSeen(n)
-
 	if h.config.OnNodeSeen != nil {
 		h.config.OnNodeSeen(n, time.Now())
 	}
@@ -1058,9 +1054,8 @@ func requestKey(hash []byte, id node.ID) string {
 // addPendingRequest registers a new pending request. A second FINDNODE to a
 // peer with one already in flight is rejected: NEIGHBORS carries no reply
 // token, so two in-flight FINDNODEs to one peer cannot be told apart.
-// destAddr must be the address the caller sends the packet to, captured once:
-// toNode.Addr() is rewritten by concurrent inbound packets, so reading it here
-// can record an endpoint the request never went to.
+// destAddr must be the address the caller sends the packet to, captured once,
+// so the recorded and actual destinations cannot diverge.
 func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte, destAddr *net.UDPAddr) (*PendingRequest, error) {
 	var destIP net.IP
 	if destAddr != nil && destAddr.IP != nil {
@@ -1088,14 +1083,6 @@ func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType b
 	h.requests[key] = append(h.requests[key], req)
 
 	return req, nil
-}
-
-// getPendingRequests returns the pending requests matching a reply token and
-// its sender, so a response can only resolve requests sent to that peer.
-func (h *Handler) getPendingRequests(replyTok []byte, id node.ID) []*PendingRequest {
-	h.requestsMu.RLock()
-	defer h.requestsMu.RUnlock()
-	return append([]*PendingRequest(nil), h.requests[requestKey(replyTok, id)]...)
 }
 
 // pendingRequestsFrom returns the pending requests of the given type that match

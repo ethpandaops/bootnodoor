@@ -19,6 +19,16 @@ import (
 //
 // Returns ErrRecordTooLarge if the encoded record exceeds 300 bytes.
 func (r *Record) EncodeRLPBytes() ([]byte, error) {
+	// A bootnode serves the same closest-node set to every requester, so the hot
+	// records are re-encoded concurrently; taking the write lock for a cache read
+	// serialises that on one mutex.
+	r.mu.RLock()
+	cached := r.raw
+	r.mu.RUnlock()
+	if len(cached) > 0 {
+		return cached, nil
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

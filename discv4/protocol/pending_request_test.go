@@ -116,7 +116,7 @@ func TestSamePeerDuplicateRequestsBothComplete(t *testing.T) {
 	}
 
 	h.removePendingRequest(req1)
-	if got := len(h.getPendingRequests(hash, n.ID())); got != 1 {
+	if got := len(h.pendingRequestsFrom(hash, n.ID(), n.Addr(), ENRRequestPacket)); got != 1 {
 		t.Fatalf("after removing one duplicate, %d pending remain, want 1", got)
 	}
 

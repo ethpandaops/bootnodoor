@@ -477,7 +477,7 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr, localA
 	// Only now is the sender proven: AES-GCM over the header authenticates
 	// possession of the session key, and the source address is not part of the
 	// AAD, so a NAT-rebound peer decrypts fine from its new address.
-	if sess.Addr().String() != from.String() {
+	if cur := sess.Addr(); cur == nil || cur.Port != from.Port || !cur.IP.Equal(from.IP) {
 		h.config.Logger.WithFields(logrus.Fields{
 			"nodeID":  srcNodeID.String()[:16],
 			"oldAddr": sess.Addr(),
@@ -1159,126 +1159,7 @@ func (h *Handler) handleTalkResp(msg *TalkResp, remoteID node.ID, from *net.UDPA
 // to send arbitrary messages through the protocol handler.
 // remoteNode is optional - if provided, it will be stored in pending handshakes for WHOAREYOU responses.
 func (h *Handler) SendMessage(msg Message, remoteID node.ID, to *net.UDPAddr, remoteNode *node.Node) error {
-	// Look up session
-	sess := h.config.Sessions.Get(remoteID)
-
-	var packetBytes []byte
-	var err error
-
-	if sess == nil {
-		// No session - send random packet to trigger WHOAREYOU from receiver
-
-		// Store pending message for handshake completion
-		// Include the node object if we have it (needed for handshake)
-		handshakeKey := makeHandshakeKey(remoteID, to)
-		now := time.Now()
-		pending := &PendingHandshake{
-			Message:    msg,
-			ToNode:     remoteNode,
-			ToAddr:     to,
-			ToNodeID:   remoteID,
-			CreatedAt:  now,
-			LastRetry:  now,
-			RetryCount: 0,
-			MaxRetries: 3, // Retry up to 3 times before giving up
-		}
-
-		h.mu.Lock()
-		accepted := h.addPendingHandshake(handshakeKey, pending)
-		h.mu.Unlock()
-
-		if !accepted {
-			return fmt.Errorf("pending handshake limit reached")
-		}
-
-		// Log if we don't have node info for potential handshake
-		if remoteNode == nil {
-			h.config.Logger.WithField("remoteID", remoteID).Debug("handler: sending random packet without node info, may fail handshake if WHOAREYOU received")
-		}
-
-		// Encode random packet (go-ethereum style)
-		// This will be 91 bytes: IV(16) + header(23) + authdata(32) + random(20)
-		packetBytes, err = EncodeRandomPacket(h.config.LocalNode.ID(), remoteID)
-		if err != nil {
-			return fmt.Errorf("failed to encode random packet: %w", err)
-		}
-	} else {
-		// Have session - encrypt and send normally
-
-		// Encode message plaintext: message-type (1 byte) + RLP-encoded message
-		msgBytes, err := msg.Encode()
-		if err != nil {
-			return fmt.Errorf("failed to encode message: %w", err)
-		}
-
-		// Build plaintext: message type + message data
-		plaintext := make([]byte, 1+len(msgBytes))
-		plaintext[0] = msg.Type()
-		copy(plaintext[1:], msgBytes)
-
-		// Generate nonce
-		nonce, err := crypto.GenerateRandomBytes(12)
-		if err != nil {
-			return fmt.Errorf("failed to generate nonce: %w", err)
-		}
-
-		// Get local node ID
-		localNodeID := h.config.LocalNode.ID()
-
-		// Authdata for ordinary message with session: srcID (32 bytes)
-		authdata := localNodeID[:]
-
-		// Build unmasked header data for GCM authentication
-		// This returns: maskingIV, unmasked headerData (IV || header || authdata)
-		maskingIV, headerData, err := BuildOrdinaryHeaderData(localNodeID, nonce, authdata)
-		if err != nil {
-			return fmt.Errorf("failed to build header data: %w", err)
-		}
-
-		// Encrypt message using session key
-		// GCM uses unmasked headerData as additional authenticated data
-		ciphertext, err := session.EncryptMessage(sess.EncryptionKey(), nonce, headerData, plaintext)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt message: %w", err)
-		}
-
-		// Now encode the full packet with the encrypted message
-		// This uses the same maskingIV to ensure consistency
-		packetBytes, err = EncodeOrdinaryPacket(localNodeID, remoteID, maskingIV, nonce, authdata, ciphertext)
-		if err != nil {
-			return fmt.Errorf("failed to encode ordinary packet: %w", err)
-		}
-
-		// Remembered so a WHOAREYOU quoting this nonce can be told apart from a
-		// forged one; answering a forged challenge would replace the session keys.
-		sess.RecordSentNonce(nonce)
-	}
-
-	// Send via UDP transport
-	h.mu.RLock()
-	transport := h.transport
-	h.mu.RUnlock()
-
-	if transport == nil {
-		return fmt.Errorf("transport not initialized")
-	}
-
-	if err := transport.SendTo(packetBytes, to); err != nil {
-		return fmt.Errorf("failed to send packet: %w", err)
-	}
-
-	h.mu.Lock()
-	h.packetsSent++
-	h.mu.Unlock()
-
-	h.config.Logger.WithFields(logrus.Fields{
-		"type":   msg.Type(),
-		"to":     to,
-		"nodeID": remoteID,
-		"size":   len(packetBytes),
-	}).Trace("sent message")
-
-	return nil
+	return h.SendMessageFrom(msg, remoteID, to, remoteNode, nil)
 }
 
 // SendMessageFrom sends a message to a remote node from a specific local address.
