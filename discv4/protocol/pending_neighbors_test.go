@@ -70,7 +70,7 @@ func TestNeighborsAccumulationCapped(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket); err != nil {
+	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket, from.Addr()); err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
 
@@ -104,7 +104,7 @@ func TestNeighborsDeliveredToWaiter(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	req, err := h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	req, err := h.addPendingRequest([]byte("req"), from, FindnodePacket, from.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestNeighborsCapAppliesBeforeNodePersistence(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket); err != nil {
+	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket, from.Addr()); err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
 
@@ -227,7 +227,7 @@ func TestFindnodeRemovesCompletedRequest(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for h.findPendingFindnode(to.ID()) == nil {
+	for h.findPendingFindnode(to.ID(), to.Addr()) == nil {
 		if time.Now().After(deadline) {
 			t.Fatal("pending FINDNODE never registered")
 		}
@@ -257,7 +257,7 @@ func TestNeighborsPersistenceCapExactUnderConcurrency(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket); err != nil {
+	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket, from.Addr()); err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
 
@@ -294,7 +294,7 @@ func TestNeighborsAfterDeliveryPersistNothing(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	req, err := h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	req, err := h.addPendingRequest([]byte("req"), from, FindnodePacket, from.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}

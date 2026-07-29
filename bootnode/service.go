@@ -340,9 +340,8 @@ func (s *Service) initDiscv4(id *identity) error {
 	discv4Config.OnNodeSeen = func(n *v4node.Node, timestamp time.Time) {
 		s.onNodeSeenV4(n, timestamp)
 	}
-	discv4Config.OnPongReceived = func(from *v4node.Node, ip net.IP, port uint16) {
-		sourceIP := from.Addr().IP
-		s.onPongReceived(from.IDBytes(), sourceIP, ip, port)
+	discv4Config.OnPongReceived = func(from *v4node.Node, provenAddr *net.UDPAddr, ip net.IP, port uint16) {
+		s.onPongReceived(from.IDBytes(), provenAddr.IP, ip, port)
 	}
 	// OnENRRequest: discv4 service handles this internally using LocalENR from config
 	// No callback needed - it will automatically respond with the ENR

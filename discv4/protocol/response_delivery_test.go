@@ -21,7 +21,8 @@ func TestDeliverResponseNeverBlocks(t *testing.T) {
 	h, cancel := newTestHandler(t)
 	defer cancel()
 
-	req, err := h.addPendingRequest([]byte("reqhash"), makeDiscv4Node(t), PingPacket)
+	dest := makeDiscv4Node(t)
+	req, err := h.addPendingRequest([]byte("reqhash"), dest, PingPacket, dest.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestDuplicateResponsesWaiterGetsOneNoLeak(t *testing.T) {
 
 	hash := []byte("reqhash")
 	to := makeDiscv4Node(t)
-	req, err := h.addPendingRequest(hash, to, PingPacket)
+	req, err := h.addPendingRequest(hash, to, PingPacket, to.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}

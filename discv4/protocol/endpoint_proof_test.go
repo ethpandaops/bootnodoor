@@ -58,7 +58,7 @@ func bondAt(t *testing.T, h *Handler, n *node.Node, addr *net.UDPAddr) {
 
 	n.SetAddr(addr)
 	hash := []byte("ping-hash-" + addr.String())
-	if _, err := h.addPendingRequest(hash, n, PingPacket); err != nil {
+	if _, err := h.addPendingRequest(hash, n, PingPacket, n.Addr()); err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
 	pong := &Pong{ReplyTok: hash, Expiration: MakeExpiration(20 * time.Second)}
@@ -162,10 +162,10 @@ func TestPongMatchingRejectsNonPingRequest(t *testing.T) {
 	addr := n.Addr()
 
 	called := 0
-	h.config.OnPongReceived = func(*node.Node, net.IP, uint16) { called++ }
+	h.config.OnPongReceived = func(*node.Node, *net.UDPAddr, net.IP, uint16) { called++ }
 
 	hash := []byte("enr-request-hash")
-	if _, err := h.addPendingRequest(hash, n, ENRRequestPacket); err != nil {
+	if _, err := h.addPendingRequest(hash, n, ENRRequestPacket, n.Addr()); err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
 
@@ -196,10 +196,10 @@ func TestReplayedPongAppliesSideEffectsOnce(t *testing.T) {
 	addr := n.Addr()
 
 	called := 0
-	h.config.OnPongReceived = func(*node.Node, net.IP, uint16) { called++ }
+	h.config.OnPongReceived = func(*node.Node, *net.UDPAddr, net.IP, uint16) { called++ }
 
 	hash := []byte("ping-hash")
-	if _, err := h.addPendingRequest(hash, n, PingPacket); err != nil {
+	if _, err := h.addPendingRequest(hash, n, PingPacket, n.Addr()); err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
 
@@ -219,6 +219,47 @@ func TestReplayedPongAppliesSideEffectsOnce(t *testing.T) {
 	}
 }
 
+// The proven address must reach the IP-discovery callback directly. Reading it
+// back off the node would hand over whatever address the last inbound packet
+// set, which is attacker-controlled and undoes the endpoint proof.
+func TestPongCallbackReceivesProvenAddress(t *testing.T) {
+	h, _, cancel := proofHandler(t)
+	defer cancel()
+
+	n, _ := makeKeyedNode(t, 30303)
+	sentTo := n.Addr()
+
+	var got *net.UDPAddr
+	h.config.OnPongReceived = func(_ *node.Node, provenAddr *net.UDPAddr, _ net.IP, _ uint16) {
+		got = provenAddr
+	}
+
+	hash := []byte("ping-hash")
+	if _, err := h.addPendingRequest(hash, n, PingPacket, sentTo); err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
+
+	// A concurrent packet from the same identity rewrites the node's address
+	// before the PONG is processed, exactly as getOrCreateNode does.
+	n.SetAddr(&net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 30303})
+
+	pong := &Pong{
+		ReplyTok:   hash,
+		To:         NewEndpoint(&net.UDPAddr{IP: net.IPv4(9, 9, 9, 9), Port: 30303}, 0),
+		Expiration: MakeExpiration(20 * time.Second),
+	}
+	if err := h.handlePong(n, sentTo, pong); err != nil {
+		t.Fatalf("handlePong: %v", err)
+	}
+
+	if got == nil {
+		t.Fatal("OnPongReceived never fired for a solicited PONG")
+	}
+	if !got.IP.Equal(sentTo.IP) {
+		t.Fatalf("callback got %s, want the proven %s", got.IP, sentTo.IP)
+	}
+}
+
 // A PONG whose source is not the address the PING went to proves only that
 // somebody received that PING, which is what the spoofing attack relies on.
 func TestPongFromWrongSourceRejected(t *testing.T) {
@@ -229,7 +270,7 @@ func TestPongFromWrongSourceRejected(t *testing.T) {
 	sentTo := n.Addr()
 
 	hash := []byte("ping-hash")
-	if _, err := h.addPendingRequest(hash, n, PingPacket); err != nil {
+	if _, err := h.addPendingRequest(hash, n, PingPacket, n.Addr()); err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
 

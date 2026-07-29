@@ -69,11 +69,11 @@ func TestIdenticalRequestsToDifferentPeersDoNotAlias(t *testing.T) {
 	nodeB, keyB := makeKeyedNode(t, 30302)
 	hash := []byte("same-second-packet")
 
-	reqA, err := h.addPendingRequest(hash, nodeA, ENRRequestPacket)
+	reqA, err := h.addPendingRequest(hash, nodeA, ENRRequestPacket, nodeA.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest A: %v", err)
 	}
-	reqB, err := h.addPendingRequest(hash, nodeB, ENRRequestPacket)
+	reqB, err := h.addPendingRequest(hash, nodeB, ENRRequestPacket, nodeB.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest B: %v", err)
 	}
@@ -106,11 +106,11 @@ func TestSamePeerDuplicateRequestsBothComplete(t *testing.T) {
 	n, key := makeKeyedNode(t, 30301)
 	hash := []byte("same-second-packet")
 
-	req1, err := h.addPendingRequest(hash, n, ENRRequestPacket)
+	req1, err := h.addPendingRequest(hash, n, ENRRequestPacket, n.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest 1: %v", err)
 	}
-	req2, err := h.addPendingRequest(hash, n, ENRRequestPacket)
+	req2, err := h.addPendingRequest(hash, n, ENRRequestPacket, n.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest 2: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestStaleENRResponseNotInstalled(t *testing.T) {
 	n.SetENR(newer)
 
 	hash := []byte("pending")
-	req, err := h.addPendingRequest(hash, n, ENRRequestPacket)
+	req, err := h.addPendingRequest(hash, n, ENRRequestPacket, n.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestMismatchedIdentityENRResponseDropped(t *testing.T) {
 	_, otherKey := makeKeyedNode(t, 30302)
 
 	hash := []byte("pending")
-	req, err := h.addPendingRequest(hash, n, ENRRequestPacket)
+	req, err := h.addPendingRequest(hash, n, ENRRequestPacket, n.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest: %v", err)
 	}
@@ -213,11 +213,11 @@ func TestIdenticalFindnodeToDifferentPeersSeparateAccumulators(t *testing.T) {
 	nodeB, _ := makeKeyedNode(t, 30302)
 	hash := []byte("same-target-same-second")
 
-	reqA, err := h.addPendingRequest(hash, nodeA, FindnodePacket)
+	reqA, err := h.addPendingRequest(hash, nodeA, FindnodePacket, nodeA.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest A: %v", err)
 	}
-	reqB, err := h.addPendingRequest(hash, nodeB, FindnodePacket)
+	reqB, err := h.addPendingRequest(hash, nodeB, FindnodePacket, nodeB.Addr())
 	if err != nil {
 		t.Fatalf("addPendingRequest B: %v", err)
 	}
@@ -252,10 +252,10 @@ func TestSecondFindnodeToSamePeerRejected(t *testing.T) {
 	defer cancel()
 
 	n, _ := makeKeyedNode(t, 30301)
-	if _, err := h.addPendingRequest([]byte("hash-1"), n, FindnodePacket); err != nil {
+	if _, err := h.addPendingRequest([]byte("hash-1"), n, FindnodePacket, n.Addr()); err != nil {
 		t.Fatalf("first findnode: %v", err)
 	}
-	if _, err := h.addPendingRequest([]byte("hash-2"), n, FindnodePacket); err == nil {
+	if _, err := h.addPendingRequest([]byte("hash-2"), n, FindnodePacket, n.Addr()); err == nil {
 		t.Fatal("second in-flight findnode to the same peer was accepted")
 	}
 }

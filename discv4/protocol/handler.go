@@ -38,7 +38,12 @@ type OnNodeSeenCallback func(n *node.Node, timestamp time.Time)
 
 // OnPongReceivedCallback is called when a PONG response is received.
 // The ip and port parameters contain our external address as seen by the remote peer.
-type OnPongReceivedCallback func(from *node.Node, ip net.IP, port uint16)
+//
+// provenAddr is the address the answered PING was sent to. Callers must use it
+// rather than from.Addr(), which any later inbound packet rewrites, including a
+// spoofed one; attributing a report to that address would undo the endpoint
+// proof this callback is gated on.
+type OnPongReceivedCallback func(from *node.Node, provenAddr *net.UDPAddr, ip net.IP, port uint16)
 
 // Handler handles incoming and outgoing discv4 protocol messages.
 //
@@ -393,11 +398,12 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 	}
 
 	// Bind the bond to the address we proved, not the packet's source.
-	fromNode.MarkPongReceived(h.config.BondExpiration, &net.UDPAddr{IP: req.DestIP, Port: from.Port})
+	provenAddr := &net.UDPAddr{IP: req.DestIP, Port: from.Port}
+	fromNode.MarkPongReceived(h.config.BondExpiration, provenAddr)
 
 	// The To field in PONG contains our address as seen by the remote peer.
 	if h.config.OnPongReceived != nil && pong.To.IP != nil && pong.To.UDP > 0 {
-		h.config.OnPongReceived(fromNode, pong.To.IP, pong.To.UDP)
+		h.config.OnPongReceived(fromNode, provenAddr, pong.To.IP, pong.To.UDP)
 	}
 
 	h.deliverResponse(req, pong)
@@ -464,9 +470,11 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 	}
 
 	// Only accept NEIGHBORS in response to a FINDNODE we actually sent to this
-	// node. Dropping unsolicited NEIGHBORS prevents a peer we never queried from
-	// making us accumulate node records without bound.
-	matchedReq := h.findPendingFindnode(fromNode.ID())
+	// address. Dropping unsolicited NEIGHBORS prevents a peer we never queried
+	// from making us accumulate node records without bound; requiring the source
+	// to be the address queried stops a peer answering from a spoofed one.
+	// NEIGHBORS carries no reply token, so the match is by node ID plus endpoint.
+	matchedReq := h.findPendingFindnode(fromNode.ID(), from)
 	if matchedReq == nil {
 		return nil
 	}
@@ -593,10 +601,12 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 		"enr_seq": resp.Record.Seq(),
 	}).Debug("Received ENRRESPONSE")
 
-	// Only a response to a request we actually sent to this peer may touch any
-	// state: ENRRESPONSE carries no expiration, so an unsolicited replay could
-	// otherwise roll the node back to an older record.
-	reqs := h.getPendingRequests(resp.ReplyTok, fromNode.ID())
+	// Only a response to an ENRREQUEST we actually sent to this address may touch
+	// any state: ENRRESPONSE carries no expiration, so an unsolicited replay could
+	// otherwise roll the node back to an older record. The type and destination
+	// must both match, or a peer could answer with the hash of some other packet
+	// we sent it and resolve the wrong waiter.
+	reqs := h.pendingRequestsFrom(resp.ReplyTok, fromNode.ID(), from, ENRRequestPacket)
 	if len(reqs) == 0 {
 		return nil
 	}
@@ -628,13 +638,17 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 
 // Ping sends a PING request to a node.
 func (h *Handler) Ping(n *node.Node) (*Pong, error) {
+	// Read the address once: inbound packets rewrite it, and the endpoint proof
+	// requires the recorded destination to be the one we actually sent to.
+	destAddr := n.Addr()
+
 	// Build PING message
 	ping := &Ping{
 		Version: 4,
 		// A bootnode serves no RLPx, so it advertises tcp-port 0; the recipient's
 		// tcp is not the sender's to set (spec: to = [ip, udp-port, 0]).
 		From:       NewEndpoint(h.config.LocalAddr, 0),
-		To:         NewEndpoint(n.Addr(), 0),
+		To:         NewEndpoint(destAddr, 0),
 		Expiration: MakeExpiration(h.config.ExpirationWindow),
 	}
 
@@ -650,14 +664,14 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 	}
 
 	// Register pending request; removal is deferred so every exit path clears it.
-	req, err := h.addPendingRequest(hash, n, PingPacket)
+	req, err := h.addPendingRequest(hash, n, PingPacket, destAddr)
 	if err != nil {
 		return nil, err
 	}
 	defer h.removePendingRequest(req)
 
 	// Send packet
-	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
+	if err := h.transport.SendTo(packet, destAddr); err != nil {
 		return nil, err
 	}
 
@@ -713,14 +727,15 @@ func (h *Handler) Findnode(n *node.Node, target []byte) ([]*node.Node, error) {
 	// Register pending request. Removal is deferred so every exit path clears
 	// it: a completed request left in the map keeps matching later NEIGHBORS
 	// from that node and reopens collection windows until cleanup runs.
-	req, err := h.addPendingRequest(hash, n, FindnodePacket)
+	destAddr := n.Addr()
+	req, err := h.addPendingRequest(hash, n, FindnodePacket, destAddr)
 	if err != nil {
 		return nil, err
 	}
 	defer h.removePendingRequest(req)
 
 	// Send packet
-	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
+	if err := h.transport.SendTo(packet, destAddr); err != nil {
 		return nil, err
 	}
 
@@ -767,14 +782,15 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 	}
 
 	// Register pending request; removal is deferred so every exit path clears it.
-	pendingReq, err := h.addPendingRequest(hash, n, ENRRequestPacket)
+	destAddr := n.Addr()
+	pendingReq, err := h.addPendingRequest(hash, n, ENRRequestPacket, destAddr)
 	if err != nil {
 		return nil, err
 	}
 	defer h.removePendingRequest(pendingReq)
 
 	// Send packet
-	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
+	if err := h.transport.SendTo(packet, destAddr); err != nil {
 		return nil, err
 	}
 
@@ -958,10 +974,13 @@ func requestKey(hash []byte, id node.ID) string {
 // addPendingRequest registers a new pending request. A second FINDNODE to a
 // peer with one already in flight is rejected: NEIGHBORS carries no reply
 // token, so two in-flight FINDNODEs to one peer cannot be told apart.
-func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte) (*PendingRequest, error) {
+// destAddr must be the address the caller sends the packet to, captured once:
+// toNode.Addr() is rewritten by concurrent inbound packets, so reading it here
+// can record an endpoint the request never went to.
+func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte, destAddr *net.UDPAddr) (*PendingRequest, error) {
 	var destIP net.IP
-	if addr := toNode.Addr(); addr != nil && addr.IP != nil {
-		destIP = append(net.IP(nil), addr.IP...)
+	if destAddr != nil && destAddr.IP != nil {
+		destIP = append(net.IP(nil), destAddr.IP...)
 	}
 
 	req := &PendingRequest{
@@ -993,6 +1012,25 @@ func (h *Handler) getPendingRequests(replyTok []byte, id node.ID) []*PendingRequ
 	h.requestsMu.RLock()
 	defer h.requestsMu.RUnlock()
 	return append([]*PendingRequest(nil), h.requests[requestKey(replyTok, id)]...)
+}
+
+// pendingRequestsFrom returns the pending requests of the given type that match
+// this reply token and were sent to this address.
+func (h *Handler) pendingRequestsFrom(replyTok []byte, id node.ID, from *net.UDPAddr, packetType byte) []*PendingRequest {
+	if from == nil || from.IP == nil {
+		return nil
+	}
+
+	h.requestsMu.RLock()
+	defer h.requestsMu.RUnlock()
+
+	var out []*PendingRequest
+	for _, req := range h.requests[requestKey(replyTok, id)] {
+		if req.PacketType == packetType && req.DestIP != nil && req.DestIP.Equal(from.IP) {
+			out = append(out, req)
+		}
+	}
+	return out
 }
 
 // consumePendingPing removes and returns the pending PING this PONG answers, or
@@ -1038,10 +1076,19 @@ func (h *Handler) consumePendingPing(replyTok []byte, id node.ID, from *net.UDPA
 
 // findPendingFindnode returns the pending FINDNODE request awaiting a response
 // from the given node, or nil if none exists.
-func (h *Handler) findPendingFindnode(id node.ID) *PendingRequest {
+func (h *Handler) findPendingFindnode(id node.ID, from *net.UDPAddr) *PendingRequest {
+	if from == nil || from.IP == nil {
+		return nil
+	}
+
 	h.requestsMu.RLock()
 	defer h.requestsMu.RUnlock()
-	return h.pendingFindnodeLocked(id)
+
+	req := h.pendingFindnodeLocked(id)
+	if req == nil || req.DestIP == nil || !req.DestIP.Equal(from.IP) {
+		return nil
+	}
+	return req
 }
 
 func (h *Handler) pendingFindnodeLocked(id node.ID) *PendingRequest {
