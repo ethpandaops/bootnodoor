@@ -13,6 +13,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -191,6 +192,37 @@ func (e *ENRResponse) Name() string { return "ENRRESPONSE/v4" }
 
 // Kind returns the packet type byte.
 func (e *ENRResponse) Kind() byte { return ENRResponsePacket }
+
+// EncodeRLP implements rlp.Encoder so the embedded ENR record is serialized via
+// enr.Record's own RLP encoding.
+//
+// Without this, geth's rlp package does not recognize enr.Record as an encoder
+// (its EncodeRLP has signature ([]byte, error), not the io.Writer form the
+// interface requires) and, because enr.Record has no exported fields, would
+// serialize the record as an empty RLP list. Real clients (go-ethereum) then
+// reject the response with "record contains less than two list elements".
+func (e *ENRResponse) EncodeRLP(w io.Writer) error {
+	var recordRLP []byte
+	if e.Record != nil {
+		encoded, err := e.Record.EncodeRLP()
+		if err != nil {
+			return err
+		}
+		recordRLP = encoded
+	}
+
+	type enrResponseRLP struct {
+		ReplyTok []byte
+		Record   rlp.RawValue
+		Rest     []rlp.RawValue `rlp:"tail"`
+	}
+
+	return rlp.Encode(w, &enrResponseRLP{
+		ReplyTok: e.ReplyTok,
+		Record:   recordRLP,
+		Rest:     e.Rest,
+	})
+}
 
 // Supporting Types
 
