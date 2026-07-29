@@ -79,11 +79,49 @@ func TestNextForkBoundaryWithoutGenesis(t *testing.T) {
 }
 
 // A distant boundary is capped so the reconciliation backstop still runs.
+// Genesis is placed beyond the settle window, since genesis is itself a boundary
+// and would otherwise put this inside the post-boundary polling period.
 func TestNextForkRefreshDelayCapped(t *testing.T) {
 	now := time.Now()
-	s := boundaryService(t, uint64(now.Unix()), "100")
+	s := boundaryService(t, uint64(now.Add(-2*forkSettleWindow).Unix()), "100")
 
 	if delay := s.nextForkRefreshDelay(); delay != maxForkRefreshDelay {
 		t.Errorf("delay = %v, want the cap %v", delay, maxForkRefreshDelay)
+	}
+}
+
+// A boundary that has just passed is skipped by nextForkBoundary, so arming for
+// the following one leaves a full backstop hole: a fire landing on the boundary
+// before the digest is computable does not look again for a minute. A devnet BPO
+// transition took 75s that way.
+func TestForkRefreshPollsAfterABoundary(t *testing.T) {
+	now := time.Now()
+	genesis := uint64(now.Add(-384 * time.Second).Unix())
+
+	s := boundaryService(t, genesis, "1")
+
+	last, ok := s.lastForkBoundary(now)
+	if !ok {
+		t.Fatal("the boundary that just passed was not reported")
+	}
+	if now.Sub(last) > 5*time.Second {
+		t.Fatalf("last boundary = %v, want ~now", last)
+	}
+
+	if delay := s.nextForkRefreshDelay(); delay != forkSettlePoll {
+		t.Errorf("delay just after a boundary = %v, want the settle poll %v", delay, forkSettlePoll)
+	}
+}
+
+// Outside the settle window the refresh must go back to waiting for the next
+// boundary rather than polling every second forever.
+func TestForkRefreshStopsPollingAfterSettleWindow(t *testing.T) {
+	now := time.Now()
+	genesis := uint64(now.Add(-(384 + 200) * time.Second).Unix())
+
+	s := boundaryService(t, genesis, "1")
+
+	if delay := s.nextForkRefreshDelay(); delay == forkSettlePoll {
+		t.Error("still polling long after the boundary settled")
 	}
 }

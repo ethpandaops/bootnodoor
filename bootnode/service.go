@@ -599,17 +599,33 @@ func (s *Service) maintenanceLoop() {
 	}
 }
 
-// forkRefreshLead re-publishes just before a boundary so the record is already
-// correct when peers act on the transition.
+// forkRefreshLead re-publishes just after a boundary, once the new fork is what
+// the clock reports.
 const forkRefreshLead = 500 * time.Millisecond
 
 // maxForkRefreshDelay caps the wait so a schedule that yields no future boundary
 // still reaches refreshForkENR at the old cadence.
 const maxForkRefreshDelay = time.Minute
 
-// nextForkRefreshDelay returns how long until the next scheduled fork boundary.
+// forkSettleWindow is how long after a boundary the refresh keeps polling.
+//
+// A boundary that has just passed is skipped by nextForkBoundary, so arming for
+// the following one leaves a full maxForkRefreshDelay hole: a fire landing on the
+// boundary before the digest is computable finds no change and does not look
+// again for a minute. A devnet BPO transition took 75s that way. Polling until
+// the change appears bounds the lag to forkSettlePoll instead.
+const forkSettleWindow = 90 * time.Second
+
+// forkSettlePoll is the retry interval inside forkSettleWindow.
+const forkSettlePoll = time.Second
+
+// nextForkRefreshDelay returns how long to wait before the next refresh attempt.
 func (s *Service) nextForkRefreshDelay() time.Duration {
 	now := time.Now()
+
+	if last, ok := s.lastForkBoundary(now); ok && now.Sub(last) < forkSettleWindow {
+		return forkSettlePoll
+	}
 
 	next, ok := s.nextForkBoundary(now)
 	if !ok {
@@ -649,7 +665,7 @@ func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
 	var next time.Time
 	found := false
 
-	consider := func(t time.Time) {
+	s.eachForkBoundary(func(t time.Time) {
 		if !t.After(now) {
 			return
 		}
@@ -657,8 +673,32 @@ func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
 			next = t
 			found = true
 		}
-	}
+	})
 
+	return next, found
+}
+
+// lastForkBoundary returns the most recent CL or EL fork activation at or before
+// now, so a refresh can keep polling until the transition is observable.
+func (s *Service) lastForkBoundary(now time.Time) (time.Time, bool) {
+	var last time.Time
+	found := false
+
+	s.eachForkBoundary(func(t time.Time) {
+		if t.After(now) {
+			return
+		}
+		if !found || t.After(last) {
+			last = t
+			found = true
+		}
+	})
+
+	return last, found
+}
+
+// eachForkBoundary calls fn with every scheduled fork activation time.
+func (s *Service) eachForkBoundary(consider func(time.Time)) {
 	if cfg := s.config.CLConfig; cfg != nil {
 		genesis := cfg.GetGenesisTime()
 		slotsPerEpoch := cfg.GetSlotsPerEpoch()
@@ -686,8 +726,6 @@ func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
 			}
 		}
 	}
-
-	return next, found
 }
 
 // localIDs returns the node IDs of every discovery identity, so discovery can
