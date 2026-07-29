@@ -330,13 +330,15 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 		return err
 	}
 
-	// Mark node as bonded: they pinged us, we ponged them.
-	// This allows THEM to query US with FINDNODE immediately.
-	fromNode.MarkPongReceived(h.config.BondExpiration)
+	// Do NOT mark the node bonded here. A received PING only proves the sender
+	// claims this endpoint; the UDP source can be spoofed, so bonding on it would
+	// let a spoofed PING coax a large NEIGHBORS reply to a victim (amplification).
+	// The bond is established only once the peer answers OUR ping-back with a PONG
+	// (handlePong -> MarkPongReceived), matching go-ethereum's endpoint proof.
 
-	// IMPORTANT: For bidirectional bonding (required by strict clients like reth for ENRRequest),
-	// we also need to establish that WE can reach THEM, not just that they can reach us.
-	// Send a PING back to them to establish bidirectional bond.
+	// Send a PING back so the peer can prove its endpoint and become bonded. This
+	// also satisfies strict clients (e.g. reth) that require bidirectional bonding
+	// before answering ENRRequest.
 	//
 	// RATE LIMITING: Only send PING back if we haven't pinged them in the last 100ms.
 	// This prevents ping-pong loops (max 10 pings/sec per node).

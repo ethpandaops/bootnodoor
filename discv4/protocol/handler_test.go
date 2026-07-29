@@ -97,3 +97,31 @@ func TestCleanupReclaimsFloodedNodes(t *testing.T) {
 		t.Fatalf("flooded nodes not reclaimed: %d still tracked", got)
 	}
 }
+
+// TestPingDoesNotBondBeforePong verifies that receiving a PING must not by itself
+// bond the sender. The bond is only established once the peer answers our
+// ping-back with a PONG (endpoint proof), matching go-ethereum.
+func TestPingDoesNotBondBeforePong(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	key, _ := crypto.GenerateKey()
+	h := NewHandler(ctx, HandlerConfig{PrivateKey: key, BondExpiration: time.Hour, LocalAddr: testAddr(), RequestTimeout: 20 * time.Millisecond}, stubTransport{})
+
+	pub, id := makeNodeID(t)
+	n := h.getOrCreateNode(id, pub, testAddr())
+
+	// Handling an inbound PING sends a PONG + a ping-back but must not bond.
+	if err := h.handlePing(n, testAddr(), nil, &Ping{Version: 4, Expiration: MakeExpiration(time.Minute)}, []byte{0x01}); err != nil {
+		t.Fatalf("handlePing: %v", err)
+	}
+	if n.IsBonded() {
+		t.Fatal("node became bonded from an inbound PING alone")
+	}
+
+	// Once the peer answers our ping-back with a PONG, the bond is established.
+	n.MarkPongReceived(time.Hour)
+	if !n.IsBonded() {
+		t.Fatal("node should be bonded after receiving a PONG to our ping")
+	}
+}
