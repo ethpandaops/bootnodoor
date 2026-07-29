@@ -187,7 +187,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 	err := ndb.db.RunDBTransaction(func(tx *sqlx.Tx) error {
 		requeue = requeue[:0]
 		for _, node := range nodes {
-			dirtyFlags := node.GetDirtyFlags()
+			dirtyFlags, dirtyGen := node.DirtySnapshot()
 			nodeID := node.ID()
 
 			ndb.logger.WithFields(logrus.Fields{
@@ -203,7 +203,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 					continue
 				}
 				// Full upsert covers everything this pass observed.
-				if node.ClearDirtyFlagsMask(dirtyFlags) {
+				if node.ClearDirtySnapshot(dirtyFlags, dirtyGen) {
 					requeue = append(requeue, node)
 				}
 				continue
@@ -254,7 +254,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 
 			// Clear only what this pass observed, so a flag marked while the
 			// batch was running is not erased unwritten.
-			if node.ClearDirtyFlagsMask(dirtyFlags) {
+			if node.ClearDirtySnapshot(dirtyFlags, dirtyGen) {
 				requeue = append(requeue, node)
 			}
 		}

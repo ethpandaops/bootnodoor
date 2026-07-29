@@ -163,7 +163,7 @@ func TestFullUpsertPersistsLastActive(t *testing.T) {
 // batchUpdate snapshots the dirty flags, writes, then clears. Clearing
 // everything discarded any flag marked while the write was in flight, because
 // that caller saw the node already queued and did not enqueue it again.
-func TestClearDirtyFlagsMaskKeepsUnobservedFlags(t *testing.T) {
+func TestClearDirtySnapshotKeepsUnobservedFlags(t *testing.T) {
 	database := persistTestDB(t, filepath.Join(t.TempDir(), "flags.db"))
 	defer database.Close()
 
@@ -174,16 +174,24 @@ func TestClearDirtyFlagsMaskKeepsUnobservedFlags(t *testing.T) {
 	n := NewFromV5(makeV5At(t, net.IPv4(10, 4, 0, 1)), ndb)
 
 	n.MarkDirty(DirtyENR)
-	observed := n.GetDirtyFlags()
+	observed, gen := n.DirtySnapshot()
 	n.MarkDirty(DirtyLastActive)
 
-	if remaining := n.ClearDirtyFlagsMask(observed); !remaining {
-		t.Error("ClearDirtyFlagsMask reported nothing left, so the later flag would not be requeued")
+	if remaining := n.ClearDirtySnapshot(observed, gen); !remaining {
+		t.Error("ClearDirtySnapshot reported nothing left, so the later mark would not be requeued")
 	}
 	if got := n.GetDirtyFlags(); got&DirtyLastActive == 0 {
 		t.Error("a flag marked after the snapshot was cleared unwritten")
 	}
-	if got := n.GetDirtyFlags(); got&DirtyENR != 0 {
-		t.Error("the observed flag was not cleared")
+
+	// Re-marking the same bit must also survive: the generation moved, so the
+	// observed write cannot be assumed to cover the newer value.
+	observed, gen = n.DirtySnapshot()
+	n.MarkDirty(DirtyLastActive)
+	if remaining := n.ClearDirtySnapshot(observed, gen); !remaining {
+		t.Error("a same-bit re-mark during the write was dropped")
+	}
+	if got := n.GetDirtyFlags(); got&DirtyLastActive == 0 {
+		t.Error("same-bit re-mark was cleared unwritten")
 	}
 }

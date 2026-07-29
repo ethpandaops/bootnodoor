@@ -666,7 +666,9 @@ func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
 		if genesis > 0 && slotsPerEpoch > 0 && secondsPerSlot > 0 {
 			for _, epoch := range cfg.ForkEpochs() {
 				offset, ok := forkOffsetSeconds(epoch, slotsPerEpoch, secondsPerSlot)
-				if !ok || genesis > math.MaxInt64-offset {
+				// Bound offset first: MaxInt64-offset is unsigned arithmetic and
+				// would wrap for an offset past MaxInt64, letting the guard pass.
+				if !ok || offset > math.MaxInt64 || genesis > math.MaxInt64-offset {
 					continue
 				}
 				consider(time.Unix(int64(genesis+offset), 0))

@@ -327,3 +327,44 @@ func TestENRRefreshBoundedAgainstEndlessBumps(t *testing.T) {
 		t.Error("refresh still marked in flight after the round bound was reached")
 	}
 }
+
+// The round bound is per claim, so without a cooldown a peer could open a fresh
+// claim immediately and sustain the same rate one PING at a time.
+func TestENRRefreshCooldownAfterRoundsExhausted(t *testing.T) {
+	peer := &scriptedPeer{t: t, enrSeq: 5, pongAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 30303}, bumpEachPong: true}
+
+	h, cancel := newScriptedHandler(t, peer)
+	defer cancel()
+	peer.h = h
+
+	n, key := makeKeyedNode(t, 30303)
+	peer.key = key
+	if !n.UpdateENR(signedV4Record(t, key, 1)) {
+		t.Fatal("seed record was not installed")
+	}
+	h.nodesMu.Lock()
+	h.nodes[n.ID()] = n
+	h.nodesMu.Unlock()
+
+	deliverPong(t, h, n, key, []byte("cooldown-ping-1"), 5)
+	time.Sleep(3500 * time.Millisecond)
+
+	_, afterFirst := peer.counts()
+
+	h.enrRefreshMu.Lock()
+	cooling := time.Now().Before(h.enrRefresh[n.ID()].cooldownUntil)
+	h.enrRefreshMu.Unlock()
+	if !cooling {
+		t.Fatal("no cooldown was set after the rounds were exhausted")
+	}
+
+	// A fresh trigger during the cooldown must not open another claim.
+	deliverPong(t, h, n, key, []byte("cooldown-ping-2"), 99)
+	time.Sleep(1500 * time.Millisecond)
+	peer.stop()
+
+	_, afterSecond := peer.counts()
+	if afterSecond != afterFirst {
+		t.Errorf("ENRREQUESTs went %d -> %d during the cooldown, want no new claim", afterFirst, afterSecond)
+	}
+}

@@ -444,6 +444,10 @@ const maxENRRefreshRetries = 2
 // to open a fresh one.
 const maxENRRefreshRounds = 4
 
+// enrRefreshCooldown is how long a peer waits for a new claim after exhausting
+// one, capping sustained refresh traffic per peer regardless of what it advertises.
+const enrRefreshCooldown = 30 * time.Second
+
 // enrRefreshState tracks one peer's automatic ENR refresh.
 type enrRefreshState struct {
 	inFlight bool
@@ -458,6 +462,12 @@ type enrRefreshState struct {
 
 	retries int
 	rounds  int
+
+	// cooldownUntil applies after a claim exhausts its rounds. Without it the
+	// bound is per claim only: one inbound PING earns a reciprocal PING, whose
+	// higher-sequence PONG opens a fresh claim, so a peer could sustain the same
+	// ENRREQUEST rate with one packet per claim.
+	cooldownUntil time.Time
 }
 
 // startENRRefresh claims the refresh for a peer and runs at most one at a time.
@@ -476,7 +486,7 @@ func (h *Handler) startENRRefresh(n *node.Node, advertisedSeq uint64) {
 	if advertisedSeq > state.highestSeenSeq {
 		state.highestSeenSeq = advertisedSeq
 	}
-	if state.inFlight {
+	if state.inFlight || time.Now().Before(state.cooldownUntil) {
 		h.enrRefreshMu.Unlock()
 		return
 	}
@@ -533,6 +543,9 @@ func (h *Handler) runENRRefresh(n *node.Node) {
 			continue
 		}
 
+		if state.rounds >= maxENRRefreshRounds {
+			state.cooldownUntil = time.Now().Add(enrRefreshCooldown)
+		}
 		state.inFlight = false
 		state.retries = 0
 		h.enrRefreshMu.Unlock()

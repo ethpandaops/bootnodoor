@@ -64,6 +64,7 @@ type Node struct {
 	// Dirty tracking for database updates
 	dirtyMu     sync.Mutex
 	dirtyFields DirtyFlags
+	dirtyGen    uint64
 }
 
 // NewFromV4 creates a generic Node from a discv4 node.
@@ -495,6 +496,7 @@ func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
 func (n *Node) MarkDirty(flags DirtyFlags) {
 	n.dirtyMu.Lock()
 	n.dirtyFields |= flags
+	n.dirtyGen++
 	n.dirtyMu.Unlock()
 }
 
@@ -513,12 +515,25 @@ func (n *Node) ClearDirtyFlags() {
 	n.dirtyMu.Unlock()
 }
 
-// ClearDirtyFlagsMask clears only the given flags and reports whether any
-// remain. Writers clear what they observed rather than everything, so a flag
-// marked while the batch was in flight survives to the next round.
-func (n *Node) ClearDirtyFlagsMask(flags DirtyFlags) bool {
+// DirtySnapshot returns the current flags and a generation that changes on every
+// subsequent MarkDirty, so a writer can tell whether anything was marked while it
+// was working.
+func (n *Node) DirtySnapshot() (DirtyFlags, uint64) {
 	n.dirtyMu.Lock()
 	defer n.dirtyMu.Unlock()
+	return n.dirtyFields, n.dirtyGen
+}
+
+// ClearDirtySnapshot clears the snapshotted flags and reports whether the node is
+// still dirty. Clearing is skipped entirely when the generation moved: the same
+// bit may have been re-marked for a newer value, which is indistinguishable from
+// the one just written, so the field would otherwise be dropped unwritten.
+func (n *Node) ClearDirtySnapshot(flags DirtyFlags, gen uint64) bool {
+	n.dirtyMu.Lock()
+	defer n.dirtyMu.Unlock()
+	if n.dirtyGen != gen {
+		return true
+	}
 	n.dirtyFields &^= flags
 	return n.dirtyFields != 0
 }
