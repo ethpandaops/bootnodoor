@@ -801,8 +801,9 @@ func (s *Service) cleanupStaleENRRequests() {
 
 	s.pendingENRRequestsV4.Range(func(key, value interface{}) bool {
 		if timestamp, ok := value.(time.Time); ok {
-			if now.Sub(timestamp) > staleThreshold {
-				s.pendingENRRequestsV4.Delete(key)
+			// Delete only the entry we just judged stale: a fresh claim may have
+			// replaced it between the Range read and here.
+			if now.Sub(timestamp) > staleThreshold && s.pendingENRRequestsV4.CompareAndDelete(key, value) {
 				cleanedCount++
 			}
 		}
@@ -1160,24 +1161,28 @@ func (s *Service) requestENRV4(n *v4node.Node) {
 	nodeID := n.ID()
 	now := time.Now()
 
-	// Check if we already have a recent pending ENR request for this node
-	if val, exists := s.pendingENRRequestsV4.Load(nodeID); exists {
-		if timestamp, ok := val.(time.Time); ok {
-			// If request is less than 30 seconds old, skip (still pending)
-			if time.Since(timestamp) < 30*time.Second {
-				return
-			}
-			// Request is stale (>30s), replace it
+	// Claim the slot atomically: a Load followed by a Store lets two callers both
+	// through, and takeover of an entry older than 30s has to stay possible, so a
+	// bare LoadOrStore is not enough either.
+	for {
+		val, loaded := s.pendingENRRequestsV4.LoadOrStore(nodeID, now)
+		if !loaded {
+			break
+		}
+		timestamp, ok := val.(time.Time)
+		if ok && time.Since(timestamp) < 30*time.Second {
+			return
+		}
+		if s.pendingENRRequestsV4.CompareAndSwap(nodeID, val, now) {
+			break
 		}
 	}
 
-	// Mark as pending with current timestamp
-	s.pendingENRRequestsV4.Store(nodeID, now)
-
 	// Run in goroutine to avoid blocking packet handling
 	go func() {
-		// Remove from pending when done
-		defer s.pendingENRRequestsV4.Delete(nodeID)
+		// Release only our own claim: an unconditional delete would drop the entry
+		// of whoever took over after our 30s window expired.
+		defer s.pendingENRRequestsV4.CompareAndDelete(nodeID, now)
 
 		// IMPORTANT: Some clients (like reth) require bidirectional bonding before responding to ENRRequest.
 		// Bidirectional bonding means:

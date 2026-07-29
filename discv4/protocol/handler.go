@@ -67,6 +67,12 @@ type Handler struct {
 	nodesMu sync.RWMutex
 	nodes   map[node.ID]*node.Node
 
+	// In-flight PONG-driven ENR refreshes, keyed by node ID. The refresh cannot
+	// update the cached sequence before its own PING is answered, so without this
+	// every PONG on the way re-triggers it.
+	enrRefreshMu sync.Mutex
+	enrRefresh   map[node.ID]*enrRefreshState
+
 	// Pending requests, keyed by packet hash + destination node ID: the hash
 	// alone aliases across peers (deterministic signatures, 1s Expiration
 	// granularity), and identical requests to one peer share a key's slice.
@@ -236,6 +242,7 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 		ctx:              ctx,
 		transport:        transport,
 		nodes:            make(map[node.ID]*node.Node),
+		enrRefresh:       make(map[node.ID]*enrRefreshState),
 		requests:         make(map[string][]*PendingRequest),
 		pendingNeighbors: make(map[string]*PendingNeighborsResponse),
 		localENR:         config.LocalENR,
@@ -419,12 +426,112 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 	// Check if remote node has newer ENR
 	if pong.ENRSeq > 0 && fromNode.ENR() != nil {
 		if pong.ENRSeq > fromNode.ENR().Seq() {
-			// Request updated ENR
-			go h.RequestENR(fromNode)
+			h.startENRRefresh(fromNode, pong.ENRSeq)
 		}
 	}
 
 	return nil
+}
+
+// maxENRRefreshRetries bounds retries after a failed refresh so a peer that
+// never answers cannot keep one running.
+const maxENRRefreshRetries = 2
+
+// enrRefreshState tracks one peer's automatic ENR refresh.
+type enrRefreshState struct {
+	inFlight bool
+
+	// targetSeq is what the running attempt is fetching; highestSeenSeq is the
+	// largest advertised since. Only highestSeenSeq > targetSeq means a genuinely
+	// newer record appeared mid-refresh and another round is warranted. Comparing
+	// against the installed record instead would also retry after a failed or
+	// stale response, which never terminates.
+	targetSeq      uint64
+	highestSeenSeq uint64
+
+	retries int
+}
+
+// startENRRefresh claims the refresh for a peer and runs at most one at a time.
+// The claim is taken here rather than inside RequestENR because a goroutine
+// descheduled past the winner's release would otherwise become a new winner —
+// under exactly the load this is meant to prevent.
+func (h *Handler) startENRRefresh(n *node.Node, advertisedSeq uint64) {
+	id := n.ID()
+
+	h.enrRefreshMu.Lock()
+	state := h.enrRefresh[id]
+	if state == nil {
+		state = &enrRefreshState{}
+		h.enrRefresh[id] = state
+	}
+	if advertisedSeq > state.highestSeenSeq {
+		state.highestSeenSeq = advertisedSeq
+	}
+	if state.inFlight {
+		h.enrRefreshMu.Unlock()
+		return
+	}
+	state.inFlight = true
+	state.targetSeq = state.highestSeenSeq
+	state.retries = 0
+	h.enrRefreshMu.Unlock()
+
+	go h.runENRRefresh(n)
+}
+
+// runENRRefresh fetches a peer's record, repeating only for a sequence observed
+// after the current attempt started or a bounded number of failures.
+func (h *Handler) runENRRefresh(n *node.Node) {
+	id := n.ID()
+
+	for {
+		_, err := h.RequestENR(n)
+
+		h.enrRefreshMu.Lock()
+		state := h.enrRefresh[id]
+		if state == nil {
+			h.enrRefreshMu.Unlock()
+			return
+		}
+
+		if state.highestSeenSeq > state.targetSeq {
+			state.targetSeq = state.highestSeenSeq
+			state.retries = 0
+			h.enrRefreshMu.Unlock()
+			continue
+		}
+
+		if err != nil && state.retries < maxENRRefreshRetries {
+			state.retries++
+			backoff := time.Duration(state.retries) * h.config.ExpirationWindow
+			h.enrRefreshMu.Unlock()
+
+			select {
+			case <-time.After(backoff):
+			case <-h.ctx.Done():
+				h.releaseENRRefresh(id)
+				return
+			}
+			continue
+		}
+
+		state.inFlight = false
+		state.retries = 0
+		h.enrRefreshMu.Unlock()
+		return
+	}
+}
+
+// releaseENRRefresh clears the in-flight claim without recreating a state entry
+// that eviction has already removed.
+func (h *Handler) releaseENRRefresh(id node.ID) {
+	h.enrRefreshMu.Lock()
+	if state := h.enrRefresh[id]; state != nil {
+		state.inFlight = false
+		state.retries = 0
+	}
+	h.enrRefreshMu.Unlock()
 }
 
 // handleFindnode processes a FINDNODE request.
@@ -1261,13 +1368,21 @@ func (h *Handler) cleanup() {
 	}
 
 	h.nodesMu.Lock()
+	evicted := make([]node.ID, 0, len(stale))
 	for _, id := range stale {
 		// Re-check: a node may have been seen again since the scan.
 		if n, ok := h.nodes[id]; ok && !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
 			delete(h.nodes, id)
+			evicted = append(evicted, id)
 		}
 	}
 	h.nodesMu.Unlock()
+
+	h.enrRefreshMu.Lock()
+	for _, id := range evicted {
+		delete(h.enrRefresh, id)
+	}
+	h.enrRefreshMu.Unlock()
 }
 
 // staleNodes returns the IDs of unbonded nodes past their TTL.
