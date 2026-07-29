@@ -195,7 +195,25 @@ func (t *FlatTable) LoadInitialNodesFromDB() error {
 	// Load random nodes from DB to bootstrap the active pool
 	randomNodes := t.db.LoadRandomNodes(t.maxActiveNodes)
 
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	for _, n := range randomNodes {
+		// The transport may have admitted nodes before this bulk load runs, so
+		// stop at the soft cap instead of stacking a full load on top of them.
+		if len(t.activeNodes) >= t.maxActiveNodes {
+			break
+		}
+		// Add applies this check; a persisted record of ourselves would
+		// otherwise sit in the pool for the whole process lifetime and be
+		// dialed by every lookup round.
+		if n.ID() == t.localID {
+			continue
+		}
+		if _, exists := t.activeNodes[n.ID()]; exists {
+			continue
+		}
+
 		if t.ipLimiter.CanAdd(n) {
 			t.activeNodes[n.ID()] = n
 			t.ipLimiter.Add(n)
@@ -708,17 +726,6 @@ func (t *FlatTable) ActiveSize() int {
 	return len(t.activeNodes)
 }
 
-// NumBucketsFilled returns a compatibility value for the flat table.
-// Since we don't have buckets, we return 1 if we have any active nodes, 0 otherwise.
-func (t *FlatTable) NumBucketsFilled() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if len(t.activeNodes) > 0 {
-		return 1
-	}
-	return 0
-}
-
 // GetStats returns statistics about the table.
 func (t *FlatTable) GetStats() TableStats {
 	t.mu.RLock()
@@ -730,7 +737,6 @@ func (t *FlatTable) GetStats() TableStats {
 	return TableStats{
 		TotalNodes:          totalCount,
 		ActiveNodes:         activeCount,
-		BucketsFilled:       0, // Not applicable for flat table
 		AdmissionRejections: t.admissionRejections,
 		IPLimitRejections:   t.ipLimitRejections,
 		DeadNodesRemoved:    t.deadNodesRemoved,

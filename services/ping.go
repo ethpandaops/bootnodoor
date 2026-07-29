@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/ethpandaops/bootnodoor/discv4"
@@ -21,6 +22,10 @@ type PingService struct {
 
 	// logger for debug messages
 	logger logrus.FieldLogger
+
+	// mu guards the counters: PingMultiple fans pings out across goroutines
+	// while GetStats is read from the web UI handler.
+	mu sync.Mutex
 
 	// Stats
 	pingsSent      int
@@ -49,7 +54,7 @@ func NewPingService(v5Handler *protocol.Handler, v4Service *discv4.Service, logg
 // Returns true if the node responded, false on timeout.
 // Also updates the node's RTT statistics.
 func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
-	ps.pingsSent++
+	ps.countPingSent()
 
 	ps.logger.WithFields(logrus.Fields{
 		"peerID": n.PeerID(),
@@ -60,13 +65,13 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 
 	// Try discv5 first if available
 	if v5Node := n.V5(); v5Node != nil && ps.v5Handler != nil {
-		ps.pingsV5++
+		ps.countProtocol(true)
 		respChan, err := ps.v5Handler.SendPing(v5Node)
 		if err != nil {
 			// Failed to send ping - only increment failure if no v4 fallback available
 			if n.V4() == nil || ps.v4Service == nil {
 				// No v4 fallback - this is a final failure
-				ps.pingTimeouts++
+				ps.countTimeout()
 				n.IncrementFailureCount()
 				ps.logger.WithFields(logrus.Fields{
 					"peerID":   n.PeerID(),
@@ -91,10 +96,7 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 
 			if resp.Error == nil {
 				// Success
-				ps.pongsReceived++
-				ps.totalRTT += rtt
-				ps.rttSampleCount++
-				ps.avgRTT = ps.totalRTT / time.Duration(ps.rttSampleCount)
+				ps.countPong(rtt)
 				n.UpdateRTT(rtt)
 				n.ResetFailureCount()
 
@@ -111,7 +113,7 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 			// V5 ping failed - only increment failure if no v4 fallback available
 			if n.V4() == nil || ps.v4Service == nil {
 				// No v4 fallback - this is a final failure
-				ps.pingTimeouts++
+				ps.countTimeout()
 				n.IncrementFailureCount()
 				ps.logger.WithFields(logrus.Fields{
 					"peerID":   n.PeerID(),
@@ -134,12 +136,12 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 
 	// Try discv4 fallback if available
 	if v4Node := n.V4(); v4Node != nil && ps.v4Service != nil {
-		ps.pingsV4++
+		ps.countProtocol(false)
 		pong, err := ps.v4Service.Ping(v4Node)
 		rtt := time.Since(start)
 
 		if err != nil {
-			ps.pingTimeouts++
+			ps.countTimeout()
 			n.IncrementFailureCount()
 			ps.logger.WithFields(logrus.Fields{
 				"peerID":   n.PeerID(),
@@ -152,10 +154,7 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 		}
 
 		// Success
-		ps.pongsReceived++
-		ps.totalRTT += rtt
-		ps.rttSampleCount++
-		ps.avgRTT = ps.totalRTT / time.Duration(ps.rttSampleCount)
+		ps.countPong(rtt)
 		n.UpdateRTT(rtt)
 		n.ResetFailureCount()
 
@@ -171,7 +170,7 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 	}
 
 	// No protocol available
-	ps.pingTimeouts++
+	ps.countTimeout()
 	n.IncrementFailureCount()
 	ps.logger.WithFields(logrus.Fields{
 		"peerID": n.PeerID(),
@@ -436,6 +435,37 @@ func (ps *PingService) CheckProtocolSupportMultiple(nodes []*nodedb.Node) {
 	}).Info("protocol support check batch complete")
 }
 
+func (ps *PingService) countPingSent() {
+	ps.mu.Lock()
+	ps.pingsSent++
+	ps.mu.Unlock()
+}
+
+func (ps *PingService) countProtocol(isV5 bool) {
+	ps.mu.Lock()
+	if isV5 {
+		ps.pingsV5++
+	} else {
+		ps.pingsV4++
+	}
+	ps.mu.Unlock()
+}
+
+func (ps *PingService) countTimeout() {
+	ps.mu.Lock()
+	ps.pingTimeouts++
+	ps.mu.Unlock()
+}
+
+func (ps *PingService) countPong(rtt time.Duration) {
+	ps.mu.Lock()
+	ps.pongsReceived++
+	ps.totalRTT += rtt
+	ps.rttSampleCount++
+	ps.avgRTT = ps.totalRTT / time.Duration(ps.rttSampleCount)
+	ps.mu.Unlock()
+}
+
 // PingStats returns statistics about PING operations.
 type PingStats struct {
 	PingsSent     int
@@ -449,6 +479,9 @@ type PingStats struct {
 
 // GetStats returns PING statistics.
 func (ps *PingService) GetStats() PingStats {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
 	successRate := 0.0
 	if ps.pingsSent > 0 {
 		successRate = float64(ps.pongsReceived) / float64(ps.pingsSent) * 100

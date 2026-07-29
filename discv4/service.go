@@ -352,23 +352,15 @@ func (s *Service) LocalENR() *enr.Record {
 func (s *Service) SetLocalENR(record *enr.Record) {
 	s.mu.Lock()
 	s.localENR = record
-	if s.handler != nil && s.transport != nil {
-		// Update handler config
-		s.handler = protocol.NewHandler(s.ctx, protocol.HandlerConfig{
-			PrivateKey:       s.privateKey,
-			LocalENR:         record,
-			LocalAddr:        s.transport.LocalAddr(),
-			BondExpiration:   s.config.BondExpiration,
-			RequestTimeout:   s.config.RequestTimeout,
-			ExpirationWindow: s.config.ExpirationWindow,
-			OnPing:           s.config.OnPing,
-			OnFindnode:       s.config.OnFindnode,
-			OnENRRequest:     s.config.OnENRRequest,
-			OnNodeSeen:       s.config.OnNodeSeen,
-			OnPongReceived:   s.config.OnPongReceived,
-		}, s.transport)
-	}
+	handler := s.handler
 	s.mu.Unlock()
+
+	// Update the live handler instead of replacing it: a rebuild discards every
+	// bond, known node, pending request and counter, orphans the old handler's
+	// cleanup goroutine, and delivers replies to a handler nobody is waiting on.
+	if handler != nil {
+		handler.SetLocalENR(record)
+	}
 }
 
 // LocalEnode returns the local enode:// URL.
@@ -383,15 +375,23 @@ func (s *Service) LocalEnode() string {
 	return en.String()
 }
 
+// Handler returns the underlying protocol handler.
+func (s *Service) Handler() *protocol.Handler {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handler
+}
+
 // Statistics
 
 // Stats returns service statistics.
 func (s *Service) Stats() map[string]interface{} {
-	if s.handler == nil {
+	handler := s.Handler()
+	if handler == nil {
 		return map[string]interface{}{}
 	}
 
-	stats := s.handler.Stats()
+	stats := handler.Stats()
 
 	// Note: Transport stats are not included since transport is managed externally
 

@@ -12,6 +12,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
@@ -57,6 +58,13 @@ func PubkeyToID(pub *ecdsa.PublicKey) ID {
 // It combines the node's ENR record with additional runtime information
 // like network statistics and last seen time.
 type Node struct {
+	// mu guards record, addr, tcpPort and the stats pointer: UpdateENR and
+	// SetStats replace them while packet handling and scoring read them from
+	// other goroutines. The pointed-to values need no guard - enr.Record has
+	// its own lock and is never mutated after signing, addr is replaced whole,
+	// and SharedStats synchronizes internally.
+	mu sync.RWMutex
+
 	// record is the ENR record containing node identity and metadata
 	record *enr.Record
 
@@ -143,40 +151,55 @@ func (n *Node) ID() ID {
 
 // Record returns the node's ENR record.
 func (n *Node) Record() *enr.Record {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.record
 }
 
 // Addr returns the node's UDP address.
 func (n *Node) Addr() *net.UDPAddr {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.addr
+}
+
+// statsRef returns the current shared stats pointer for use outside the lock.
+func (n *Node) statsRef() *stats.SharedStats {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.stats
 }
 
 // SetStats replaces the node's stats with a shared stats pointer.
 // This allows the node to update stats owned by a parent node.
 func (n *Node) SetStats(sharedStats *stats.SharedStats) {
 	if sharedStats != nil {
+		n.mu.Lock()
 		n.stats = sharedStats
+		n.mu.Unlock()
 	}
 }
 
 // IP returns the node's IP address.
 func (n *Node) IP() net.IP {
-	return n.addr.IP
+	return n.Addr().IP
 }
 
 // UDPPort returns the node's UDP port.
 func (n *Node) UDPPort() uint16 {
-	return uint16(n.addr.Port)
+	return uint16(n.Addr().Port)
 }
 
 // TCPPort returns the node's TCP port (0 if not set).
 func (n *Node) TCPPort() uint16 {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.tcpPort
 }
 
 // PublicKey returns the node's public key.
 func (n *Node) PublicKey() *ecdsa.PublicKey {
-	return n.record.PublicKey()
+	return n.Record().PublicKey()
 }
 
 // PeerID returns the libp2p peer ID for this node.
@@ -201,7 +224,7 @@ func (n *Node) PeerID() string {
 
 // Digest returns the node's fork digest.
 func (n *Node) Digest() [4]byte {
-	eth2Data, ok := n.record.Eth2()
+	eth2Data, ok := n.Record().Eth2()
 	if !ok {
 		return [4]byte{}
 	}
@@ -210,37 +233,37 @@ func (n *Node) Digest() [4]byte {
 
 // SetLastSeen updates the last seen time.
 func (n *Node) SetLastSeen(t time.Time) {
-	n.stats.SetLastSeen(t)
+	n.statsRef().SetLastSeen(t)
 }
 
 // SetLastPing updates the last ping time.
 func (n *Node) SetLastPing(t time.Time) {
-	n.stats.SetLastPing(t)
+	n.statsRef().SetLastPing(t)
 }
 
 // SetFailureCount sets the failure count.
 func (n *Node) SetFailureCount(count int) {
-	n.stats.SetFailureCount(count)
+	n.statsRef().SetFailureCount(count)
 }
 
 // SetSuccessCount sets the success count.
 func (n *Node) SetSuccessCount(count int) {
-	n.stats.SetSuccessCount(count)
+	n.statsRef().SetSuccessCount(count)
 }
 
 // IncrementFailureCount increases the failure count by 1.
 func (n *Node) IncrementFailureCount() {
-	n.stats.IncrementFailureCount()
+	n.statsRef().IncrementFailureCount()
 }
 
 // ResetFailureCount resets the failure count to 0 and increments success count.
 func (n *Node) ResetFailureCount() {
-	n.stats.ResetFailureCount()
+	n.statsRef().ResetFailureCount()
 }
 
 // UpdateRTT updates the average RTT using exponential moving average.
 func (n *Node) UpdateRTT(rtt time.Duration) {
-	n.stats.UpdateRTT(rtt)
+	n.statsRef().UpdateRTT(rtt)
 }
 
 // UpdateENR updates the node's ENR record if the new one has a higher sequence number.
@@ -250,6 +273,9 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 	if newRecord == nil {
 		return false
 	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
 	// Only update if new record has higher sequence number
 	if newRecord.Seq() > n.record.Seq() {
@@ -279,7 +305,7 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 //
 // Format: Node[id=abc123..., addr=192.168.1.1:9000, seen=1m ago]
 func (n *Node) String() string {
-	lastSeen := n.stats.LastSeen()
+	lastSeen := n.statsRef().LastSeen()
 
 	var seenStr string
 	if lastSeen.IsZero() {
@@ -290,7 +316,7 @@ func (n *Node) String() string {
 
 	return fmt.Sprintf("Node[id=%s, addr=%s, seen=%s]",
 		n.id.String()[:8]+"...", // First 8 chars of ID
-		n.addr.String(),
+		n.Addr().String(),
 		seenStr,
 	)
 }
@@ -308,7 +334,7 @@ type Stats struct {
 
 // GetStats returns the current statistics for the node.
 func (n *Node) GetStats() Stats {
-	snapshot := n.stats.GetSnapshot()
+	snapshot := n.statsRef().GetSnapshot()
 	return Stats{
 		FirstSeen:    snapshot.FirstSeen,
 		LastSeen:     snapshot.LastSeen,
@@ -316,7 +342,7 @@ func (n *Node) GetStats() Stats {
 		FailureCount: snapshot.FailureCount,
 		SuccessCount: snapshot.SuccessCount,
 		AvgRTT:       snapshot.AvgRTT,
-		ENRSeq:       n.record.Seq(),
+		ENRSeq:       n.Record().Seq(),
 	}
 }
 
@@ -354,7 +380,7 @@ type ForkScoringInfo struct {
 //
 // Returns a score between 0.0 (worst) and 1.0 (best).
 func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
-	snapshot := n.stats.GetSnapshot()
+	snapshot := n.statsRef().GetSnapshot()
 	now := time.Now()
 
 	// RTT score (30% weight, adjusted from 40%)

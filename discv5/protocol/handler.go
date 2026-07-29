@@ -42,6 +42,11 @@ type PendingChallenge struct {
 	ChallengeData []byte
 	PacketBytes   []byte // Raw WHOAREYOU packet bytes for resending
 	CreatedAt     time.Time
+
+	// KnownNode is the record our advertised ENRSeq came from, if any. A peer
+	// may legally answer a non-zero ENRSeq without repeating its record, so
+	// this is the only copy left to verify that handshake against.
+	KnownNode *node.Node
 }
 
 // OnHandshakeCompleteCallback is called when a handshake completes successfully.
@@ -704,6 +709,10 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 		}
 	}
 
+	if sess.GetNode() == nil && remoteNode != nil {
+		sess.SetNode(remoteNode)
+	}
+
 	h.config.Sessions.Put(sess)
 
 	// Call OnHandshakeComplete callback for outgoing handshake
@@ -798,29 +807,12 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr, local
 	h.removePendingChallenge(challengeKey, pendingChallenge)
 	h.mu.Unlock()
 
-	// Get sender's static public key for signature verification
-	// First try to extract it from the ENR in the handshake packet
-	var senderPubKey *ecdsa.PublicKey
-	var remoteNodeFromENR *node.Node
-	if len(packet.Handshake.ENR) > 0 {
-		enrRecord := &enr.Record{}
-		if err := enrRecord.DecodeRLPBytes(packet.Handshake.ENR); err != nil {
-			h.config.Logger.WithError(err).Warn("handler: failed to decode ENR from handshake")
-		} else {
-			remoteNode, err := node.New(enrRecord)
-			if err != nil {
-				h.config.Logger.WithError(err).Warn("handler: failed to create node from ENR")
-			} else {
-				remoteNodeFromENR = remoteNode
-				senderPubKey = remoteNode.PublicKey()
-			}
-		}
-	}
-
-	// ENR is required in handshake packet for signature verification
-	if senderPubKey == nil {
-		h.config.Logger.WithField("sourceNodeID", sourceNodeID.String()[:16]).Warn("handler: no ENR provided in handshake packet")
-		return fmt.Errorf("no ENR provided in handshake packet")
+	remoteNodeFromENR, senderPubKey, err := resolveHandshakeSender(
+		packet.Handshake.ENR, pendingChallenge, sourceNodeID, h.config.Logger)
+	if err != nil {
+		h.config.Logger.WithError(err).WithField("sourceNodeID", sourceNodeID.String()[:16]).
+			Warn("handler: cannot resolve handshake sender")
+		return err
 	}
 
 	// Decode ephemeral public key (for ECDH)
@@ -1400,8 +1392,10 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID, nonce []byt
 
 	// Get the current ENR sequence we have for this node
 	enrSeq := uint64(0)
+	var knownNode *node.Node
 	if sess := h.config.Sessions.Get(destNodeID); sess != nil {
 		if existingNode := sess.GetNode(); existingNode != nil {
+			knownNode = existingNode
 			enrSeq = existingNode.Record().Seq()
 		}
 	}
@@ -1432,6 +1426,7 @@ func (h *Handler) sendWHOAREYOU(to *net.UDPAddr, destNodeID node.ID, nonce []byt
 		ChallengeData: challengeData,
 		PacketBytes:   packetBytes, // Store for resending
 		CreatedAt:     time.Now(),
+		KnownNode:     knownNode,
 	}
 
 	h.mu.Lock()
@@ -1686,13 +1681,20 @@ func (h *Handler) requestENRUpdate(n *node.Node) {
 				return
 			}
 
-			// The NODES response handler will automatically update the ENR in our table
 			nodesMsg, ok := resp.Message.(*Nodes)
-			if ok && len(nodesMsg.Records) > 0 {
+			if !ok {
 				h.config.Logger.WithFields(logrus.Fields{
 					"nodeID": n.ID().String()[:16],
-					"count":  len(nodesMsg.Records),
-				}).Debug("handler: received ENR update")
+					"type":   fmt.Sprintf("%T", resp.Message),
+				}).Debug("handler: ENR update returned unexpected response")
+				return
+			}
+
+			if h.applyENRUpdate(n, nodesMsg.Records) {
+				h.config.Logger.WithFields(logrus.Fields{
+					"nodeID": n.ID().String()[:16],
+					"seq":    n.Record().Seq(),
+				}).Debug("handler: installed ENR update")
 			}
 
 		case <-time.After(5 * time.Second):
@@ -1701,6 +1703,87 @@ func (h *Handler) requestENRUpdate(n *node.Node) {
 			}).Debug("handler: ENR update request timed out")
 		}
 	}()
+}
+
+// resolveHandshakeSender determines which node, and therefore which static key,
+// a handshake must be verified against.
+//
+// The record is optional in the handshake message: a peer may legally omit it
+// when our WHOAREYOU advertised an ENRSeq it has nothing newer than, in which
+// case the challenge's own copy is the only one left. The whole node is
+// returned rather than a bare key because the session and the handshake
+// callback both hang off it, and a node-less session can never refresh its ENR.
+func resolveHandshakeSender(enrBytes []byte, challenge *PendingChallenge, sourceNodeID node.ID,
+	logger logrus.FieldLogger,
+) (*node.Node, *ecdsa.PublicKey, error) {
+	var remoteNode *node.Node
+
+	if len(enrBytes) > 0 {
+		record := &enr.Record{}
+		if err := record.DecodeRLPBytes(enrBytes); err != nil {
+			logger.WithError(err).Warn("handler: failed to decode ENR from handshake")
+		} else if n, err := node.New(record); err != nil {
+			logger.WithError(err).Warn("handler: failed to create node from ENR")
+		} else {
+			remoteNode = n
+		}
+	}
+
+	if remoteNode == nil && challenge != nil {
+		remoteNode = challenge.KnownNode
+	}
+
+	if remoteNode == nil {
+		return nil, nil, fmt.Errorf("no ENR provided in handshake packet")
+	}
+
+	pubKey := remoteNode.PublicKey()
+	if pubKey == nil {
+		return nil, nil, fmt.Errorf("handshake record carries no public key")
+	}
+
+	// The session is keyed by the claimed source ID while the signature only
+	// proves possession of this key, so without binding the two a peer could
+	// authenticate as itself and be filed under another node's identity.
+	if node.PubkeyToID(pubKey) != sourceNodeID {
+		return nil, nil, fmt.Errorf("handshake key does not match source node ID")
+	}
+
+	return remoteNode, pubKey, nil
+}
+
+// applyENRUpdate installs the newest valid record returned by a distance-zero
+// FINDNODE request. A peer must not be able to replace its session record with
+// another node's ENR, even though the response itself matched the pending request.
+func (h *Handler) applyENRUpdate(n *node.Node, records []*enr.Record) bool {
+	var newest *enr.Record
+
+	for _, record := range records {
+		candidate, err := node.New(record)
+		if err != nil {
+			h.config.Logger.WithError(err).Debug("handler: ignoring invalid ENR update")
+			continue
+		}
+		if candidate.ID() != n.ID() {
+			h.config.Logger.WithFields(logrus.Fields{
+				"nodeID":   n.ID().String()[:16],
+				"recordID": candidate.ID().String()[:16],
+			}).Debug("handler: ignoring ENR update for a different node")
+			continue
+		}
+		if newest == nil || record.Seq() > newest.Seq() {
+			newest = record
+		}
+	}
+
+	if newest == nil || !n.UpdateENR(newest) {
+		return false
+	}
+
+	if h.config.OnNodeUpdate != nil {
+		h.config.OnNodeUpdate(n)
+	}
+	return true
 }
 
 // SendFindNode sends a FINDNODE request.

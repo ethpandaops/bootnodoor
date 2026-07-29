@@ -626,8 +626,35 @@
                   <td class="text-end"><span class="badge rounded-pill text-bg-danger" data-stat="filter-rejected-invalid">{{ .FilterRejectedInvalid }}</span></td>
                 </tr>
                 <tr>
-                  <td class="text-muted">Rejected (Expired)</td>
-                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary" data-stat="filter-rejected-expired">{{ .FilterRejectedExpired }}</span></td>
+                  <td class="text-muted">Accepted (Historical)</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-secondary" data-stat="filter-accepted-historical">{{ .FilterAcceptedHistorical }}</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      {{ end }}
+
+      <!-- EL Fork ID Admission Card -->
+      {{ if .ELFilterTotalChecks }}
+      <div class="col-12 col-md-6 col-lg-4 mb-3">
+        <div class="card h-100">
+          <div class="card-body">
+            <h6 class="card-title">EL Fork ID Admission</h6>
+            <table class="table table-sm mb-0">
+              <tbody>
+                <tr>
+                  <td class="text-muted">Total Checks</td>
+                  <td class="text-end" data-stat="el-filter-total-checks">{{ .ELFilterTotalChecks }}</td>
+                </tr>
+                <tr>
+                  <td class="text-muted">Accepted</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-success" data-stat="el-filter-accepted">{{ .ELFilterAccepted }}</span></td>
+                </tr>
+                <tr>
+                  <td class="text-muted">Rejected (Fork)</td>
+                  <td class="text-end"><span class="badge rounded-pill text-bg-danger" data-stat="el-filter-rejected">{{ .ELFilterRejected }}</span></td>
                 </tr>
               </tbody>
             </table>
@@ -877,7 +904,14 @@
           updateValue('[data-stat="filter-accepted-current"]', data.FilterAcceptedCurrent);
           updateValue('[data-stat="filter-accepted-old"]', data.FilterAcceptedOld);
           updateValue('[data-stat="filter-rejected-invalid"]', data.FilterRejectedInvalid);
-          updateValue('[data-stat="filter-rejected-expired"]', data.FilterRejectedExpired);
+          updateValue('[data-stat="filter-accepted-historical"]', data.FilterAcceptedHistorical);
+        }
+
+        /* EL fork ID admission (independent of the CL filter above) */
+        if (data.ELFilterTotalChecks) {
+          updateValue('[data-stat="el-filter-total-checks"]', data.ELFilterTotalChecks);
+          updateValue('[data-stat="el-filter-accepted"]', data.ELFilterAccepted);
+          updateValue('[data-stat="el-filter-rejected"]', data.ELFilterRejected);
         }
       })
       .catch(function(error) {

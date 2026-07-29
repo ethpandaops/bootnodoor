@@ -51,7 +51,6 @@ type ForkDigestFilter struct {
 	acceptedOld        int
 	acceptedHistorical int
 	rejectedInvalid    int
-	rejectedExpired    int
 }
 
 // Logger interface for debug messages
@@ -233,8 +232,10 @@ func (f *ForkDigestFilter) Update() {
 		f.currentForkDigest = newDigest
 		f.lastUpdate = time.Now()
 
-		// Log would go here
-		// logger.Info("Fork activated", "old", oldDigest, "new", newDigest)
+		if f.logger != nil {
+			f.logger.Debugf("CL fork activated: digest %s -> %s (previous digest accepted for %s)",
+				oldDigest.String(), newDigest.String(), f.gracePeriod)
+		}
 	}
 
 	// Clean up expired old digests
@@ -242,35 +243,6 @@ func (f *ForkDigestFilter) Update() {
 	for digest, activationTime := range f.oldForkDigests {
 		if now.Sub(activationTime) > f.gracePeriod {
 			delete(f.oldForkDigests, digest)
-		}
-	}
-}
-
-// StartPeriodicUpdate starts a background goroutine that periodically updates the fork digest.
-//
-// Parameters:
-//   - interval: How often to check for fork activations (e.g., 5 minutes)
-//   - stopCh: Channel to signal shutdown
-//
-// Example:
-//
-//	stopCh := make(chan struct{})
-//	filter.StartPeriodicUpdate(5*time.Minute, genesisTime, stopCh)
-//
-//	// Later, to stop:
-//	close(stopCh)
-func (f *ForkDigestFilter) StartPeriodicUpdate(interval time.Duration, stopCh <-chan struct{}) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			// Update fork digest
-			f.Update()
-
-		case <-stopCh:
-			return
 		}
 	}
 }
@@ -308,7 +280,6 @@ type FilterStats struct {
 	AcceptedOld        int
 	AcceptedHistorical int
 	RejectedInvalid    int
-	RejectedExpired    int
 	CurrentDigest      ForkDigest
 	OldDigests         int
 	LastUpdate         time.Time
@@ -325,7 +296,6 @@ func (f *ForkDigestFilter) GetStats() FilterStats {
 		AcceptedOld:        f.acceptedOld,
 		AcceptedHistorical: f.acceptedHistorical,
 		RejectedInvalid:    f.rejectedInvalid,
-		RejectedExpired:    f.rejectedExpired,
 		CurrentDigest:      f.currentForkDigest,
 		OldDigests:         len(f.oldForkDigests),
 		LastUpdate:         f.lastUpdate,
@@ -375,6 +345,13 @@ func (f *ForkDigestFilter) nextForkInfo() ([4]byte, uint64) {
 	currentForkVersion := f.config.GetForkVersionAtEpoch(currentEpoch)
 
 	for _, fork := range f.config.getForks() {
+		// An unscheduled fork is not an upcoming one. Returning its version
+		// published a next_fork_version for a fork that may never activate,
+		// where the spec wants the current version once next_fork_epoch is
+		// FAR_FUTURE_EPOCH.
+		if fork.epoch == farFutureEpoch {
+			continue
+		}
 		if fork.epoch > currentEpoch {
 			return fork.parsedVersion, fork.epoch
 		}
@@ -499,12 +476,13 @@ func (f *ForkDigestFilter) GetRejectedInvalid() int {
 	return f.rejectedInvalid
 }
 
-// GetRejectedExpired returns the count of nodes rejected due to expired grace period.
-func (f *ForkDigestFilter) GetRejectedExpired() int {
+// GetAcceptedHistorical returns the count of nodes accepted on a historical
+// fork digest (valid chain, not the current or grace-period fork).
+func (f *ForkDigestFilter) GetAcceptedHistorical() int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	return f.rejectedExpired
+	return f.acceptedHistorical
 }
 
 // GetTotalChecks returns the total number of filter checks performed.
@@ -561,21 +539,4 @@ func CompatibilityMode(acceptedDigests []ForkDigest) enr.ENRFilter {
 		// Check if accepted
 		return digestMap[forkDigest]
 	}
-}
-
-// ForkFilterStats contains statistics about fork digest filtering.
-type ForkFilterStats struct {
-	NetworkName     string
-	CurrentFork     string
-	CurrentDigest   string
-	PreviousFork    string
-	PreviousDigest  string
-	GenesisDigest   string
-	GracePeriod     string
-	OldDigests      map[string]time.Duration
-	AcceptedCurrent int
-	AcceptedOld     int
-	RejectedInvalid int
-	RejectedExpired int
-	TotalChecks     int
 }

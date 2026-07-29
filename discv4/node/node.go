@@ -31,6 +31,11 @@ type Node struct {
 	// pubKey is the node's secp256k1 public key
 	pubKey *ecdsa.PublicKey
 
+	// mu guards addr, enr and the stats pointer: SetAddr/SetENR/SetStats
+	// replace them from other goroutines while packet handling reads them.
+	// The pointed-to values synchronize themselves or are replaced whole.
+	mu sync.RWMutex
+
 	// addr is the node's UDP address
 	addr *net.UDPAddr
 
@@ -159,6 +164,8 @@ func (n *Node) PublicKey() *ecdsa.PublicKey {
 
 // Addr returns the node's UDP address.
 func (n *Node) Addr() *net.UDPAddr {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.addr
 }
 
@@ -166,17 +173,30 @@ func (n *Node) Addr() *net.UDPAddr {
 //
 // This is used when we receive packets from a different address than expected.
 func (n *Node) SetAddr(addr *net.UDPAddr) {
+	n.mu.Lock()
 	n.addr = addr
+	n.mu.Unlock()
 }
 
 // ENR returns the node's ENR record, if available.
 func (n *Node) ENR() *enr.Record {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.enr
 }
 
 // SetENR updates the node's ENR record.
 func (n *Node) SetENR(record *enr.Record) {
+	n.mu.Lock()
 	n.enr = record
+	n.mu.Unlock()
+}
+
+// statsRef returns the current shared stats pointer for use outside the lock.
+func (n *Node) statsRef() *stats.SharedStats {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.stats
 }
 
 // Enode returns the node's enode:// representation.
@@ -185,12 +205,14 @@ func (n *Node) Enode() *enode.Enode {
 		return n.enode
 	}
 
+	addr := n.Addr()
+
 	// Build enode from node info
 	return &enode.Enode{
 		PublicKey: n.pubKey,
-		IP:        n.addr.IP,
-		UDP:       uint16(n.addr.Port),
-		TCP:       uint16(n.addr.Port), // Assume same port for TCP
+		IP:        addr.IP,
+		UDP:       uint16(addr.Port),
+		TCP:       uint16(addr.Port), // Assume same port for TCP
 	}
 }
 
@@ -201,7 +223,7 @@ func (n *Node) String() string {
 	n.bondMu.RUnlock()
 
 	return fmt.Sprintf("Node{id=%x, addr=%s, bond=%s}",
-		n.id[:8], n.addr.String(), bondStatus)
+		n.id[:8], n.Addr().String(), bondStatus)
 }
 
 // Bond Status Methods
@@ -241,7 +263,7 @@ func (n *Node) MarkPingSent() {
 	}
 	n.bondMu.Unlock()
 
-	n.stats.SetLastPing(now)
+	n.statsRef().SetLastPing(now)
 }
 
 // MarkPingReceived records that we received a PING from this node.
@@ -276,7 +298,7 @@ func (n *Node) MarkPongReceived(bondDuration time.Duration) {
 	n.consecutiveTimeout = 0
 	n.bondMu.Unlock()
 
-	n.stats.ResetFailureCount()
+	n.statsRef().ResetFailureCount()
 	n.UpdateLastSeen()
 }
 
@@ -286,7 +308,7 @@ func (n *Node) MarkTimeout() {
 	n.consecutiveTimeout++
 	n.bondMu.Unlock()
 
-	n.stats.IncrementFailureCount()
+	n.statsRef().IncrementFailureCount()
 }
 
 // LastPingSent returns when we last sent a PING.
@@ -314,17 +336,17 @@ func (n *Node) BondExpiration() time.Time {
 
 // UpdateLastSeen updates the last seen timestamp.
 func (n *Node) UpdateLastSeen() {
-	n.stats.SetLastSeen(time.Now())
+	n.statsRef().SetLastSeen(time.Now())
 }
 
 // LastSeen returns when we last saw a packet from this node.
 func (n *Node) LastSeen() time.Time {
-	return n.stats.LastSeen()
+	return n.statsRef().LastSeen()
 }
 
 // FailedPings returns the number of failed ping attempts.
 func (n *Node) FailedPings() uint32 {
-	return uint32(n.stats.FailureCount())
+	return uint32(n.statsRef().FailureCount())
 }
 
 // IncrementPacketsReceived increments the received packet counter.
@@ -366,7 +388,9 @@ func (n *Node) ConsecutiveTimeouts() uint32 {
 // This allows the node to update stats owned by a parent node.
 func (n *Node) SetStats(sharedStats *stats.SharedStats) {
 	if sharedStats != nil {
+		n.mu.Lock()
 		n.stats = sharedStats
+		n.mu.Unlock()
 	}
 }
 

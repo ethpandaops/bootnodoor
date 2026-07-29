@@ -141,6 +141,8 @@ func (n *Node) PublicKey() *ecdsa.PublicKey {
 
 // ENR returns the node's ENR record.
 func (n *Node) ENR() *enr.Record {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.enr
 }
 
@@ -165,27 +167,38 @@ func (n *Node) SetAddr(addr *net.UDPAddr) {
 
 // V4 returns the discv4 node if available.
 func (n *Node) V4() *node.Node {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.v4Node
 }
 
 // V5 returns the discv5 node if available.
 func (n *Node) V5() *discv5node.Node {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.v5Node
 }
 
 // HasV4 returns true if this node supports discv4.
 func (n *Node) HasV4() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.v4Node != nil
 }
 
 // HasV5 returns true if this node supports discv5.
 func (n *Node) HasV5() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.v5Node != nil
 }
 
 // SetV4 sets the discv4 node and marks protocol support dirty.
 func (n *Node) SetV4(v4 *node.Node) {
+	n.mu.Lock()
 	n.v4Node = v4
+	n.mu.Unlock()
+
 	if v4 != nil && n.nodeStats != nil {
 		// Ensure callback is set up (in case stats were created elsewhere)
 		n.setupSharedStatsCallback()
@@ -197,7 +210,10 @@ func (n *Node) SetV4(v4 *node.Node) {
 
 // SetV5 sets the discv5 node and marks protocol support dirty.
 func (n *Node) SetV5(v5 *discv5node.Node) {
+	n.mu.Lock()
 	n.v5Node = v5
+	n.mu.Unlock()
+
 	if v5 != nil && n.nodeStats != nil {
 		// Ensure callback is set up (in case stats were created elsewhere)
 		n.setupSharedStatsCallback()
@@ -209,8 +225,12 @@ func (n *Node) SetV5(v5 *discv5node.Node) {
 
 // Enode returns the node's enode:// URL representation.
 func (n *Node) Enode() *enode.Enode {
-	if n.v4Node != nil {
-		return n.v4Node.Enode()
+	n.mu.RLock()
+	v4 := n.v4Node
+	n.mu.RUnlock()
+
+	if v4 != nil {
+		return v4.Enode()
 	}
 
 	// Build from generic node info
@@ -382,14 +402,20 @@ type NodeStats struct {
 
 // Record returns the node's ENR record.
 func (n *Node) Record() *enr.Record {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 	return n.enr
 }
 
 // PeerID returns the libp2p peer ID for this node.
 // Delegates to the v5 node if available, otherwise builds it from the public key.
 func (n *Node) PeerID() string {
-	if n.v5Node != nil {
-		return n.v5Node.PeerID()
+	n.mu.RLock()
+	v5 := n.v5Node
+	n.mu.RUnlock()
+
+	if v5 != nil {
+		return v5.PeerID()
 	}
 	// Fallback: build peer ID from public key
 	if n.pubKey != nil {
@@ -406,18 +432,22 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 	}
 
 	// Update our ENR
-	if newRecord.Seq() > n.enr.Seq() {
-		n.enr = newRecord
+	n.mu.Lock()
+	if newRecord.Seq() <= n.enr.Seq() {
+		n.mu.Unlock()
+		return false
+	}
+	n.enr = newRecord
+	v5 := n.v5Node
+	n.mu.Unlock()
 
-		// Update v5 node if available
-		if n.v5Node != nil {
-			n.v5Node.UpdateENR(newRecord)
-		}
-
-		return true
+	// Update v5 node if available - outside the lock so n.mu never nests with
+	// the v5 node's own mutex.
+	if v5 != nil {
+		v5.UpdateENR(newRecord)
 	}
 
-	return false
+	return true
 }
 
 // NeedsPing checks if the node needs a liveness check.
@@ -434,7 +464,11 @@ func (n *Node) IsAlive(maxAge time.Duration, maxFailures int) bool {
 // CalculateScore computes a quality score for the node.
 // Delegates to the v5 node if available.
 func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
-	if n.v5Node != nil {
+	n.mu.RLock()
+	v5 := n.v5Node
+	n.mu.RUnlock()
+
+	if v5 != nil {
 		// Cast forkInfo to the v5 node's ForkScoringInfo type
 		if forkInfo != nil {
 			// Convert table.ForkScoringInfo to discv5/node.ForkScoringInfo
@@ -444,10 +478,10 @@ func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
 				GenesisForkDigest:  forkInfo.GenesisForkDigest,
 				GracePeriodEnd:     forkInfo.GracePeriodEnd,
 			}
-			return n.v5Node.CalculateScore(v5ForkInfo)
+			return v5.CalculateScore(v5ForkInfo)
 		}
 		// If forkInfo is nil or wrong type, call with nil
-		return n.v5Node.CalculateScore(nil)
+		return v5.CalculateScore(nil)
 	}
 	// Basic fallback score based on success rate
 	successCount := n.SuccessCount()

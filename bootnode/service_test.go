@@ -2,6 +2,7 @@ package bootnode
 
 import (
 	"crypto/ecdsa"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -527,4 +528,82 @@ func TestLayerENR_StripsForeignForkField(t *testing.T) {
 	if err := cl.Get("eth", &v); err == nil {
 		t.Error("CL ENR should not carry eth")
 	}
+}
+
+// The published eth entry must describe the current fork era, not the genesis
+// era with an already-passed Next (which geth-family peers treat as stale).
+func TestUpdateENR_PublishesCurrentEraForkID(t *testing.T) {
+	const genesisTime = 1000
+	passed := uint64(time.Now().Unix()) - 3600
+	future := uint64(time.Now().Unix()) + 86400
+	cfg := &Config{
+		Logger:        quietLogger(),
+		ELConfig:      mustChainConfig(t, fmt.Sprintf(`{"chainId":1,"shanghaiTime":%d,"cancunTime":%d}`, passed, future)),
+		ELGenesisHash: [32]byte{1, 2, 3},
+		ELGenesisTime: genesisTime,
+	}
+	key := mustKey(t)
+	ln, err := createLocalNode(cfg, key, net.ParseIP("1.2.3.4"), nil, 9000, nil)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+
+	mgr := NewENRManager(cfg, key, ln, true, false)
+	headBlock, headTime := StaticHead()
+	if err := mgr.UpdateENR(headBlock, headTime); err != nil {
+		t.Fatalf("UpdateENR: %v", err)
+	}
+
+	eth, ok := ln.Record().Eth()
+	if !ok || len(eth) == 0 {
+		t.Fatal("EL identity did not advertise eth")
+	}
+	want := mgr.GetELFilter().GetCurrentForkID(headBlock, headTime)
+	if eth[0].ForkID != want.Hash || eth[0].NextForkEpoch != want.Next {
+		t.Fatalf("published eth = {%#x %d}, want current era {%#x %d}", eth[0].ForkID, eth[0].NextForkEpoch, want.Hash, want.Next)
+	}
+	if eth[0].NextForkEpoch != future {
+		t.Fatalf("published Next = %d, want the upcoming fork %d", eth[0].NextForkEpoch, future)
+	}
+}
+
+// The refresh tick calls UpdateENR every minute; an unchanged record must not
+// bump the sequence number, because peers re-fetch on every bump.
+func TestUpdateENR_NoSeqBumpWhenUnchanged(t *testing.T) {
+	cfg := &Config{
+		Logger:        quietLogger(),
+		ELConfig:      mustChainConfig(t, `{"chainId":1,"shanghaiTime":1500}`),
+		ELGenesisHash: [32]byte{4, 5, 6},
+		ELGenesisTime: 1000,
+	}
+	key := mustKey(t)
+	ln, err := createLocalNode(cfg, key, net.ParseIP("1.2.3.4"), nil, 9000, nil)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+
+	mgr := NewENRManager(cfg, key, ln, true, false)
+	headBlock, headTime := StaticHead()
+	if err := mgr.UpdateENR(headBlock, headTime); err != nil {
+		t.Fatalf("first UpdateENR: %v", err)
+	}
+	seq := ln.Record().Seq()
+
+	for i := 0; i < 3; i++ {
+		if err := mgr.UpdateENR(StaticHead()); err != nil {
+			t.Fatalf("repeat UpdateENR: %v", err)
+		}
+	}
+	if got := ln.Record().Seq(); got != seq {
+		t.Fatalf("sequence advanced from %d to %d without a field change", seq, got)
+	}
+}
+
+func mustChainConfig(t *testing.T, jsonCfg string) *elconfig.ChainConfig {
+	t.Helper()
+	cfg, err := elconfig.ParseChainConfig([]byte(jsonCfg))
+	if err != nil {
+		t.Fatalf("ParseChainConfig: %v", err)
+	}
+	return cfg
 }

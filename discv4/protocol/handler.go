@@ -69,6 +69,10 @@ type Handler struct {
 	pendingNeighborsMu sync.RWMutex
 	pendingNeighbors   map[string]*PendingNeighborsResponse
 
+	// Local ENR, replaceable while running (fork transitions, IP discovery)
+	localENRMu sync.RWMutex
+	localENR   *enr.Record
+
 	// Statistics
 	statsMu               sync.RWMutex
 	packetsReceived       uint64
@@ -85,7 +89,9 @@ type HandlerConfig struct {
 	// PrivateKey is our node's private key
 	PrivateKey *ecdsa.PrivateKey
 
-	// LocalENR is our node's ENR record (optional)
+	// LocalENR is our node's ENR record (optional). It seeds the handler's
+	// record; SetLocalENR replaces it while running, so handler code must read
+	// LocalRecord() rather than this field.
 	LocalENR *enr.Record
 
 	// LocalAddr is our listening address
@@ -99,6 +105,16 @@ type HandlerConfig struct {
 
 	// ExpirationWindow is the acceptable time range for packet expiration (default 20s)
 	ExpirationWindow time.Duration
+
+	// MaxNodes is the maximum number of nodes to track (default 50000).
+	// Once reached, new nodes are handled but not retained until a slot frees up,
+	// keeping memory bounded under floods of distinct node IDs.
+	MaxNodes int
+
+	// NodeTTL is how long an unbonded node is retained since it was last seen
+	// before it becomes eligible for eviction (default 5 minutes). Bonded nodes
+	// are kept until their bond expires.
+	NodeTTL time.Duration
 
 	// Callbacks (all optional)
 	OnPing         OnPingCallback
@@ -134,11 +150,17 @@ type PendingNeighborsResponse struct {
 	// Nodes accumulated so far
 	Nodes []*node.Node
 
+	// Reserved counts nodes a handler has claimed room for but may not have
+	// appended yet. Reserving before decoding makes the persistence cap exact
+	// even when packets are dispatched concurrently.
+	Reserved int
+
+	// Closed marks a delivered entry. Packets processed after delivery must
+	// not reserve against it; cleanup evicts the tombstone by CreatedAt.
+	Closed bool
+
 	// CreatedAt is when we received the first packet
 	CreatedAt time.Time
-
-	// LastRecv is when we received the last packet
-	LastRecv time.Time
 }
 
 const (
@@ -154,8 +176,27 @@ const (
 	// cleanupInterval is how often we run cleanup
 	cleanupInterval = 5 * time.Second
 
-	// neighborsTimeout is how long to wait for additional NEIGHBORS packets
+	// neighborsTimeout is how long a pending NEIGHBORS entry may live before
+	// cleanup evicts it as a backstop.
 	neighborsTimeout = 2 * time.Second
+
+	// defaultMaxNodes is the default cap on tracked nodes. It bounds memory
+	// against floods of distinct node IDs (for example fabricated NEIGHBORS
+	// records) that would otherwise grow the map without limit.
+	defaultMaxNodes = 50000
+
+	// defaultNodeTTL is how long an unbonded node is retained since it was last
+	// seen before it becomes eligible for eviction.
+	defaultNodeTTL = 5 * time.Minute
+
+	// neighborsCollectWindow is how long we accumulate multi-packet NEIGHBORS
+	// before delivering the collected nodes to the waiting FINDNODE.
+	neighborsCollectWindow = 100 * time.Millisecond
+
+	// maxNeighborsPerResponse caps the nodes accumulated for one FINDNODE. A
+	// discv4 FINDNODE returns at most one k-bucket, so anything beyond this is a
+	// flood and is dropped.
+	maxNeighborsPerResponse = 16
 )
 
 // NewHandler creates a new protocol handler.
@@ -170,6 +211,12 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 	if config.ExpirationWindow == 0 {
 		config.ExpirationWindow = defaultExpirationWindow
 	}
+	if config.MaxNodes == 0 {
+		config.MaxNodes = defaultMaxNodes
+	}
+	if config.NodeTTL == 0 {
+		config.NodeTTL = defaultNodeTTL
+	}
 
 	h := &Handler{
 		config:           config,
@@ -178,6 +225,7 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 		nodes:            make(map[node.ID]*node.Node),
 		requests:         make(map[string]*PendingRequest),
 		pendingNeighbors: make(map[string]*PendingNeighborsResponse),
+		localENR:         config.LocalENR,
 	}
 
 	// Start cleanup goroutine
@@ -337,7 +385,7 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 	// Match to pending request
 	req := h.getPendingRequest(string(pong.ReplyTok))
 	if req != nil {
-		req.ResponseChan <- pong
+		h.deliverResponse(req, pong)
 	}
 
 	// Check if remote node has newer ENR
@@ -402,9 +450,41 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 
 	h.incrementFindnodeResponsesRecv()
 
-	// Convert nodes
-	nodes := make([]*node.Node, 0, len(neighbors.Nodes))
+	// Only accept NEIGHBORS in response to a FINDNODE we actually sent to this
+	// node. Dropping unsolicited NEIGHBORS prevents a peer we never queried from
+	// making us accumulate node records without bound.
+	matchedReq := h.findPendingFindnode(fromNode.ID())
+	if matchedReq == nil {
+		return nil
+	}
+
+	// Accumulate the response, keyed by the matched request's hash so each
+	// FINDNODE gets exactly one entry and a fresh request never collides with
+	// a delivered one. Room is reserved before decoding, so records past the
+	// cap are never persisted in the global node map, even when packets are
+	// dispatched concurrently.
+	key := string(matchedReq.RequestHash)
+
+	h.pendingNeighborsMu.Lock()
+	pending := h.pendingNeighbors[key]
+	if pending != nil && pending.Closed {
+		h.pendingNeighborsMu.Unlock()
+		return nil
+	}
+	firstPacket := pending == nil
+	if firstPacket {
+		pending = &PendingNeighborsResponse{CreatedAt: time.Now()}
+		h.pendingNeighbors[key] = pending
+	}
+	take := min(len(neighbors.Nodes), maxNeighborsPerResponse-pending.Reserved)
+	pending.Reserved += take
+	h.pendingNeighborsMu.Unlock()
+
+	nodes := make([]*node.Node, 0, take)
 	for _, n := range neighbors.Nodes {
+		if len(nodes) >= take {
+			break
+		}
 		pubkey, err := DecodePubkey(crypto.S256(), n.ID)
 		if err != nil {
 			logrus.WithError(err).Debug("Invalid node public key in NEIGHBORS")
@@ -417,53 +497,33 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		}
 
 		nodeID := node.PubkeyToID(pubkey)
-		discoveredNode := h.getOrCreateNode(nodeID, pubkey, addr)
-		nodes = append(nodes, discoveredNode)
+		nodes = append(nodes, h.getOrCreateNode(nodeID, pubkey, addr))
 	}
 
-	// Try to match to pending request
-	// We use the sender's node ID as the key for pending FINDNODE requests
-	key := string(fromNode.IDBytes())
-
 	h.pendingNeighborsMu.Lock()
-	pending := h.pendingNeighbors[key]
-	if pending == nil {
-		pending = &PendingNeighborsResponse{
-			Nodes:     nodes,
-			CreatedAt: time.Now(),
-			LastRecv:  time.Now(),
-		}
-		h.pendingNeighbors[key] = pending
-	} else {
-		pending.Nodes = append(pending.Nodes, nodes...)
-		pending.LastRecv = time.Now()
+	if p := h.pendingNeighbors[key]; p != nil && !p.Closed {
+		p.Nodes = append(p.Nodes, nodes...)
 	}
 	h.pendingNeighborsMu.Unlock()
 
-	// Check if we have a pending request waiting for this
-	h.requestsMu.RLock()
-	var matchedReq *PendingRequest
-	for _, req := range h.requests {
-		if req.PacketType == FindnodePacket && req.ToNode.ID() == fromNode.ID() {
-			matchedReq = req
-			break
-		}
-	}
-	h.requestsMu.RUnlock()
-
-	if matchedReq != nil {
-		// Deliver accumulated nodes after a short delay
-		// (in case more NEIGHBORS packets arrive)
+	// Deliver once, after a short window that lets multi-packet responses
+	// arrive. Only the first packet schedules delivery, so a flood cannot spawn
+	// a goroutine per packet.
+	if firstPacket {
 		go func() {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(neighborsCollectWindow)
 
 			h.pendingNeighborsMu.Lock()
 			finalPending := h.pendingNeighbors[key]
-			delete(h.pendingNeighbors, key)
+			var collected []*node.Node
+			if finalPending != nil {
+				finalPending.Closed = true
+				collected = finalPending.Nodes
+			}
 			h.pendingNeighborsMu.Unlock()
 
 			if finalPending != nil {
-				matchedReq.ResponseChan <- finalPending.Nodes
+				h.deliverResponse(matchedReq, collected)
 			}
 		}()
 	}
@@ -522,7 +582,7 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 	// Match to pending request
 	req := h.getPendingRequest(string(resp.ReplyTok))
 	if req != nil {
-		req.ResponseChan <- resp.Record
+		h.deliverResponse(req, resp.Record)
 	}
 
 	return nil
@@ -543,8 +603,8 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 	}
 
 	// Add ENR sequence if we have an ENR
-	if h.config.LocalENR != nil {
-		ping.ENRSeq = h.config.LocalENR.Seq()
+	if rec := h.LocalRecord(); rec != nil {
+		ping.ENRSeq = rec.Seq()
 	}
 
 	// Encode packet
@@ -553,12 +613,12 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 		return nil, fmt.Errorf("encode error: %w", err)
 	}
 
-	// Register pending request
+	// Register pending request; removal is deferred so every exit path clears it.
 	req := h.addPendingRequest(hash, n, PingPacket)
+	defer h.removePendingRequest(string(hash))
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
-		h.removePendingRequest(string(hash))
 		return nil, err
 	}
 
@@ -579,11 +639,9 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 		}
 		return nil, fmt.Errorf("unexpected response type")
 	case <-time.After(h.config.RequestTimeout):
-		h.removePendingRequest(string(hash))
 		n.MarkTimeout()
 		return nil, fmt.Errorf("timeout")
 	case <-h.ctx.Done():
-		h.removePendingRequest(string(hash))
 		return nil, h.ctx.Err()
 	}
 }
@@ -613,12 +671,14 @@ func (h *Handler) Findnode(n *node.Node, target []byte) ([]*node.Node, error) {
 		return nil, fmt.Errorf("encode error: %w", err)
 	}
 
-	// Register pending request
+	// Register pending request. Removal is deferred so every exit path clears
+	// it: a completed request left in the map keeps matching later NEIGHBORS
+	// from that node and reopens collection windows until cleanup runs.
 	req := h.addPendingRequest(hash, n, FindnodePacket)
+	defer h.removePendingRequest(string(hash))
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
-		h.removePendingRequest(string(hash))
 		return nil, err
 	}
 
@@ -633,11 +693,9 @@ func (h *Handler) Findnode(n *node.Node, target []byte) ([]*node.Node, error) {
 		}
 		return nil, fmt.Errorf("unexpected response type")
 	case <-time.After(h.config.RequestTimeout * 3): // Longer timeout for multi-packet responses
-		h.removePendingRequest(string(hash))
 		n.MarkTimeout()
 		return nil, fmt.Errorf("timeout")
 	case <-h.ctx.Done():
-		h.removePendingRequest(string(hash))
 		return nil, h.ctx.Err()
 	}
 }
@@ -666,12 +724,12 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 		return nil, fmt.Errorf("encode error: %w", err)
 	}
 
-	// Register pending request
+	// Register pending request; removal is deferred so every exit path clears it.
 	pendingReq := h.addPendingRequest(hash, n, ENRRequestPacket)
+	defer h.removePendingRequest(string(hash))
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
-		h.removePendingRequest(string(hash))
 		return nil, err
 	}
 
@@ -686,11 +744,9 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 		}
 		return nil, fmt.Errorf("unexpected response type")
 	case <-time.After(h.config.RequestTimeout):
-		h.removePendingRequest(string(hash))
 		n.MarkTimeout()
 		return nil, fmt.Errorf("timeout")
 	case <-h.ctx.Done():
-		h.removePendingRequest(string(hash))
 		return nil, h.ctx.Err()
 	}
 }
@@ -704,8 +760,8 @@ func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPA
 	}
 
 	// Add ENR sequence if we have an ENR
-	if h.config.LocalENR != nil {
-		pong.ENRSeq = h.config.LocalENR.Seq()
+	if rec := h.LocalRecord(); rec != nil {
+		pong.ENRSeq = rec.Seq()
 	}
 
 	packet, _, err := Encode(h.config.PrivateKey, pong)
@@ -768,13 +824,14 @@ func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net
 
 // sendENRResponse sends an ENRRESPONSE.
 func (h *Handler) sendENRResponse(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, replyTok []byte) error {
-	if h.config.LocalENR == nil {
+	rec := h.LocalRecord()
+	if rec == nil {
 		return fmt.Errorf("no local ENR configured")
 	}
 
 	resp := &ENRResponse{
 		ReplyTok: replyTok,
-		Record:   h.config.LocalENR,
+		Record:   rec,
 	}
 
 	packet, _, err := Encode(h.config.PrivateKey, resp)
@@ -808,8 +865,20 @@ func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net
 		return n
 	}
 
-	// Create new node
+	// Create new node. Stamp last-seen with the insertion time: a node learned
+	// from a NEIGHBORS record has never sent us a packet, and a zero timestamp
+	// would make cleanup evict it on its next run regardless of NodeTTL.
 	n = node.New(pubkey, addr)
+	n.UpdateLastSeen()
+
+	// Bound the map so an unauthenticated flood of distinct node IDs (for
+	// example fabricated NEIGHBORS records) cannot grow it without limit. Stale
+	// unbonded entries are reclaimed by cleanup; until a slot frees up we still
+	// return the node so the packet is handled, but we do not retain it.
+	if len(h.nodes) >= h.config.MaxNodes {
+		return n
+	}
+
 	h.nodes[id] = n
 	return n
 }
@@ -860,11 +929,38 @@ func (h *Handler) getPendingRequest(hash string) *PendingRequest {
 	return h.requests[hash]
 }
 
+// findPendingFindnode returns a pending FINDNODE request awaiting a response
+// from the given node, or nil if none exists.
+func (h *Handler) findPendingFindnode(id node.ID) *PendingRequest {
+	h.requestsMu.RLock()
+	defer h.requestsMu.RUnlock()
+	for _, req := range h.requests {
+		if req.PacketType == FindnodePacket && req.ToNode != nil && req.ToNode.ID() == id {
+			return req
+		}
+	}
+	return nil
+}
+
 // removePendingRequest removes a pending request.
 func (h *Handler) removePendingRequest(hash string) {
 	h.requestsMu.Lock()
 	delete(h.requests, hash)
 	h.requestsMu.Unlock()
+}
+
+// deliverResponse hands a response to a waiting request without blocking.
+//
+// ResponseChan is buffered (size 1) and read at most once by the waiter. A
+// duplicate, replayed or late response therefore finds the buffer full or the
+// waiter already gone. Sending directly would park the packet-dispatch
+// goroutine forever, so an unauthenticated peer could leak goroutines by
+// replaying responses. The non-blocking send drops the extra response instead.
+func (h *Handler) deliverResponse(req *PendingRequest, resp interface{}) {
+	select {
+	case req.ResponseChan <- resp:
+	default:
+	}
 }
 
 // Cleanup
@@ -900,11 +996,22 @@ func (h *Handler) cleanup() {
 	// Clean up old pending neighbors
 	h.pendingNeighborsMu.Lock()
 	for key, pending := range h.pendingNeighbors {
-		if now.Sub(pending.LastRecv) > neighborsTimeout {
+		if now.Sub(pending.CreatedAt) > neighborsTimeout {
 			delete(h.pendingNeighbors, key)
 		}
 	}
 	h.pendingNeighborsMu.Unlock()
+
+	// Evict stale, unbonded nodes so the map stays bounded. Bonded nodes are
+	// kept until their bond expires, after which IsBonded reports false and they
+	// become eligible here.
+	h.nodesMu.Lock()
+	for id, n := range h.nodes {
+		if !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
+			delete(h.nodes, id)
+		}
+	}
+	h.nodesMu.Unlock()
 }
 
 // Statistics
@@ -951,21 +1058,79 @@ func (h *Handler) incrementFindnodeResponsesRecv() {
 	h.statsMu.Unlock()
 }
 
-// Stats returns current statistics.
-func (h *Handler) Stats() map[string]interface{} {
+// HandlerStats is a snapshot of the handler's counters.
+type HandlerStats struct {
+	PacketsReceived       uint64
+	PacketsSent           uint64
+	InvalidPackets        uint64
+	ExpiredPackets        uint64
+	UnbondedFindnode      uint64
+	FindnodeRequestsRecv  uint64
+	FindnodeResponsesRecv uint64
+	KnownNodes            int
+	PendingRequests       int
+	PendingNeighbors      int
+}
+
+// GetStats returns current statistics.
+func (h *Handler) GetStats() HandlerStats {
+	h.nodesMu.RLock()
+	knownNodes := len(h.nodes)
+	h.nodesMu.RUnlock()
+	h.requestsMu.RLock()
+	pendingRequests := len(h.requests)
+	h.requestsMu.RUnlock()
+	h.pendingNeighborsMu.RLock()
+	pendingNeighbors := len(h.pendingNeighbors)
+	h.pendingNeighborsMu.RUnlock()
+
 	h.statsMu.RLock()
 	defer h.statsMu.RUnlock()
 
-	return map[string]interface{}{
-		"packets_received":        h.packetsReceived,
-		"packets_sent":            h.packetsSent,
-		"invalid_packets":         h.invalidPackets,
-		"expired_packets":         h.expiredPackets,
-		"unbonded_findnode":       h.unbondedFindnode,
-		"findnode_requests_recv":  h.findnodeRequestsRecv,
-		"findnode_responses_recv": h.findnodeResponsesRecv,
-		"known_nodes":             len(h.nodes),
-		"pending_requests":        len(h.requests),
-		"pending_neighbors":       len(h.pendingNeighbors),
+	return HandlerStats{
+		PacketsReceived:       h.packetsReceived,
+		PacketsSent:           h.packetsSent,
+		InvalidPackets:        h.invalidPackets,
+		ExpiredPackets:        h.expiredPackets,
+		UnbondedFindnode:      h.unbondedFindnode,
+		FindnodeRequestsRecv:  h.findnodeRequestsRecv,
+		FindnodeResponsesRecv: h.findnodeResponsesRecv,
+		KnownNodes:            knownNodes,
+		PendingRequests:       pendingRequests,
+		PendingNeighbors:      pendingNeighbors,
 	}
+}
+
+// Stats returns current statistics as a map, for callers that render it
+// generically.
+func (h *Handler) Stats() map[string]interface{} {
+	s := h.GetStats()
+	return map[string]interface{}{
+		"packets_received":        s.PacketsReceived,
+		"packets_sent":            s.PacketsSent,
+		"invalid_packets":         s.InvalidPackets,
+		"expired_packets":         s.ExpiredPackets,
+		"unbonded_findnode":       s.UnbondedFindnode,
+		"findnode_requests_recv":  s.FindnodeRequestsRecv,
+		"findnode_responses_recv": s.FindnodeResponsesRecv,
+		"known_nodes":             s.KnownNodes,
+		"pending_requests":        s.PendingRequests,
+		"pending_neighbors":       s.PendingNeighbors,
+	}
+}
+
+// LocalRecord returns the ENR the handler currently advertises.
+func (h *Handler) LocalRecord() *enr.Record {
+	h.localENRMu.RLock()
+	defer h.localENRMu.RUnlock()
+	return h.localENR
+}
+
+// SetLocalENR replaces the advertised ENR in place, so a fork transition or an
+// IP-discovery update does not have to rebuild the handler and lose its bonds,
+// known nodes, pending requests and stats.
+func (h *Handler) SetLocalENR(record *enr.Record) {
+	h.localENRMu.Lock()
+	h.localENR = record
+	h.localENRMu.Unlock()
 }
