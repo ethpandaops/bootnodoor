@@ -180,16 +180,19 @@ func New(cfg *Config) (*Service, error) {
 	s.localNode = primary.localNode
 	s.enrManager = primary.enrManager
 
-	// Create IP discovery service
-	ipDiscoveryCfg := services.IPDiscoveryConfig{
-		MinReports:     5, // Require 5 reports
-		MinDistinctIPs: 3, // From at least 3 distinct IPs
-		Logger:         cfg.Logger,
-		OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
-			s.updateENRWithDiscoveredIP(ip, port, isIPv6)
-		},
+	// Create IP discovery service. Leaving it nil when disabled is the whole
+	// enforcement: onPongReceived already returns early on a nil service, so no
+	// peer report can reach consensus and rewrite the ENR.
+	if cfg.EnableIPDiscovery {
+		s.ipDiscovery = services.NewIPDiscovery(services.IPDiscoveryConfig{
+			MinReports:     5, // Require 5 reports
+			MinDistinctIPs: 3, // From at least 3 distinct IPs
+			Logger:         cfg.Logger,
+			OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
+				s.updateENRWithDiscoveredIP(ip, port, isIPv6)
+			},
+		})
 	}
-	s.ipDiscovery = services.NewIPDiscovery(ipDiscoveryCfg)
 
 	// Create node databases for enabled layers
 	var err error
@@ -1608,6 +1611,17 @@ func (s *Service) onPongReceived(remoteID []byte, sourceIP net.IP, reportedIP ne
 
 // updateENRWithDiscoveredIP updates every identity's ENR with the discovered IP.
 func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool) {
+	// An explicitly configured address is authoritative (see Config.ENRIPProvided),
+	// so peer reports must not move it. reconcileStoredENR already honours this at
+	// startup; without the same check here a configured address is overwritten
+	// while running and only restored on restart.
+	if isIPv6 && s.config.ENRIP6Provided {
+		return
+	}
+	if !isIPv6 && s.config.ENRIPProvided {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

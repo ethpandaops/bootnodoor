@@ -126,7 +126,9 @@ type Config struct {
 
 	// Discovery configuration
 
-	// EnableIPDiscovery enables automatic IP discovery from PONG responses (default: false)
+	// EnableIPDiscovery enables automatic IP discovery from PONG responses
+	// (default: true). An explicitly configured ENRIP/ENRIP6 is never overridden
+	// by discovery regardless of this setting.
 	EnableIPDiscovery bool
 
 	// GracePeriod is the grace period for accepting old fork digests (default: 60 minutes)
@@ -157,7 +159,7 @@ func DefaultConfig() *Config {
 		EnableDiscv5:      true,
 		SessionLifetime:   12 * time.Hour,
 		MaxSessions:       1024,
-		EnableIPDiscovery: false,
+		EnableIPDiscovery: true,
 		GracePeriod:       60 * time.Minute,
 	}
 }

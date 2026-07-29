@@ -59,9 +59,10 @@ var (
 	clEnrPort  int
 
 	// ENR configuration
-	enrIP   string
-	enrIP6  string
-	enrPort int
+	enrIP             string
+	enrIP6            string
+	enrPort           int
+	enableIPDiscovery bool
 
 	// Logging
 	logLevel string
@@ -139,6 +140,7 @@ func init() {
 	rootCmd.Flags().StringVar(&enrIP, "enr-ip", "", "IPv4 address to advertise in ENR (auto-detected if not specified)")
 	rootCmd.Flags().StringVar(&enrIP6, "enr-ip6", "", "IPv6 address to advertise in ENR (optional)")
 	rootCmd.Flags().IntVar(&enrPort, "enr-port", 0, "UDP port to advertise in ENR (0 = use bind-port)")
+	rootCmd.Flags().BoolVar(&enableIPDiscovery, "enable-ip-discovery", true, "Learn the external address from peer PONG reports (never overrides --enr-ip/--enr-ip6)")
 
 	// Logging
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
@@ -521,6 +523,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.ENRIP6 = enrIPv6
 	config.ENRIPProvided = enrIP != ""
 	config.ENRIP6Provided = enrIP6 != ""
+	config.EnableIPDiscovery = enableIPDiscovery
 	config.ENRPort = enrUDPPort
 	config.EnableDiscv4 = enableDiscv4
 	config.EnableDiscv5 = enableDiscv5
