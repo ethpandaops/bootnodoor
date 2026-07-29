@@ -368,3 +368,42 @@ func TestENRRefreshCooldownAfterRoundsExhausted(t *testing.T) {
 		t.Errorf("ENRREQUESTs went %d -> %d during the cooldown, want no new claim", afterFirst, afterSecond)
 	}
 }
+
+// A bump seen during a cooldown is remembered but not fetched, so the cached
+// record would stay stale unless another PONG happened to arrive later.
+func TestENRRefreshResumesBumpDeferredByCooldown(t *testing.T) {
+	peer := &scriptedPeer{t: t, enrSeq: 5, pongAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 30303}}
+
+	h, cancel := newScriptedHandler(t, peer)
+	defer cancel()
+	peer.h = h
+
+	n, key := makeKeyedNode(t, 30303)
+	peer.key = key
+	if !n.UpdateENR(signedV4Record(t, key, 1)) {
+		t.Fatal("seed record was not installed")
+	}
+	h.nodesMu.Lock()
+	h.nodes[n.ID()] = n
+	h.nodesMu.Unlock()
+
+	h.enrRefreshMu.Lock()
+	h.enrRefresh[n.ID()] = &enrRefreshState{highestSeenSeq: 9, targetSeq: 1}
+	h.enrRefreshMu.Unlock()
+
+	peer.setSeq(9)
+	h.resumeDeferredENRRefreshes()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, enrReqs := peer.counts(); enrReqs > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	peer.stop()
+
+	if _, enrReqs := peer.counts(); enrReqs == 0 {
+		t.Error("a bump deferred by cooldown was never fetched")
+	}
+}

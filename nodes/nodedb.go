@@ -182,10 +182,15 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 		"layer": ndb.layer,
 	}).Debug("processing batch update")
 
-	var requeue []*Node
+	type written struct {
+		node  *Node
+		flags DirtyFlags
+		gen   uint64
+	}
+	var processed []written
 
 	err := ndb.db.RunDBTransaction(func(tx *sqlx.Tx) error {
-		requeue = requeue[:0]
+		processed = processed[:0]
 		for _, node := range nodes {
 			dirtyFlags, dirtyGen := node.DirtySnapshot()
 			nodeID := node.ID()
@@ -202,10 +207,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to upsert node in batch")
 					continue
 				}
-				// Full upsert covers everything this pass observed.
-				if node.ClearDirtySnapshot(dirtyFlags, dirtyGen) {
-					requeue = append(requeue, node)
-				}
+				processed = append(processed, written{node, dirtyFlags, dirtyGen})
 				continue
 			}
 
@@ -252,11 +254,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				}
 			}
 
-			// Clear only what this pass observed, so a flag marked while the
-			// batch was running is not erased unwritten.
-			if node.ClearDirtySnapshot(dirtyFlags, dirtyGen) {
-				requeue = append(requeue, node)
-			}
+			processed = append(processed, written{node, dirtyFlags, dirtyGen})
 		}
 		return nil
 	})
@@ -277,10 +275,15 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 	}
 	ndb.updateQueueLock.Unlock()
 
-	// Re-queue anything marked dirty while this batch was in flight: those
-	// callers saw the node already queued and returned without enqueueing.
-	for _, node := range requeue {
-		if err := ndb.QueueUpdate(node); err != nil {
+	// Clear after the set entry is gone, so a caller that marked the node while
+	// the write was running either enqueued itself or is requeued here. Clearing
+	// first would let its QueueUpdate be swallowed as already-queued and then have
+	// the entry deleted underneath it.
+	for _, p := range processed {
+		if !p.node.ClearDirtySnapshot(p.flags, p.gen) {
+			continue
+		}
+		if err := ndb.QueueUpdate(p.node); err != nil {
 			ndb.logger.WithError(err).Debug("failed to requeue node dirtied during batch")
 		}
 	}

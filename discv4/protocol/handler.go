@@ -444,9 +444,14 @@ const maxENRRefreshRetries = 2
 // to open a fresh one.
 const maxENRRefreshRounds = 4
 
-// enrRefreshCooldown is how long a peer waits for a new claim after exhausting
-// one, capping sustained refresh traffic per peer regardless of what it advertises.
+// enrRefreshCooldown follows a claim that exhausted its rounds.
 const enrRefreshCooldown = 30 * time.Second
+
+// enrRefreshMinInterval separates consecutive claims for one peer. Bounding
+// rounds alone is not enough: a peer can advertise one increment per claim, let
+// it finish in a single round, and reopen on the next PONG, sustaining the same
+// ENRREQUEST rate without ever exhausting a claim.
+const enrRefreshMinInterval = 5 * time.Second
 
 // enrRefreshState tracks one peer's automatic ENR refresh.
 type enrRefreshState struct {
@@ -543,13 +548,56 @@ func (h *Handler) runENRRefresh(n *node.Node) {
 			continue
 		}
 
+		cooldown := enrRefreshMinInterval
 		if state.rounds >= maxENRRefreshRounds {
-			state.cooldownUntil = time.Now().Add(enrRefreshCooldown)
+			cooldown = enrRefreshCooldown
 		}
+		state.cooldownUntil = time.Now().Add(cooldown)
 		state.inFlight = false
 		state.retries = 0
 		h.enrRefreshMu.Unlock()
 		return
+	}
+}
+
+// resumeDeferredENRRefreshes starts refreshes for peers whose newer sequence was
+// observed during a cooldown. Without this the bump is remembered but never
+// fetched unless another PONG happens to arrive after the cooldown expires.
+func (h *Handler) resumeDeferredENRRefreshes() {
+	now := time.Now()
+
+	type pending struct {
+		id  node.ID
+		seq uint64
+	}
+	var due []pending
+
+	h.enrRefreshMu.Lock()
+	for id, state := range h.enrRefresh {
+		if state.inFlight || now.Before(state.cooldownUntil) {
+			continue
+		}
+		if state.highestSeenSeq > state.targetSeq {
+			due = append(due, pending{id, state.highestSeenSeq})
+		}
+	}
+	h.enrRefreshMu.Unlock()
+
+	if len(due) == 0 {
+		return
+	}
+
+	h.nodesMu.RLock()
+	resume := make([]*node.Node, 0, len(due))
+	for _, p := range due {
+		if n, ok := h.nodes[p.id]; ok && n.ENR() != nil && p.seq > n.ENR().Seq() {
+			resume = append(resume, n)
+		}
+	}
+	h.nodesMu.RUnlock()
+
+	for _, n := range resume {
+		h.startENRRefresh(n, 0)
 	}
 }
 
@@ -1357,6 +1405,7 @@ func (h *Handler) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			h.cleanup()
+			h.resumeDeferredENRRefreshes()
 		case <-h.ctx.Done():
 			return
 		}
