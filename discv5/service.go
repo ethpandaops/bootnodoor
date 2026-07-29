@@ -367,10 +367,12 @@ func (s *Service) TalkReq(n *node.Node, protocolName string, request []byte) ([]
 		Request:   request,
 	}
 
-	// Register pending request and send
-	respChan := s.handler.Requests().AddRequest(requestID, n, talkReq)
+	destAddr := n.Addr()
 
-	if err := s.handler.SendMessage(talkReq, n.ID(), n.Addr(), n); err != nil {
+	// Register pending request and send
+	respChan := s.handler.Requests().AddRequest(requestID, n, talkReq, destAddr)
+
+	if err := s.handler.SendMessage(talkReq, n.ID(), destAddr, n); err != nil {
 		s.handler.Requests().CancelRequest(requestID)
 		return nil, fmt.Errorf("failed to send talkreq: %w", err)
 	}

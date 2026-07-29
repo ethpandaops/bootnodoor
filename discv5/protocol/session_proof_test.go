@@ -116,6 +116,85 @@ func garbageOrdinaryPacket(t *testing.T, srcID, destID node.ID) []byte {
 	return data
 }
 
+// authenticPacket encrypts msg with the session key so it decrypts successfully,
+// letting a test vary only the source address.
+func authenticPacket(t *testing.T, sess *session.Session, srcID, destID node.ID, msg Message) []byte {
+	t.Helper()
+
+	msgBytes, err := msg.Encode()
+	if err != nil {
+		t.Fatalf("msg.Encode: %v", err)
+	}
+	plaintext := make([]byte, 1+len(msgBytes))
+	plaintext[0] = msg.Type()
+	copy(plaintext[1:], msgBytes)
+
+	nonce := make([]byte, 12)
+	for i := range nonce {
+		nonce[i] = byte(i + 9)
+	}
+
+	authdata := srcID[:]
+	maskingIV, headerData, err := BuildOrdinaryHeaderData(srcID, nonce, authdata)
+	if err != nil {
+		t.Fatalf("BuildOrdinaryHeaderData: %v", err)
+	}
+
+	ciphertext, err := session.EncryptMessage(sess.DecryptionKey(), nonce, headerData, plaintext)
+	if err != nil {
+		t.Fatalf("EncryptMessage: %v", err)
+	}
+
+	data, err := EncodeOrdinaryPacket(srcID, destID, maskingIV, nonce, authdata, ciphertext)
+	if err != nil {
+		t.Fatalf("EncodeOrdinaryPacket: %v", err)
+	}
+	return data
+}
+
+// A session peer can send a correctly encrypted PONG from a forged source, and
+// that source is what feeds the distinct-reporter threshold in IP discovery. The
+// vote must require the PONG to come from the address the PING was sent to, while
+// delivery stays source-agnostic so NAT rebinding still works.
+func TestPongVoteRequiresRequestDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fromAddr *net.UDPAddr
+		wantVote bool
+	}{
+		{"from the pinged address", &net.UDPAddr{IP: net.IPv4(198, 51, 100, 5), Port: 30303}, true},
+		{"from a forged source", &net.UDPAddr{IP: net.IPv4(203, 0, 113, 9), Port: 40404}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, cache, cancel := sessionHandler(t)
+			defer cancel()
+
+			pingedAddr := &net.UDPAddr{IP: net.IPv4(198, 51, 100, 5), Port: 30303}
+			peer, sess := victimSession(t, cache, pingedAddr)
+
+			votes := 0
+			h.config.OnPongReceived = func(node.ID, net.IP, net.IP, uint16) { votes++ }
+
+			requestID := []byte{0x07, 0x08}
+			h.requests.AddRequest(requestID, peer, &Ping{RequestID: requestID}, pingedAddr)
+
+			pong := &Pong{RequestID: requestID, IP: []byte{9, 9, 9, 9}, Port: 30303}
+			data := authenticPacket(t, sess, peer.ID(), h.config.LocalNode.ID(), pong)
+
+			if err := h.HandleIncomingPacket(data, tc.fromAddr, pingedAddr); err != nil {
+				t.Fatalf("HandleIncomingPacket: %v", err)
+			}
+
+			if tc.wantVote && votes != 1 {
+				t.Fatalf("votes = %d for a PONG from the pinged address, want 1", votes)
+			}
+			if !tc.wantVote && votes != 0 {
+				t.Fatalf("votes = %d for a PONG from a forged source, want 0", votes)
+			}
+		})
+	}
+}
+
 // A node ID is public information from an ENR, so an attacker who knows only that
 // must not be able to move a peer's session to an address of their choosing.
 func TestSpoofedOrdinaryPacketDoesNotMigrateSession(t *testing.T) {
@@ -213,7 +292,7 @@ func TestSpoofedWhoareyouWithPendingRequestKeepsKeys(t *testing.T) {
 	keysBefore := string(sess.EncryptionKey())
 
 	requestID := []byte{0x01, 0x02, 0x03, 0x04}
-	h.requests.AddRequest(requestID, victim, &Ping{RequestID: requestID})
+	h.requests.AddRequest(requestID, victim, &Ping{RequestID: requestID}, victimAddr)
 
 	nonce := make([]byte, 12)
 	for i := range nonce {

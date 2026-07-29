@@ -993,13 +993,18 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, rem
 	// An unsolicited PONG must not reach the side effects below: OnPongReceived
 	// casts a vote in the external-IP election that rewrites our published ENR,
 	// and the ENR branch triggers outbound traffic.
-	if !h.requests.MatchResponse(msg.RequestID, remoteID, msg) {
+	req := h.requests.MatchResponse(msg.RequestID, remoteID, msg)
+	if req == nil {
 		return nil
 	}
 
-	// Call OnPongReceived callback with the source IP and the IP/port reported in the PONG
-	// The IP and Port fields in PONG contain our address as seen by the remote peer
-	if h.config.OnPongReceived != nil && len(msg.IP) > 0 && msg.Port > 0 {
+	// The IP-discovery vote additionally requires the PONG to come from the address
+	// we pinged. A session peer can send an authenticated PONG from a forged source,
+	// and from.IP is what feeds the distinct-reporter threshold. Delivery above
+	// stays source-agnostic so NAT rebinding and mobile peers keep working; only
+	// this vote needs the endpoint proven.
+	if h.config.OnPongReceived != nil && len(msg.IP) > 0 && msg.Port > 0 &&
+		req.DestAddr != nil && req.DestAddr.IP.Equal(from.IP) {
 		reportedIP := net.IP(msg.IP)
 		h.config.OnPongReceived(remoteID, from.IP, reportedIP, msg.Port)
 	}
@@ -1652,11 +1657,15 @@ func (h *Handler) SendPing(n *node.Node) (<-chan *Response, error) {
 		ENRSeq:    h.config.LocalNode.Record().Seq(),
 	}
 
+	// One read of the address for both the record and the send: a newer ENR can
+	// move it in between, and the endpoint proof needs them to agree.
+	destAddr := n.Addr()
+
 	// Register pending request (store message and node for replay if session becomes stale)
-	respChan := h.requests.AddRequest(requestID, n, ping)
+	respChan := h.requests.AddRequest(requestID, n, ping, destAddr)
 
 	// Send PING (pass node object so it's available for handshake if needed)
-	if err := h.SendMessage(ping, n.ID(), n.Addr(), n); err != nil {
+	if err := h.SendMessage(ping, n.ID(), destAddr, n); err != nil {
 		h.config.Logger.WithFields(logrus.Fields{
 			"to":     n.Addr(),
 			"nodeID": n.ID(),
@@ -1825,11 +1834,13 @@ func (h *Handler) SendFindNode(n *node.Node, distances []uint) (<-chan *Response
 		Distances: distances,
 	}
 
+	destAddr := n.Addr()
+
 	// Register pending request (store message and node for replay if session becomes stale)
-	respChan := h.requests.AddRequest(requestID, n, findNode)
+	respChan := h.requests.AddRequest(requestID, n, findNode, destAddr)
 
 	// Send FINDNODE (pass node object so it's available for handshake if needed)
-	if err := h.SendMessage(findNode, n.ID(), n.Addr(), n); err != nil {
+	if err := h.SendMessage(findNode, n.ID(), destAddr, n); err != nil {
 		h.config.Logger.WithFields(logrus.Fields{
 			"to":        n.Addr(),
 			"nodeID":    n.ID(),
