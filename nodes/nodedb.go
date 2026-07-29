@@ -194,6 +194,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 		for _, node := range nodes {
 			dirtyFlags, dirtyGen := node.DirtySnapshot()
 			nodeID := node.ID()
+			writeFailed := false
 
 			ndb.logger.WithFields(logrus.Fields{
 				"nodeID":      fmt.Sprintf("%x", nodeID[:8]),
@@ -216,6 +217,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				ndb.logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("updating ENR")
 				if err := ndb.updateNodeENRTx(tx, node); err != nil {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update ENR in batch")
+					writeFailed = true
 				}
 			}
 
@@ -224,6 +226,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				ndb.logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("updating stats")
 				if err := ndb.updateNodeStatsTx(tx, node); err != nil {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update stats in batch")
+					writeFailed = true
 				}
 			}
 
@@ -233,6 +236,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				if !lastActive.IsZero() {
 					if err := ndb.db.UpdateNodeLastActive(tx, ndb.layer, nodeID[:], lastActive.Unix()); err != nil {
 						ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update last_active in batch")
+						writeFailed = true
 					}
 				}
 			}
@@ -243,6 +247,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				if !lastSeen.IsZero() {
 					if err := ndb.db.UpdateNodeLastSeen(tx, ndb.layer, nodeID[:], lastSeen.Unix()); err != nil {
 						ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update last_seen in batch")
+						writeFailed = true
 					}
 				}
 			}
@@ -251,15 +256,21 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 			if dirtyFlags&DirtyProtocol != 0 {
 				if err := ndb.updateNodeProtocolSupportTx(tx, nodeID, node.HasV4(), node.HasV5()); err != nil {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update protocol support in batch")
+					writeFailed = true
 				}
 			}
 
-			processed = append(processed, written{node, dirtyFlags, dirtyGen})
+			if !writeFailed {
+				processed = append(processed, written{node, dirtyFlags, dirtyGen})
+			}
 		}
 		return nil
 	})
 
 	if err != nil {
+		// Nothing reached the database, so no snapshot may be cleared: the flags
+		// are all that will bring these nodes back on a later pass.
+		processed = processed[:0]
 		ndb.logger.WithError(err).Error("failed to commit batch transaction")
 	} else {
 		ndb.logger.WithFields(logrus.Fields{
@@ -279,12 +290,27 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 	// the write was running either enqueued itself or is requeued here. Clearing
 	// first would let its QueueUpdate be swallowed as already-queued and then have
 	// the entry deleted underneath it.
+	persisted := make(map[[32]byte]bool, len(processed))
+	requeue := make([]*Node, 0, len(nodes))
+
 	for _, p := range processed {
-		if !p.node.ClearDirtySnapshot(p.flags, p.gen) {
-			continue
+		persisted[p.node.ID()] = true
+		if p.node.ClearDirtySnapshot(p.flags, p.gen) {
+			requeue = append(requeue, p.node)
 		}
-		if err := ndb.QueueUpdate(p.node); err != nil {
-			ndb.logger.WithError(err).Debug("failed to requeue node dirtied during batch")
+	}
+
+	// A node whose write failed keeps its flags, but it is out of the queue set
+	// now, so nothing would bring it back until an unrelated update marked it.
+	for _, node := range nodes {
+		if !persisted[node.ID()] {
+			requeue = append(requeue, node)
+		}
+	}
+
+	for _, node := range requeue {
+		if err := ndb.QueueUpdate(node); err != nil {
+			ndb.logger.WithError(err).Debug("failed to requeue node after batch")
 		}
 	}
 
