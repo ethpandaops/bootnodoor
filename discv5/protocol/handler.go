@@ -648,7 +648,7 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 	var enrBytes []byte
 	localENR := h.config.LocalNode.Record()
 	if packet.Challenge.ENRSeq == 0 || packet.Challenge.ENRSeq < localENR.Seq() {
-		enrBytes, err = localENR.EncodeRLP()
+		enrBytes, err = localENR.EncodeRLPBytes()
 		if err != nil {
 			h.config.Logger.WithError(err).Warn("handler: failed to encode ENR")
 		} else {

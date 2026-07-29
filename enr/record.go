@@ -112,7 +112,7 @@ func (r *Record) SetSeq(seq uint64) {
 //	clone.Set("ip", newIP)
 func (r *Record) Clone() (*Record, error) {
 	// Encode the current record to RLP bytes
-	data, err := r.EncodeRLP()
+	data, err := r.EncodeRLPBytes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode record for cloning: %w", err)
 	}
@@ -583,7 +583,7 @@ func (r *Record) encode() ([]byte, error) {
 // This is useful for interoperability with go-ethereum's p2p stack.
 // Returns nil if the record cannot be converted (missing required fields).
 func (r *Record) ToEnode() *enode.Node {
-	encoded, err := r.EncodeRLP()
+	encoded, err := r.EncodeRLPBytes()
 	if err != nil {
 		return nil
 	}

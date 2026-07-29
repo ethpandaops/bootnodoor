@@ -984,7 +984,7 @@ func (s *Service) loadStoredENR(key string) (*enr.Record, error) {
 
 // storeENR stores an identity's ENR to the database under its state key.
 func (s *Service) storeENR(key string, record *enr.Record) error {
-	data, err := record.EncodeRLP()
+	data, err := record.EncodeRLPBytes()
 	if err != nil {
 		return err
 	}

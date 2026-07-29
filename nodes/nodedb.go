@@ -297,7 +297,7 @@ func (ndb *NodeDB) updateNodeENRTx(tx *sqlx.Tx, n *Node) error {
 		}
 	}
 
-	enrBytes, err := n.ENR().EncodeRLP()
+	enrBytes, err := n.ENR().EncodeRLPBytes()
 	if err != nil {
 		return fmt.Errorf("failed to encode ENR: %w", err)
 	}
@@ -335,7 +335,7 @@ func (ndb *NodeDB) upsertNodeTx(tx *sqlx.Tx, n *Node) error {
 	port := n.Addr().Port
 	seq := n.ENR().Seq()
 
-	enrBytes, err := n.ENR().EncodeRLP()
+	enrBytes, err := n.ENR().EncodeRLPBytes()
 	if err != nil {
 		return fmt.Errorf("failed to encode ENR: %w", err)
 	}
