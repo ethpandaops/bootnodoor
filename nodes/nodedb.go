@@ -130,6 +130,11 @@ func (ndb *NodeDB) processUpdateQueue() {
 	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
 
+	// Failures requeue their nodes so nothing is lost, which on a persistent
+	// database error would otherwise spin: the requeue refills the batch and the
+	// next pass runs immediately. Back off between consecutive failures instead.
+	failures := 0
+
 	for {
 		select {
 		case <-ndb.ctx.Done():
@@ -144,7 +149,7 @@ func (ndb *NodeDB) processUpdateQueue() {
 
 			// Process when batch reaches 50 items
 			if len(batch) >= 50 {
-				ndb.batchUpdate(batch)
+				failures = ndb.runBatch(batch, failures)
 				batch = batch[:0]
 				time.Sleep(10 * time.Millisecond) // Avoid hammering DB
 			}
@@ -152,11 +157,35 @@ func (ndb *NodeDB) processUpdateQueue() {
 		case <-ticker.C:
 			// Process any pending items
 			if len(batch) > 0 {
-				ndb.batchUpdate(batch)
+				failures = ndb.runBatch(batch, failures)
 				batch = batch[:0]
 			}
 		}
 	}
+}
+
+// maxBatchBackoff caps the delay after repeated batch failures.
+const maxBatchBackoff = 5 * time.Second
+
+// runBatch writes a batch and sleeps proportionally to how many consecutive
+// batches have failed, returning the updated count.
+func (ndb *NodeDB) runBatch(batch []*Node, failures int) int {
+	if ndb.batchUpdate(batch) {
+		return 0
+	}
+
+	failures++
+
+	backoff := time.Duration(failures) * 100 * time.Millisecond
+	if backoff > maxBatchBackoff {
+		backoff = maxBatchBackoff
+	}
+
+	select {
+	case <-time.After(backoff):
+	case <-ndb.ctx.Done():
+	}
+	return failures
 }
 
 // drainQueue moves everything currently queued into batch without blocking.
@@ -172,9 +201,10 @@ func (ndb *NodeDB) drainQueue(batch []*Node) []*Node {
 }
 
 // batchUpdate performs a batch update of nodes.
-func (ndb *NodeDB) batchUpdate(nodes []*Node) {
+// batchUpdate writes a batch and reports whether the transaction committed.
+func (ndb *NodeDB) batchUpdate(nodes []*Node) bool {
 	if len(nodes) == 0 {
-		return
+		return true
 	}
 
 	ndb.logger.WithFields(logrus.Fields{
@@ -318,6 +348,8 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 	ndb.statsLock.Lock()
 	ndb.stats.ProcessedUpdates += int64(len(nodes))
 	ndb.statsLock.Unlock()
+
+	return err == nil
 }
 
 // updateNodeENRTx updates only ENR info within a transaction.
