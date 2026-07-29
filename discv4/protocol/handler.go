@@ -437,6 +437,13 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 // never answers cannot keep one running.
 const maxENRRefreshRetries = 2
 
+// maxENRRefreshRounds bounds the rounds one claim may run. Re-arming on a
+// sequence observed mid-refresh is otherwise unbounded: a peer that advertises a
+// higher sequence in every PONG keeps the goroutine and its PING/ENRREQUEST
+// traffic alive indefinitely. Past the bound the claim ends, and a later PONG has
+// to open a fresh one.
+const maxENRRefreshRounds = 4
+
 // enrRefreshState tracks one peer's automatic ENR refresh.
 type enrRefreshState struct {
 	inFlight bool
@@ -450,6 +457,7 @@ type enrRefreshState struct {
 	highestSeenSeq uint64
 
 	retries int
+	rounds  int
 }
 
 // startENRRefresh claims the refresh for a peer and runs at most one at a time.
@@ -475,6 +483,7 @@ func (h *Handler) startENRRefresh(n *node.Node, advertisedSeq uint64) {
 	state.inFlight = true
 	state.targetSeq = state.highestSeenSeq
 	state.retries = 0
+	state.rounds = 0
 	h.enrRefreshMu.Unlock()
 
 	go h.runENRRefresh(n)
@@ -495,16 +504,24 @@ func (h *Handler) runENRRefresh(n *node.Node) {
 			return
 		}
 
-		if state.highestSeenSeq > state.targetSeq {
+		state.rounds++
+
+		if state.highestSeenSeq > state.targetSeq && state.rounds < maxENRRefreshRounds {
 			state.targetSeq = state.highestSeenSeq
 			state.retries = 0
 			h.enrRefreshMu.Unlock()
 			continue
 		}
 
-		if err != nil && state.retries < maxENRRefreshRetries {
+		if err != nil && state.retries < maxENRRefreshRetries && state.rounds < maxENRRefreshRounds {
 			state.retries++
-			backoff := time.Duration(state.retries) * h.config.ExpirationWindow
+			// ExpirationWindow can be zero in a bare config; a zero backoff would
+			// make the retry immediate rather than delayed.
+			unit := h.config.ExpirationWindow
+			if unit <= 0 {
+				unit = 20 * time.Second
+			}
+			backoff := time.Duration(state.retries) * unit
 			h.enrRefreshMu.Unlock()
 
 			select {

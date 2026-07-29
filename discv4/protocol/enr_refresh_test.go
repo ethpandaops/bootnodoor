@@ -19,12 +19,13 @@ type scriptedPeer struct {
 	h   *Handler
 	key *ecdsa.PrivateKey
 
-	mu       sync.Mutex
-	pings    int
-	enrReqs  int
-	enrSeq   uint64
-	stopped  bool
-	pongAddr *net.UDPAddr
+	mu           sync.Mutex
+	pings        int
+	enrReqs      int
+	enrSeq       uint64
+	stopped      bool
+	bumpEachPong bool
+	pongAddr     *net.UDPAddr
 }
 
 func (p *scriptedPeer) SendTo(data []byte, to *net.UDPAddr) error {
@@ -38,13 +39,19 @@ func (p *scriptedPeer) SendTo(data []byte, to *net.UDPAddr) error {
 		p.mu.Unlock()
 		return nil
 	}
-	seq := p.enrSeq
 	switch packet.(type) {
 	case *Ping:
 		p.pings++
+		// Bump on PING only, so every round's PONG advertises strictly more than
+		// the record the previous round installed. Bumping on the ENRREQUEST too
+		// would put the installed record ahead and the loop would not re-arm.
+		if p.bumpEachPong {
+			p.enrSeq++
+		}
 	case *ENRRequest:
 		p.enrReqs++
 	}
+	seq := p.enrSeq
 	p.mu.Unlock()
 
 	var reply []byte
@@ -281,4 +288,42 @@ func TestENRRefreshConcurrentTriggers(t *testing.T) {
 
 	time.Sleep(1500 * time.Millisecond)
 	peer.stop()
+}
+
+// A peer that advertises a higher sequence in every PONG could otherwise re-arm
+// the refresh forever, holding a goroutine and generating traffic until shutdown.
+func TestENRRefreshBoundedAgainstEndlessBumps(t *testing.T) {
+	peer := &scriptedPeer{t: t, enrSeq: 5, pongAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 30303}, bumpEachPong: true}
+
+	h, cancel := newScriptedHandler(t, peer)
+	defer cancel()
+	peer.h = h
+
+	n, key := makeKeyedNode(t, 30303)
+	peer.key = key
+	if !n.UpdateENR(signedV4Record(t, key, 1)) {
+		t.Fatal("seed record was not installed")
+	}
+	h.nodesMu.Lock()
+	h.nodes[n.ID()] = n
+	h.nodesMu.Unlock()
+
+	deliverPong(t, h, n, key, []byte("bump-ping-hash"), 5)
+
+	time.Sleep(4 * time.Second)
+	peer.stop()
+	_, enrReqs := peer.counts()
+
+	// Literal, not maxENRRefreshRounds: comparing against the constant under test
+	// makes the assertion vacuous when the bound is raised.
+	if enrReqs > 4 {
+		t.Errorf("ENRREQUESTs sent = %d, want at most 4 rounds per claim", enrReqs)
+	}
+
+	h.enrRefreshMu.Lock()
+	inFlight := h.enrRefresh[n.ID()].inFlight
+	h.enrRefreshMu.Unlock()
+	if inFlight {
+		t.Error("refresh still marked in flight after the round bound was reached")
+	}
 }

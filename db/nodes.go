@@ -149,6 +149,8 @@ func (d *Database) UpsertNode(tx *sqlx.Tx, node *Node) error {
 			seq = excluded.seq,
 			fork_digest = excluded.fork_digest,
 			last_seen = excluded.last_seen,
+			-- COALESCE so a caller without a timestamp cannot blank a stored one.
+			last_active = COALESCE(excluded.last_active, nodes.last_active),
 			enr = excluded.enr,
 			has_v4 = excluded.has_v4,
 			has_v5 = excluded.has_v5,

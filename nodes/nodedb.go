@@ -182,7 +182,10 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 		"layer": ndb.layer,
 	}).Debug("processing batch update")
 
+	var requeue []*Node
+
 	err := ndb.db.RunDBTransaction(func(tx *sqlx.Tx) error {
+		requeue = requeue[:0]
 		for _, node := range nodes {
 			dirtyFlags := node.GetDirtyFlags()
 			nodeID := node.ID()
@@ -199,8 +202,10 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to upsert node in batch")
 					continue
 				}
-				// Full upsert covers everything, clear all dirty flags
-				node.ClearDirtyFlags()
+				// Full upsert covers everything this pass observed.
+				if node.ClearDirtyFlagsMask(dirtyFlags) {
+					requeue = append(requeue, node)
+				}
 				continue
 			}
 
@@ -247,8 +252,11 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				}
 			}
 
-			// Clear dirty flags after successful update
-			node.ClearDirtyFlags()
+			// Clear only what this pass observed, so a flag marked while the
+			// batch was running is not erased unwritten.
+			if node.ClearDirtyFlagsMask(dirtyFlags) {
+				requeue = append(requeue, node)
+			}
 		}
 		return nil
 	})
@@ -268,6 +276,14 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 		delete(ndb.updateQueueSet, node.ID())
 	}
 	ndb.updateQueueLock.Unlock()
+
+	// Re-queue anything marked dirty while this batch was in flight: those
+	// callers saw the node already queued and returned without enqueueing.
+	for _, node := range requeue {
+		if err := ndb.QueueUpdate(node); err != nil {
+			ndb.logger.WithError(err).Debug("failed to requeue node dirtied during batch")
+		}
+	}
 
 	// Track processed updates
 	ndb.statsLock.Lock()

@@ -626,6 +626,24 @@ func (s *Service) nextForkRefreshDelay() time.Duration {
 	return delay
 }
 
+// forkOffsetSeconds returns seconds from genesis to an epoch, reporting false if
+// any step would overflow. Each multiplication is checked before it happens: a
+// placeholder epoch or an absurd slot length would otherwise wrap, and dividing
+// by an already-wrapped product panics.
+func forkOffsetSeconds(epoch, slotsPerEpoch, secondsPerSlot uint64) (uint64, bool) {
+	if slotsPerEpoch == 0 || secondsPerSlot == 0 {
+		return 0, false
+	}
+	if slotsPerEpoch > math.MaxUint64/secondsPerSlot {
+		return 0, false
+	}
+	epochSeconds := slotsPerEpoch * secondsPerSlot
+	if epoch > math.MaxUint64/epochSeconds {
+		return 0, false
+	}
+	return epoch * epochSeconds, true
+}
+
 // nextForkBoundary returns the earliest CL or EL fork activation after now.
 func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
 	var next time.Time
@@ -647,11 +665,11 @@ func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
 		secondsPerSlot := cfg.SecondsPerSlot
 		if genesis > 0 && slotsPerEpoch > 0 && secondsPerSlot > 0 {
 			for _, epoch := range cfg.ForkEpochs() {
-				// Overflow guard: a placeholder epoch would wrap the product.
-				if epoch > math.MaxUint64/(slotsPerEpoch*secondsPerSlot) {
+				offset, ok := forkOffsetSeconds(epoch, slotsPerEpoch, secondsPerSlot)
+				if !ok || genesis > math.MaxInt64-offset {
 					continue
 				}
-				consider(time.Unix(int64(genesis+epoch*slotsPerEpoch*secondsPerSlot), 0))
+				consider(time.Unix(int64(genesis+offset), 0))
 			}
 		}
 	}

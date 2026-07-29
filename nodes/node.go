@@ -513,6 +513,16 @@ func (n *Node) ClearDirtyFlags() {
 	n.dirtyMu.Unlock()
 }
 
+// ClearDirtyFlagsMask clears only the given flags and reports whether any
+// remain. Writers clear what they observed rather than everything, so a flag
+// marked while the batch was in flight survives to the next round.
+func (n *Node) ClearDirtyFlagsMask(flags DirtyFlags) bool {
+	n.dirtyMu.Lock()
+	defer n.dirtyMu.Unlock()
+	n.dirtyFields &^= flags
+	return n.dirtyFields != 0
+}
+
 // LastActive returns the last active timestamp.
 func (n *Node) LastActive() time.Time {
 	n.mu.RLock()

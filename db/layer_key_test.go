@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 
@@ -135,5 +136,55 @@ func TestBadNodeSuppressionSurvivesBothLayers(t *testing.T) {
 	}
 	if clBad && clReason != "invalid_fork_digest" {
 		t.Errorf("CL reason = %q, want invalid_fork_digest", clReason)
+	}
+}
+
+// The full upsert supplies last_active, but its conflict clause has to assign it
+// too: an already-persisted row would otherwise keep a stale or NULL timestamp
+// while the DirtyFull branch cleared the flag that would have fixed it.
+func TestUpsertUpdatesLastActiveOnExistingRow(t *testing.T) {
+	database := testDB(t)
+
+	id := []byte("aaaabbbbccccddddeeeeffff00001111")
+
+	if err := database.RunDBTransaction(func(tx *sqlx.Tx) error {
+		return database.UpdateNodeENR(tx, LayerEL, id, nil, nil, 30303, 1, []byte{1, 2, 3, 4}, []byte("enr"), true, true)
+	}); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
+
+	active := time.Now().Unix()
+	n := &Node{
+		NodeID: id, Layer: string(LayerEL), Port: 30303, Seq: 2,
+		ForkDigest: []byte{1, 2, 3, 4}, FirstSeen: 1000, ENR: []byte("enr2"),
+		LastActive: sql.NullInt64{Valid: true, Int64: active},
+	}
+	if err := database.RunDBTransaction(func(tx *sqlx.Tx) error {
+		return database.UpsertNode(tx, n)
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	stored, err := database.GetNode(LayerEL, id)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !stored.LastActive.Valid || stored.LastActive.Int64 != active {
+		t.Errorf("last_active = %v, want %d", stored.LastActive, active)
+	}
+
+	// A caller with no timestamp must not blank the stored one.
+	n.LastActive = sql.NullInt64{}
+	if err := database.RunDBTransaction(func(tx *sqlx.Tx) error {
+		return database.UpsertNode(tx, n)
+	}); err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	stored, err = database.GetNode(LayerEL, id)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !stored.LastActive.Valid || stored.LastActive.Int64 != active {
+		t.Errorf("last_active was blanked by an upsert without a timestamp: %v", stored.LastActive)
 	}
 }
