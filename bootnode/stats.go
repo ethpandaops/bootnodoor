@@ -97,6 +97,8 @@ func (s *Service) GetStats() Stats {
 			out.Packets.SendErrors += m.SendErrors
 			out.Packets.ReceiveErrors += m.ReceiveErrors
 			out.Packets.RateLimited += m.RateLimited
+			out.Packets.PacketsFellThrough += m.PacketsFellThrough
+			out.Packets.PacketsUnhandled += m.PacketsUnhandled
 		}
 	}
 

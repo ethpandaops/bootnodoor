@@ -391,11 +391,17 @@ func (t *UDPTransport) dispatchPacket(data []byte, from *net.UDPAddr, localAddr 
 	t.handlersMu.RUnlock()
 
 	// Try each handler in order
-	for _, handler := range handlers {
+	for i, handler := range handlers {
 		if handler(data, from, localAddr) {
-			// Handler accepted the packet
+			if i > 0 && t.metrics != nil {
+				t.metrics.RecordFellThrough()
+			}
 			return
 		}
+	}
+
+	if t.metrics != nil {
+		t.metrics.RecordUnhandled()
 	}
 
 	// No handler recognized the packet

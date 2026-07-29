@@ -105,11 +105,12 @@ type OverviewPageData struct {
 	PendingChallenges int
 
 	// Handler stats
-	PacketsReceived   int
-	PacketsSent       int
-	InvalidPackets    int
-	FilteredResponses int
-	FindNodeReceived  int
+	PacketsReceived      int
+	PacketsSent          int
+	InvalidPackets       int
+	WrongProtocolPackets int
+	FilteredResponses    int
+	FindNodeReceived     int
 
 	// CL fork digest filter stats
 	FilterAcceptedCurrent    int
@@ -503,7 +504,13 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	// discv5-specific views stay on the handler counters.
 	pageData.PacketsReceived = int(stats.Packets.PacketsReceived)
 	pageData.PacketsSent = int(stats.Packets.PacketsSent)
-	pageData.InvalidPackets = stats.Discv5.InvalidPackets + int(stats.Discv4.InvalidPackets)
+
+	// A packet the first handler declines but a later one accepts is ordinary
+	// traffic for the other protocol on the shared socket, so only the packets
+	// nothing accepted are unrecognised. Summing the per-handler "invalid"
+	// counters instead reported most normal discv4 load as invalid.
+	pageData.WrongProtocolPackets = int(stats.Packets.PacketsFellThrough)
+	pageData.InvalidPackets = int(stats.Packets.PacketsUnhandled)
 	pageData.FilteredResponses = stats.Discv5.FilteredResponses
 	pageData.FindNodeReceived = stats.Discv5.FindNodeReceived + int(stats.Discv4.FindnodeRequestsRecv)
 

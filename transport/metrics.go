@@ -21,6 +21,22 @@ type Metrics struct {
 	sendErrors    atomic.Uint64
 	receiveErrors atomic.Uint64
 	rateLimited   atomic.Uint64
+
+	// Dispatch outcomes. A packet the first handler declines but a later one
+	// accepts is normal traffic for the other protocol on a shared socket; only
+	// a packet no handler accepts is unrecognised.
+	packetsFellThrough atomic.Uint64
+	packetsUnhandled   atomic.Uint64
+}
+
+// RecordFellThrough records a packet accepted by a handler other than the first.
+func (m *Metrics) RecordFellThrough() {
+	m.packetsFellThrough.Add(1)
+}
+
+// RecordUnhandled records a packet no handler accepted.
+func (m *Metrics) RecordUnhandled() {
+	m.packetsUnhandled.Add(1)
 }
 
 // NewMetrics creates a new metrics tracker.
@@ -62,14 +78,16 @@ func (m *Metrics) IncrementDropped() {
 
 // Snapshot returns a snapshot of the current metrics.
 type MetricsSnapshot struct {
-	PacketsSent     uint64
-	PacketsReceived uint64
-	PacketsDropped  uint64
-	BytesSent       uint64
-	BytesReceived   uint64
-	SendErrors      uint64
-	ReceiveErrors   uint64
-	RateLimited     uint64
+	PacketsSent        uint64
+	PacketsReceived    uint64
+	PacketsDropped     uint64
+	BytesSent          uint64
+	BytesReceived      uint64
+	SendErrors         uint64
+	ReceiveErrors      uint64
+	RateLimited        uint64
+	PacketsFellThrough uint64
+	PacketsUnhandled   uint64
 }
 
 // Snapshot returns a snapshot of the current metrics.
@@ -81,14 +99,16 @@ type MetricsSnapshot struct {
 //	    snapshot.PacketsSent, snapshot.PacketsReceived)
 func (m *Metrics) Snapshot() MetricsSnapshot {
 	return MetricsSnapshot{
-		PacketsSent:     m.packetsSent.Load(),
-		PacketsReceived: m.packetsReceived.Load(),
-		PacketsDropped:  m.packetsDropped.Load(),
-		BytesSent:       m.bytesSent.Load(),
-		BytesReceived:   m.bytesReceived.Load(),
-		SendErrors:      m.sendErrors.Load(),
-		ReceiveErrors:   m.receiveErrors.Load(),
-		RateLimited:     m.rateLimited.Load(),
+		PacketsSent:        m.packetsSent.Load(),
+		PacketsReceived:    m.packetsReceived.Load(),
+		PacketsDropped:     m.packetsDropped.Load(),
+		BytesSent:          m.bytesSent.Load(),
+		BytesReceived:      m.bytesReceived.Load(),
+		SendErrors:         m.sendErrors.Load(),
+		ReceiveErrors:      m.receiveErrors.Load(),
+		RateLimited:        m.rateLimited.Load(),
+		PacketsFellThrough: m.packetsFellThrough.Load(),
+		PacketsUnhandled:   m.packetsUnhandled.Load(),
 	}
 }
 
