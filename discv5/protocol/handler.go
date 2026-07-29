@@ -1040,9 +1040,18 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 		}).Debug("handler: FINDNODE lookup completed via callback")
 	}
 
-	// Split nodes into multiple packets if needed to stay under max packet size
-	// Each ENR is typically 200-400 bytes, so we limit to 3 nodes per packet to be safe
+	// Split nodes into multiple packets if needed to stay under max packet size.
+	// Each ENR is typically 200-400 bytes, so we limit to 3 nodes per packet to be safe.
 	const maxNodesPerPacket = 3
+
+	// Cap the total response so it never exceeds what real clients consume. go-ethereum
+	// honours only the first packet's `total` and reads at most 5 NODES packets
+	// (totalNodesResponseLimit); anything beyond that is dropped as unsolicited. sigp/discv5
+	// caps at 16 nodes. Keep to <=5 packets / <=15 nodes so no served node is silently lost.
+	const maxNodesPerResponse = 15
+	if len(nodes) > maxNodesPerResponse {
+		nodes = nodes[:maxNodesPerResponse]
+	}
 
 	// Calculate total number of packets needed
 	totalPackets := (len(nodes) + maxNodesPerPacket - 1) / maxNodesPerPacket
