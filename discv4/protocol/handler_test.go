@@ -125,3 +125,38 @@ func TestPingDoesNotBondBeforePong(t *testing.T) {
 		t.Fatal("node should be bonded after receiving a PONG to our ping")
 	}
 }
+
+// TestFloodDoesNotEvictBondedPeers verifies that when the node map is full,
+// inserts evict a stale unbonded entry (so genuine new peers are never locked
+// out) while bonded, endpoint-proven peers are retained.
+func TestFloodDoesNotEvictBondedPeers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const maxNodes = 10
+	h := NewHandler(ctx, HandlerConfig{MaxNodes: maxNodes, NodeTTL: time.Hour}, nil)
+
+	// A genuine, bonded peer.
+	pub, bondedID := makeNodeID(t)
+	bonded := h.getOrCreateNode(bondedID, pub, testAddr())
+	bonded.MarkPongReceived(time.Hour)
+
+	// Fill the rest with unbonded nodes, then flood well past the cap.
+	for i := 0; i < maxNodes*20; i++ {
+		p, id := makeNodeID(t)
+		h.getOrCreateNode(id, p, testAddr())
+	}
+
+	if got := len(h.AllNodes()); got != maxNodes {
+		t.Fatalf("map not bounded under flood: got %d want %d", got, maxNodes)
+	}
+	if h.GetNode(bondedID) == nil {
+		t.Fatal("bonded peer was evicted by an unbonded-ID flood")
+	}
+	// A brand-new node still gets retained (evicting an unbonded entry).
+	p, freshID := makeNodeID(t)
+	h.getOrCreateNode(freshID, p, testAddr())
+	if h.GetNode(freshID) == nil {
+		t.Fatal("new peer not retained when map full")
+	}
+}

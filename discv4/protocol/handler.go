@@ -884,12 +884,26 @@ func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net
 	n = node.New(pubkey, addr)
 	n.UpdateLastSeen()
 
-	// Bound the map so an unauthenticated flood of distinct node IDs (for
-	// example fabricated NEIGHBORS records) cannot grow it without limit. Stale
-	// unbonded entries are reclaimed by cleanup; until a slot frees up we still
-	// return the node so the packet is handled, but we do not retain it.
+	// Bound the map so an unauthenticated flood of distinct node IDs (for example
+	// fabricated NEIGHBORS records, or signed PINGs from generated keys) cannot grow
+	// it without limit. When full, evict one unbonded entry to make room rather than
+	// dropping the new node: otherwise a flood that pins the map at MaxNodes would
+	// lock out genuine new peers (their node is never retained, so their inbound PING
+	// can never lead to a bond). Bonded entries are real, endpoint-proven peers and
+	// are never evicted here; if every entry is bonded (genuine load, not a flood) we
+	// leave the map as-is and return the node without retaining it.
 	if len(h.nodes) >= h.config.MaxNodes {
-		return n
+		evicted := false
+		for eid, en := range h.nodes {
+			if !en.IsBonded() {
+				delete(h.nodes, eid)
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			return n
+		}
 	}
 
 	h.nodes[id] = n
