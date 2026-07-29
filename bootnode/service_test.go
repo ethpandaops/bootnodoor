@@ -1,6 +1,7 @@
 package bootnode
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"fmt"
 	"net"
@@ -11,7 +12,9 @@ import (
 	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
+	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enr"
+	"github.com/ethpandaops/bootnodoor/nodes"
 	"github.com/ethpandaops/bootnodoor/services"
 	"github.com/sirupsen/logrus"
 )
@@ -631,4 +634,124 @@ func mustChainConfig(t *testing.T, jsonCfg string) *elconfig.ChainConfig {
 		t.Fatalf("ParseChainConfig: %v", err)
 	}
 	return cfg
+}
+
+// newServeAllTestService builds a Service with an EL table and ENR manager,
+// enough to exercise checkAndAddNode admission.
+func newServeAllTestService(t *testing.T, serveAll bool) *Service {
+	t.Helper()
+
+	logger := quietLogger()
+	database := db.NewDatabase(&db.SqliteDatabaseConfig{File: ":memory:", MaxOpenConns: 5, MaxIdleConns: 2}, logger)
+	if err := database.Init(); err != nil {
+		t.Fatalf("db init: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	if err := database.ApplyEmbeddedDbSchema(-2); err != nil {
+		t.Fatalf("db schema: %v", err)
+	}
+
+	cfg := &Config{
+		Logger:        logger,
+		Database:      database,
+		ELConfig:      &elconfig.ChainConfig{},
+		ELGenesisHash: [32]byte{1, 2, 3},
+		ELGenesisTime: 1000,
+		ServeAll:      serveAll,
+	}
+
+	key := mustKey(t)
+	ln, err := createLocalNode(cfg, key, net.ParseIP("1.2.3.4"), nil, 9000, nil)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	s := &Service{config: cfg, ctx: ctx, enrManager: NewENRManager(cfg, key, ln, true, false)}
+	s.elNodeDB = nodes.NewNodeDB(ctx, database, db.LayerEL, logger)
+	s.elTable, err = s.createTable(ln.ID(), s.elNodeDB, "EL")
+	if err != nil {
+		t.Fatalf("createTable: %v", err)
+	}
+
+	return s
+}
+
+// A node advertising neither eth nor eth2 is unclassifiable: rejected in the
+// default classified mode, admitted under --serve-all.
+func TestServeAll_AdmitsUnclassifiableNode(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		serveAll  bool
+		wantAdded bool
+	}{
+		{name: "classified rejects", serveAll: false, wantAdded: false},
+		{name: "serve-all admits", serveAll: true, wantAdded: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newServeAllTestService(t, tc.serveAll)
+
+			record := storedENRWith(t, mustKey(t), nil)
+			n, err := v5node.New(record)
+			if err != nil {
+				t.Fatalf("v5node.New: %v", err)
+			}
+
+			if got := s.checkAndAddNode(n); got != tc.wantAdded {
+				t.Fatalf("checkAndAddNode = %v, want %v", got, tc.wantAdded)
+			}
+		})
+	}
+}
+
+// Serve-all makes no fork-based admission decision, so it must not move the EL
+// admission counters.
+func TestServeAll_LeavesAdmissionCountersUntouched(t *testing.T) {
+	s := newServeAllTestService(t, true)
+
+	record := storedENRWith(t, mustKey(t), map[string][]byte{"eth": {0x01, 0x02, 0x03, 0x04}})
+	n, err := v5node.New(record)
+	if err != nil {
+		t.Fatalf("v5node.New: %v", err)
+	}
+
+	s.checkAndAddNode(n)
+
+	if got := s.enrManager.GetELFilter().GetStats().TotalChecks; got != 0 {
+		t.Fatalf("TotalChecks = %d under serve-all, want 0", got)
+	}
+}
+
+// A node present in both tables must be served once, not once per table.
+func TestDedupeByID(t *testing.T) {
+	s := newServeAllTestService(t, true)
+
+	rec := storedENRWith(t, mustKey(t), nil)
+	v5, err := v5node.New(rec)
+	if err != nil {
+		t.Fatalf("v5node.New: %v", err)
+	}
+
+	a := nodes.NewFromV5(v5, s.elNodeDB)
+	b := nodes.NewFromV5(v5, s.elNodeDB)
+	other := nodes.NewFromV5(mustV5Node(t), s.elNodeDB)
+
+	got := dedupeByID([]*nodes.Node{a, b, other, a})
+	if len(got) != 2 {
+		t.Fatalf("dedupeByID returned %d nodes, want 2", len(got))
+	}
+	if got[0].ID() != a.ID() || got[1].ID() != other.ID() {
+		t.Errorf("dedupeByID did not keep first occurrences in order")
+	}
+}
+
+func mustV5Node(t *testing.T) *v5node.Node {
+	t.Helper()
+	n, err := v5node.New(storedENRWith(t, mustKey(t), nil))
+	if err != nil {
+		t.Fatalf("v5node.New: %v", err)
+	}
+	return n
 }

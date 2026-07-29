@@ -74,6 +74,9 @@ var (
 	enableEL bool
 	enableCL bool
 
+	// Rendezvous mode
+	serveAll bool
+
 	// WebUI flags
 	enableWebUI bool
 	webUIHost   string
@@ -147,6 +150,9 @@ func init() {
 	// Layer selection
 	rootCmd.Flags().BoolVar(&enableEL, "enable-el", true, "Enable Execution Layer support (discv4 + discv5)")
 	rootCmd.Flags().BoolVar(&enableCL, "enable-cl", true, "Enable Consensus Layer support (discv5)")
+
+	// Rendezvous mode
+	rootCmd.Flags().BoolVar(&serveAll, "serve-all", false, "Disable EL/CL classification and fork-ID filtering: pool and serve every discovered node to everyone (plain discv5 rendezvous)")
 
 	// WebUI
 	rootCmd.Flags().BoolVar(&enableWebUI, "web-ui", false, "Enable web UI")
@@ -518,6 +524,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.ENRPort = enrUDPPort
 	config.EnableDiscv4 = enableDiscv4
 	config.EnableDiscv5 = enableDiscv5
+	config.ServeAll = serveAll
 	config.MaxActiveNodes = maxActiveNodes
 	config.MaxNodesPerIP = maxNodesPerIP
 	config.Logger = logger

@@ -840,8 +840,9 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 		return
 	}
 
-	// Filter by fork ID before adding
-	if s.enrManager != nil {
+	// Filter by fork ID before adding. Serve-all must not drop a configured seed:
+	// rejecting the only seed leaves the table empty, so discovery never starts.
+	if !s.config.ServeAll && s.enrManager != nil {
 		isEL, forkID := s.enrManager.FilterELNode(record)
 		s.enrManager.RecordELAdmission(record, isEL, forkID)
 		if !isEL {
@@ -896,7 +897,7 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	v4Node.SetENR(enrRecord)
 
 	// Filter by fork ID before adding
-	if s.enrManager != nil {
+	if !s.config.ServeAll && s.enrManager != nil {
 		isEL, forkID := s.enrManager.FilterELNode(enrRecord)
 		s.enrManager.RecordELAdmission(enrRecord, isEL, forkID)
 		if !isEL {
@@ -939,7 +940,7 @@ func (s *Service) connectCLBootnodes() {
 		nodeID := v5.ID()
 
 		// Filter by fork digest before adding
-		if s.enrManager != nil && !s.enrManager.FilterCLNode(record) {
+		if !s.config.ServeAll && s.enrManager != nil && !s.enrManager.FilterCLNode(record) {
 			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR has invalid fork digest, skipping")
 			continue
 		}
@@ -1007,16 +1008,29 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 	if s.enrManager != nil {
 		nodeID := n.ID()
 
-		if isEL, _ := s.enrManager.FilterELNode(n.Record()); isEL && s.elTable != nil && s.elNodeDB != nil {
-			// Look up the generic node from the table
+		// Serve-all pools a node into every table, so refresh last-seen wherever it
+		// actually lives rather than by classification. Classified mode is
+		// EL-xor-CL, so the CL filter only runs when the EL one declines.
+		var isEL, isCL bool
+		if s.config.ServeAll {
+			isEL = s.elTable != nil
+			isCL = s.clTable != nil
+		} else {
+			isEL, _ = s.enrManager.FilterELNode(n.Record())
+			if !isEL {
+				isCL = s.enrManager.FilterCLNode(n.Record())
+			}
+		}
+
+		if isEL && s.elTable != nil && s.elNodeDB != nil {
 			if genericNode := s.elTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
 				// Get falls back to the DB, so Add re-admits demoted nodes
 				s.elTable.Add(genericNode)
 				s.elNodeDB.QueueUpdate(genericNode)
 			}
-		} else if s.enrManager.FilterCLNode(n.Record()) && s.clTable != nil && s.clNodeDB != nil {
-			// Look up the generic node from the table
+		}
+		if isCL && s.clTable != nil && s.clNodeDB != nil {
 			if genericNode := s.clTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
 				s.clTable.Add(genericNode)
@@ -1037,7 +1051,8 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	// A shared identity serves both layers under one ID, so classify a known
 	// requester by its ENR and serve only its layer(s); an unclassifiable known
 	// peer gets nothing, an unknown one (no ENR yet) falls through to both.
-	if id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
+	// Serve-all skips this: every requester gets nodes from every served layer.
+	if !s.config.ServeAll && id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
 		serveEL, _ = s.enrManager.FilterELNode(sourceRecord)
 		serveCL = s.enrManager.FilterCLNode(sourceRecord)
@@ -1048,6 +1063,12 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	}
 	if serveCL && s.clTable != nil {
 		allNodes = append(allNodes, s.clTable.GetNodesByDistance(localID, msg.Distances, 8)...)
+	}
+
+	// A node can sit in both tables (any dual-stack peer, and every peer under
+	// serve-all), so serving both layers would return it twice.
+	if serveEL && serveCL {
+		allNodes = dedupeByID(allNodes)
 	}
 
 	// Filter nodes based on protocol support (only return v5-capable nodes)
@@ -1185,7 +1206,7 @@ func (s *Service) requestENRV4(n *v4node.Node) {
 // admitELLookupNode decides admission of a lookup-discovered node to the EL
 // table.
 func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
-	if n.Record() != nil && s.enrManager != nil {
+	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
 		isEL, forkID := s.enrManager.FilterELNode(n.Record())
 		s.enrManager.RecordELAdmission(n.Record(), isEL, forkID)
 		if !isEL {
@@ -1224,7 +1245,7 @@ func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
 // admitCLLookupNode decides admission of a lookup-discovered node to the CL
 // table.
 func (s *Service) admitCLLookupNode(n *nodes.Node) services.AdmissionResult {
-	if n.Record() != nil && s.enrManager != nil {
+	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
 		if !s.enrManager.FilterCLNode(n.Record()) {
 			// No eth2 entry means an execution node, not a consensus
 			// node on the wrong digest; keep the two distinguishable.
@@ -1313,7 +1334,7 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	alreadyKnown := s.elTable.Get(n.ID()) != nil
 
 	// Filter the node using ENR manager (EL-only for discv4)
-	if s.enrManager != nil {
+	if !s.config.ServeAll && s.enrManager != nil {
 		filter, forkID := s.enrManager.FilterELNode(n.ENR())
 		s.enrManager.RecordELAdmission(n.ENR(), filter, forkID)
 		if !filter {
@@ -1349,10 +1370,18 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 		return false
 	}
 
-	// Determine layer
-	isEL, elForkID := s.enrManager.FilterELNode(n.Record())
-	isCL := s.enrManager.FilterCLNode(n.Record())
-	s.enrManager.RecordELAdmission(n.Record(), isEL, elForkID)
+	// Serve-all skips the filters rather than overriding their results: calling
+	// them would move admission counters for decisions never made.
+	var isEL, isCL bool
+	if s.config.ServeAll {
+		isEL = s.elTable != nil
+		isCL = s.clTable != nil
+	} else {
+		var elForkID elconfig.ForkID
+		isEL, elForkID = s.enrManager.FilterELNode(n.Record())
+		isCL = s.enrManager.FilterCLNode(n.Record())
+		s.enrManager.RecordELAdmission(n.Record(), isEL, elForkID)
+	}
 
 	// Add to appropriate table(s)
 	added := false
@@ -1370,6 +1399,22 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	}
 
 	return added
+}
+
+// dedupeByID drops repeat node IDs, keeping the first occurrence.
+func dedupeByID(nodeList []*nodes.Node) []*nodes.Node {
+	seen := make(map[[32]byte]struct{}, len(nodeList))
+	out := nodeList[:0]
+	for _, n := range nodeList {
+		id := n.ID()
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, n)
+	}
+
+	return out
 }
 
 // filterNodesForRequester applies LAN-aware and protocol filtering.
