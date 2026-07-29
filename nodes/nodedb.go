@@ -349,7 +349,10 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) bool {
 	ndb.stats.ProcessedUpdates += int64(len(nodes))
 	ndb.statsLock.Unlock()
 
-	return err == nil
+	// Row-level failures leave the callback returning nil, so a committed
+	// transaction is not proof every node landed. Reporting success on a partial
+	// batch would reset the backoff while the requeued nodes retry immediately.
+	return err == nil && len(processed) == len(nodes)
 }
 
 // updateNodeENRTx updates only ENR info within a transaction.
