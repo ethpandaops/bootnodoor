@@ -118,7 +118,7 @@ func (c *Cache) Put(session *Session) {
 	// Store the session
 	c.sessions[session.RemoteID] = session
 
-	c.logger.WithField("nodeID", session.RemoteID).WithField("addr", session.RemoteAddr).WithField("lifetime", c.sessionLifetime).Trace("cached new session")
+	c.logger.WithField("nodeID", session.RemoteID).WithField("addr", session.Addr()).WithField("lifetime", c.sessionLifetime).Trace("cached new session")
 }
 
 // Delete removes a session from the cache.
@@ -216,7 +216,7 @@ func (c *Cache) GetByAddr(addr *net.UDPAddr) *Session {
 	defer c.mu.RUnlock()
 
 	for _, session := range c.sessions {
-		if session.RemoteAddr.String() == addr.String() {
+		if session.Addr().String() == addr.String() {
 			if !session.IsExpired() {
 				session.Touch()
 				return session

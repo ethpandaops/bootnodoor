@@ -431,27 +431,12 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr, localA
 	var srcNodeID node.ID
 	copy(srcNodeID[:], packet.SrcID)
 
-	// Look up session by node ID first (most efficient and handles IP changes)
+	// Sessions are keyed by the sender's node ID and every creation site uses the
+	// correct ID, so this always hits when a session exists. There is deliberately
+	// no address fallback: srcID is unauthenticated, so matching a session by
+	// source address alone let anyone who could guess a peer's IP:port reach the
+	// failure path below and tear that peer's session down.
 	sess := h.config.Sessions.Get(srcNodeID)
-
-	// If session exists, verify and update address if needed
-	if sess != nil {
-		// Check if the address has changed
-		if sess.RemoteAddr.String() != from.String() {
-			h.config.Logger.WithFields(logrus.Fields{
-				"nodeID":  srcNodeID.String()[:16],
-				"oldAddr": sess.RemoteAddr,
-				"newAddr": from,
-			}).Info("handler: node address changed, updating session")
-
-			// Update the session's remote address
-			sess.UpdateAddr(from)
-		}
-	} else {
-		// No session by node ID, try lookup by address (slower fallback)
-		sess = h.config.Sessions.GetByAddr(from)
-	}
-
 	if sess == nil {
 		// No session exists, send WHOAREYOU challenge
 		h.config.Logger.WithFields(logrus.Fields{
@@ -470,22 +455,36 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr, localA
 		packet.Message,
 	)
 	if err != nil {
-		// Decryption failed - session is corrupted/expired
-		// Delete the session immediately to force a new handshake
-		h.config.Sessions.Delete(sess.RemoteID)
+		// Keep the session. Anyone can send an undecryptable packet naming this
+		// node ID, so deleting here let an attacker who knows only a peer's public
+		// ID destroy that peer's session at will. A peer that genuinely lost its
+		// keys recovers via the handshake, and Cache.Put replaces this entry by
+		// node ID when it lands, so deletion buys nothing.
+		//
+		// The challenge still goes to the packet source: the legitimate "restarted
+		// and lost my keys" case is a random packet, which by definition fails to
+		// decrypt, and the source is the only address such a peer is reachable at.
+		// Answering at sess.Addr() instead would be a reflection primitive.
 		h.config.Logger.WithFields(logrus.Fields{
 			"nodeID": sess.RemoteID.String()[:16],
 			"addr":   from,
 			"error":  err,
-		}).Debug("handler: decryption failed, deleted session and sending WHOAREYOU")
+		}).Debug("handler: decryption failed, keeping session and sending WHOAREYOU")
 
-		// Extract dest node ID from packet srcID and send WHOAREYOU
-		if len(packet.SrcID) != 32 {
-			return fmt.Errorf("no source node ID in packet")
-		}
-		var destNodeID node.ID
-		copy(destNodeID[:], packet.SrcID)
-		return h.sendWHOAREYOU(from, destNodeID, packet.Header.Nonce, localAddr)
+		return h.sendWHOAREYOU(from, srcNodeID, packet.Header.Nonce, localAddr)
+	}
+
+	// Only now is the sender proven: AES-GCM over the header authenticates
+	// possession of the session key, and the source address is not part of the
+	// AAD, so a NAT-rebound peer decrypts fine from its new address.
+	if sess.Addr().String() != from.String() {
+		h.config.Logger.WithFields(logrus.Fields{
+			"nodeID":  srcNodeID.String()[:16],
+			"oldAddr": sess.Addr(),
+			"newAddr": from,
+		}).Info("handler: node address changed, updating session")
+
+		sess.UpdateAddr(from)
 	}
 
 	// Decode message from plaintext
@@ -556,16 +555,29 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 			return fmt.Errorf("no pending handshake for %s", from)
 		}
 
+		// Answering this challenge derives fresh keys and replaces the session, so
+		// a WHOAREYOU nobody authenticated must not reach that path: otherwise
+		// anyone able to reach us from this address could swap a working session
+		// for keys the real peer never agreed to. Only a peer that actually
+		// received one of our packets can quote its nonce.
+		if !sess.SentNonce(packet.Header.Nonce) {
+			h.config.Logger.WithFields(logrus.Fields{
+				"nodeID": sess.RemoteID.String()[:16],
+				"addr":   from,
+			}).Debug("handler: ignoring WHOAREYOU referencing a nonce we never sent")
+			return fmt.Errorf("unsolicited WHOAREYOU from %s", from)
+		}
+
 		// Look up pending request for this node to get the message to replay
 		pendingReq := h.requests.GetPendingRequestForNode(sess.RemoteID)
 		if pendingReq == nil {
-			// No pending request either - just delete stale session
+			// Keep the session: the handshake replaces it by node ID if the peer
+			// really did lose its keys, so deleting here only helps an attacker.
 			h.config.Logger.WithFields(logrus.Fields{
 				"nodeID": sess.RemoteID.String()[:16],
 				"addr":   from,
 				"age":    sess.Age(),
-			}).Info("handler: received unexpected WHOAREYOU with no pending request, deleting stale session")
-			h.config.Sessions.Delete(sess.RemoteID)
+			}).Info("handler: received unexpected WHOAREYOU with no pending request")
 			return fmt.Errorf("no pending handshake or request for %s", from)
 		}
 
@@ -587,8 +599,9 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 		h.pendingHandshakes[pendingKey] = pending
 		h.mu.Unlock()
 
-		// Delete the stale session - we'll create a new one during handshake
-		h.config.Sessions.Delete(sess.RemoteID)
+		// The stale session is not deleted here: sendHandshakePacket's Put replaces
+		// it by node ID once the new keys exist, so deleting first only widens the
+		// window in which the peer has no session at all.
 
 		// Continue processing the WHOAREYOU with our pending handshake
 		// After handshake completes, the message will be sent with the SAME request ID,
@@ -1230,6 +1243,10 @@ func (h *Handler) SendMessage(msg Message, remoteID node.ID, to *net.UDPAddr, re
 		if err != nil {
 			return fmt.Errorf("failed to encode ordinary packet: %w", err)
 		}
+
+		// Remembered so a WHOAREYOU quoting this nonce can be told apart from a
+		// forged one; answering a forged challenge would replace the session keys.
+		sess.RecordSentNonce(nonce)
 	}
 
 	// Send via UDP transport
@@ -1355,6 +1372,10 @@ func (h *Handler) SendMessageFrom(msg Message, remoteID node.ID, to *net.UDPAddr
 		if err != nil {
 			return fmt.Errorf("failed to encode ordinary packet: %w", err)
 		}
+
+		// Remembered so a WHOAREYOU quoting this nonce can be told apart from a
+		// forged one; answering a forged challenge would replace the session keys.
+		sess.RecordSentNonce(nonce)
 	}
 
 	// Send via UDP transport from the specified local address
