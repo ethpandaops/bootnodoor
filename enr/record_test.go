@@ -272,3 +272,34 @@ func BenchmarkRecordEncoding(b *testing.B) {
 		record.EncodeRLP()
 	}
 }
+
+// TestDecodeRejectsOversizedRecord verifies the 300-byte ingest limit (G9): an
+// oversized but structurally-valid record must be rejected on decode so it can't be
+// stored and re-served.
+func TestDecodeRejectsOversizedRecord(t *testing.T) {
+	// build > 300 bytes of RLP by padding a raw record body
+	big := make([]byte, MaxRecordSize+50)
+	for i := range big {
+		big[i] = 0x80 // RLP empty-string items; content irrelevant, size is the point
+	}
+	rec := New()
+	err := rec.DecodeRLPBytes(big)
+	if err != ErrRecordTooLarge {
+		t.Fatalf("expected ErrRecordTooLarge for %d-byte input, got %v", len(big), err)
+	}
+	// a normal signed record must still decode fine
+	key, _ := crypto.GenerateKey()
+	ok := New()
+	_ = ok.Set("id", "v4")
+	if err := ok.Sign(key); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	enc, _ := ok.EncodeRLP()
+	if len(enc) > MaxRecordSize {
+		t.Skip("signed record unexpectedly large")
+	}
+	rt := New()
+	if err := rt.DecodeRLPBytes(enc); err != nil {
+		t.Fatalf("valid record rejected: %v", err)
+	}
+}

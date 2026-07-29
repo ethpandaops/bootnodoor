@@ -57,6 +57,14 @@ func (r *Record) DecodeRLPBytes(data []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Enforce the EIP-778 300-byte size limit on ingest, matching go-ethereum and
+	// sigp/discv5. Without this, an oversized (but validly signed) ENR received in a
+	// NODES/handshake message could be stored and later re-served, and a single
+	// oversized record makes real clients discard the entire NODES message.
+	if len(data) > MaxRecordSize {
+		return ErrRecordTooLarge
+	}
+
 	// Decode the RLP list
 	var items []interface{}
 	if err := rlp.DecodeBytes(data, &items); err != nil {
