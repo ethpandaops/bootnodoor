@@ -477,7 +477,10 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr, localA
 	// Only now is the sender proven: AES-GCM over the header authenticates
 	// possession of the session key, and the source address is not part of the
 	// AAD, so a NAT-rebound peer decrypts fine from its new address.
-	if cur := sess.Addr(); cur == nil || cur.Port != from.Port || !cur.IP.Equal(from.IP) {
+	// Zone is part of the comparison because Cache.GetByAddr matches on the full
+	// address string; ignoring it here would let the two disagree for scoped IPv6
+	// and strand a peer that changed interface.
+	if cur := sess.Addr(); cur == nil || cur.Port != from.Port || cur.Zone != from.Zone || !cur.IP.Equal(from.IP) {
 		h.config.Logger.WithFields(logrus.Fields{
 			"nodeID":  srcNodeID.String()[:16],
 			"oldAddr": sess.Addr(),
