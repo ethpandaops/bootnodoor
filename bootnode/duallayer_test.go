@@ -96,19 +96,23 @@ func dualLayerNode(t *testing.T, s *Service) *v5node.Node {
 	return n
 }
 
-// A dual-layer peer is admitted to both tables as two separate node objects with
-// their own last-seen. Refreshing only one on inbound traffic leaves the other
-// ageing out while the peer is actively talking to us.
+// A dual-layer peer occupies both tables as two node objects with their own
+// last-seen. The handler's SetLastSeen reaches only whichever one currently
+// shares stats with the v5 node, and re-admission repoints that at a wrapper the
+// tables discarded — so onNodeSeen has to refresh both itself.
 func TestOnNodeSeenRefreshesBothLayers(t *testing.T) {
 	s := newDualLayerService(t)
 	n := dualLayerNode(t, s)
 
+	// Admit with a known last-seen, so a later failure shows a stale timestamp
+	// rather than a zero one and cannot be mistaken for "never populated".
+	admitted := time.Now()
+	n.SetLastSeen(admitted)
+
 	if !s.checkAndAddNode(n) {
 		t.Fatal("dual-layer node was not admitted")
 	}
-
-	el := s.elTable.Get(n.ID())
-	cl := s.clTable.Get(n.ID())
+	el, cl := s.elTable.Get(n.ID()), s.clTable.Get(n.ID())
 	if el == nil || cl == nil {
 		t.Fatalf("node not in both tables: el=%v cl=%v", el != nil, cl != nil)
 	}
@@ -116,7 +120,13 @@ func TestOnNodeSeenRefreshesBothLayers(t *testing.T) {
 		t.Skip("tables share one node object; this test only means something when they differ")
 	}
 
+	// Re-admission, as an ENR refresh would do: repoints the v5 node's stats at a
+	// wrapper the tables do not hold.
+	s.checkAndAddNode(n)
+
+	// One inbound packet, in the order the handler produces it.
 	refreshed := time.Now().Add(time.Hour)
+	n.SetLastSeen(refreshed)
 	s.onNodeSeen(n, refreshed)
 
 	if got := s.elTable.Get(n.ID()).LastSeen(); !got.Equal(refreshed) {
