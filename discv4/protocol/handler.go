@@ -142,8 +142,8 @@ type PendingRequest struct {
 
 	// DestIP is the IP the request was sent to, snapshotted at send time.
 	// ToNode.Addr() is unusable for verifying a response's origin because
-	// getOrCreateNode rewrites it from every inbound packet, including the
-	// spoofed one a response check is meant to catch.
+	// lookupOrCreateNode deliberately never rewrites it, but the node object can
+	// still be re-addressed by a proven promotion between send and response.
 	DestIP net.IP
 
 	// PacketType is the type of request
@@ -282,17 +282,11 @@ func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr, localAddr *net.UD
 
 	fromNodeID := node.PubkeyToID(pubkey)
 
-	// Get or create node
-	fromNode := h.getOrCreateNode(fromNodeID, pubkey, from)
-
-	// Update last seen
-	fromNode.UpdateLastSeen()
-	fromNode.IncrementPacketsReceived()
-
-	// Call OnNodeSeen callback
-	if h.config.OnNodeSeen != nil {
-		h.config.OnNodeSeen(fromNode, time.Now())
-	}
+	// Look up the node without promoting this packet's source to its canonical
+	// address, and without touching liveness or firing OnNodeSeen: none of that is
+	// warranted before the handler has checked expiration and solicitation. Each
+	// handler states its own gate and calls noteSeen/noteProven itself.
+	fromNode := h.lookupOrCreateNode(fromNodeID, pubkey, from)
 
 	// Dispatch by packet type
 	switch p := packet.(type) {
@@ -329,6 +323,15 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 		return ErrExpired
 	}
 
+	h.noteSeen(fromNode)
+
+	// Admission and its outbound traffic need a proven source; an already-bonded
+	// peer has one. Otherwise the reciprocal PING below proves it a moment later
+	// and its PONG runs noteProven then.
+	if fromNode.IsBondedFrom(from) {
+		h.noteProven(fromNode)
+	}
+
 	// Mark ping received
 	fromNode.MarkPingReceived()
 
@@ -361,9 +364,11 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 
 	// Only spawn goroutine if we're actually going to ping (don't create unnecessary goroutines)
 	if timeSinceLastPing > 100*time.Millisecond {
-		// Send PING back in goroutine to establish bidirectional bond
+		// Ping the source we just ponged, not the canonical address: a peer that
+		// moved is only reachable at its new address, and its PONG from there is
+		// what proves the new endpoint.
 		go func() {
-			if _, err := h.Ping(fromNode); err != nil {
+			if _, err := h.pingTo(fromNode, from); err != nil {
 				logrus.WithFields(logrus.Fields{
 					"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
 					"error":   err,
@@ -389,6 +394,8 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 		return ErrExpired
 	}
 
+	h.noteSeen(fromNode)
+
 	// Nothing below may run for a PONG we did not solicit from this address: it
 	// establishes a bond, casts a vote in the external-IP election that rewrites
 	// our published ENR, and can trigger outbound ENR traffic.
@@ -399,7 +406,10 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 
 	// Bind the bond to the address we proved, not the packet's source.
 	provenAddr := &net.UDPAddr{IP: req.DestIP, Port: from.Port}
+	h.promoteAddr(fromNode, provenAddr)
+	h.promoteAddr(req.ToNode, provenAddr)
 	fromNode.MarkPongReceived(h.config.BondExpiration, provenAddr)
+	h.noteProven(fromNode)
 
 	// The To field in PONG contains our address as seen by the remote peer.
 	if h.config.OnPongReceived != nil && pong.To.IP != nil && pong.To.UDP > 0 {
@@ -433,6 +443,8 @@ func (h *Handler) handleFindnode(fromNode *node.Node, from *net.UDPAddr, localAd
 		return ErrExpired
 	}
 
+	h.noteSeen(fromNode)
+
 	// Bonded at this source address specifically: a bond earned elsewhere would
 	// let a spoofed source have us reflect NEIGHBORS at a third party.
 	if !fromNode.IsBondedFrom(from) {
@@ -442,6 +454,7 @@ func (h *Handler) handleFindnode(fromNode *node.Node, from *net.UDPAddr, localAd
 		return fmt.Errorf("node not bonded")
 	}
 
+	h.noteProven(fromNode)
 	h.incrementFindnodeRequestsRecv()
 
 	// Call callback to get nodes
@@ -469,6 +482,8 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		return ErrExpired
 	}
 
+	h.noteSeen(fromNode)
+
 	// Only accept NEIGHBORS in response to a FINDNODE we actually sent to this
 	// address. Dropping unsolicited NEIGHBORS prevents a peer we never queried
 	// from making us accumulate node records without bound; requiring the source
@@ -481,6 +496,7 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 
 	// Counted after the gate: this reports responses to our queries, so counting
 	// unsolicited packets here would let any peer inflate it.
+	h.noteProven(fromNode)
 	h.incrementFindnodeResponsesRecv()
 
 	// Accumulate the response, keyed by the matched request's hash so each
@@ -522,7 +538,7 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		}
 
 		nodeID := node.PubkeyToID(pubkey)
-		nodes = append(nodes, h.getOrCreateNode(nodeID, pubkey, addr))
+		nodes = append(nodes, h.lookupOrCreateNode(nodeID, pubkey, addr))
 	}
 
 	h.pendingNeighborsMu.Lock()
@@ -601,6 +617,8 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 		"enr_seq": resp.Record.Seq(),
 	}).Debug("Received ENRRESPONSE")
 
+	h.noteSeen(fromNode)
+
 	// Only a response to an ENRREQUEST we actually sent to this address may touch
 	// any state: ENRRESPONSE carries no expiration, so an unsolicited replay could
 	// otherwise roll the node back to an older record. The type and destination
@@ -627,6 +645,10 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 
 	fromNode.UpdateENR(resp.Record)
 
+	// After UpdateENR, so OnNodeSeen sees the record and admits the node instead of
+	// requesting an ENR it already has.
+	h.noteProven(fromNode)
+
 	for _, req := range reqs {
 		h.deliverResponse(req, resp.Record)
 	}
@@ -636,12 +658,18 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 
 // Sending Methods
 
-// Ping sends a PING request to a node.
+// Ping sends a PING request to a node at its canonical address.
 func (h *Handler) Ping(n *node.Node) (*Pong, error) {
-	// Read the address once: inbound packets rewrite it, and the endpoint proof
-	// requires the recorded destination to be the one we actually sent to.
-	destAddr := n.Addr()
+	return h.pingTo(n, n.Addr())
+}
 
+// pingTo sends a PING to an explicit destination.
+//
+// handlePing uses it to ping back the source it just ponged, rather than the
+// node's canonical address. That is what lets a peer which moved re-prove its new
+// endpoint: without it, a moved peer would be pinged only at its old address, never
+// answer, and so never bond or be served again.
+func (h *Handler) pingTo(n *node.Node, destAddr *net.UDPAddr) (*Pong, error) {
 	// Build PING message
 	ping := &Ping{
 		Version: 4,
@@ -912,17 +940,27 @@ func (h *Handler) sendENRResponse(to *node.Node, addr *net.UDPAddr, localAddr *n
 
 // Node Management
 
-// getOrCreateNode gets an existing node or creates a new one.
-func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net.UDPAddr) *node.Node {
+// lookupOrCreateNode returns the tracked node for id, creating one at addr if the
+// id is unknown.
+//
+// addr is used ONLY when creating: an existing node's canonical address is never
+// rewritten here, because addr is either an unauthenticated packet source or an
+// address a peer claimed in a NEIGHBORS record. Every sender reads that address,
+// and sendNeighbors republishes it, so letting either source set it would steer
+// our outbound traffic and let a peer poison what we publish about a third party.
+// Only promoteAddr, on a proven endpoint, may move it.
+func (h *Handler) lookupOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net.UDPAddr) *node.Node {
+	h.nodesMu.RLock()
+	n, exists := h.nodes[id]
+	h.nodesMu.RUnlock()
+	if exists {
+		return n
+	}
+
 	h.nodesMu.Lock()
 	defer h.nodesMu.Unlock()
 
-	n, exists := h.nodes[id]
-	if exists {
-		// Update address if changed
-		if n.Addr().String() != addr.String() {
-			n.SetAddr(addr)
-		}
+	if n, exists := h.nodes[id]; exists {
 		return n
 	}
 
@@ -942,6 +980,48 @@ func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net
 
 	h.nodes[id] = n
 	return n
+}
+
+// promoteAddr installs a proven endpoint as n's canonical address.
+//
+// Only handlePong may call this, and only for the address a matched PING was sent
+// to — see lookupOrCreateNode for why nothing else may move it.
+func (h *Handler) promoteAddr(n *node.Node, proven *net.UDPAddr) {
+	if n == nil || proven == nil || proven.IP == nil {
+		return
+	}
+	if n.Addr().String() == proven.String() {
+		return
+	}
+
+	n.SetAddr(proven)
+
+	logrus.WithFields(logrus.Fields{
+		"node_id": fmt.Sprintf("%x", n.IDBytes()[:8]),
+		"addr":    proven.String(),
+	}).Debug("promoted proven endpoint to canonical address")
+}
+
+// noteSeen refreshes identity-scoped liveness.
+//
+// Safe for any non-expired packet: the signature authenticates the identity, so a
+// peer can only refresh its own liveness. Withholding it until the source is
+// proven would evict a peer that is actively signing packets but whose bond has
+// lapsed, and it would come back with no proven addresses at all.
+func (h *Handler) noteSeen(n *node.Node) {
+	n.UpdateLastSeen()
+	n.IncrementPacketsReceived()
+}
+
+// noteProven is noteSeen plus OnNodeSeen, which admits the node to the routing
+// table and can spawn outbound PING/ENRREQUEST traffic toward it. It requires a
+// proven or solicited source.
+func (h *Handler) noteProven(n *node.Node) {
+	h.noteSeen(n)
+
+	if h.config.OnNodeSeen != nil {
+		h.config.OnNodeSeen(n, time.Now())
+	}
 }
 
 // GetNode returns a node by ID.

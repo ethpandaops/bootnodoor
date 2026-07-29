@@ -185,7 +185,7 @@ func TestFreshNodeSurvivesCleanup(t *testing.T) {
 		t.Fatalf("generate key: %v", err)
 	}
 	id := node.PubkeyToID(&key.PublicKey)
-	h.getOrCreateNode(id, &key.PublicKey, &net.UDPAddr{IP: net.IPv4(9, 9, 9, 9), Port: 30303})
+	h.lookupOrCreateNode(id, &key.PublicKey, &net.UDPAddr{IP: net.IPv4(9, 9, 9, 9), Port: 30303})
 
 	h.cleanup()
 
