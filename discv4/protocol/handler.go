@@ -585,6 +585,8 @@ func (h *Handler) handleENRRequest(fromNode *node.Node, from *net.UDPAddr, local
 		return ErrExpired
 	}
 
+	h.noteSeen(fromNode)
+
 	// IMPORTANT: Check if node is bonded (bidirectional bond required)
 	// This prevents amplification attacks and matches reth's behavior.
 	// Only respond to ENRRequest if we've established a bidirectional bond:
@@ -597,6 +599,8 @@ func (h *Handler) handleENRRequest(fromNode *node.Node, from *net.UDPAddr, local
 		}).Debug("Ignoring ENRREQUEST from unbonded node")
 		return fmt.Errorf("node not bonded")
 	}
+
+	h.noteProven(fromNode)
 
 	// Call callback
 	if h.config.OnENRRequest != nil {

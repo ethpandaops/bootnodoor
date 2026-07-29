@@ -116,8 +116,11 @@ func (s *Session) SetNode(n *node.Node) {
 }
 
 // maxSentNonces bounds the remembered nonces. A WHOAREYOU answers a packet we
-// sent moments ago, so only the most recent few can legitimately be referenced.
-const maxSentNonces = 16
+// sent moments ago, so the window only has to cover the traffic we can send to
+// one peer within a request lifetime; sized well above that, because being too
+// small silently drops a legitimate peer's restart recovery until its next
+// packet, while being generous costs a few hundred bytes per session.
+const maxSentNonces = 64
 
 // RecordSentNonce remembers the nonce of an ordinary packet we sent on this
 // session, so a WHOAREYOU claiming to answer it can be verified.

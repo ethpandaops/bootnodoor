@@ -109,8 +109,11 @@ func (c *Cache) Put(session *Session) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Check if we need to evict
-	if len(c.sessions) >= c.maxSessions {
+	// Replacing an existing key frees no slot, so only evict when this Put grows
+	// the map. Handshake recovery replaces a retained session by node ID; without
+	// this check it would evict an unrelated live peer and leave the map short.
+	_, replacing := c.sessions[session.RemoteID]
+	if !replacing && len(c.sessions) >= c.maxSessions {
 		// Find and remove the least recently used session
 		c.evictLRU()
 	}
