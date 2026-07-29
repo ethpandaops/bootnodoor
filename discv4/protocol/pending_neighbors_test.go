@@ -70,7 +70,9 @@ func TestNeighborsAccumulationCapped(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket); err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
 
 	// Pre-build packets so no slow key generation happens between the calls and
 	// the read (the delivery goroutine deletes the entry after the window).
@@ -85,7 +87,7 @@ func TestNeighborsAccumulationCapped(t *testing.T) {
 	}
 
 	h.pendingNeighborsMu.RLock()
-	pending := h.pendingNeighbors["req"]
+	pending := h.pendingNeighbors[requestKey([]byte("req"), from.ID())]
 	h.pendingNeighborsMu.RUnlock()
 	if pending == nil {
 		t.Fatal("expected a pending entry for the matched FINDNODE")
@@ -102,7 +104,10 @@ func TestNeighborsDeliveredToWaiter(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	req := h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	req, err := h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	if err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
 
 	if err := h.handleNeighbors(from, from.Addr(), makeNeighbors(t, 5)); err != nil {
 		t.Fatal(err)
@@ -152,7 +157,9 @@ func TestNeighborsCapAppliesBeforeNodePersistence(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket); err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
 
 	if err := h.handleNeighbors(from, from.Addr(), makeNeighbors(t, maxNeighborsPerResponse+20)); err != nil {
 		t.Fatal(err)
@@ -250,7 +257,9 @@ func TestNeighborsPersistenceCapExactUnderConcurrency(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	if _, err := h.addPendingRequest([]byte("req"), from, FindnodePacket); err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
 
 	packets := make([]*Neighbors, 6)
 	for i := range packets {
@@ -285,7 +294,10 @@ func TestNeighborsAfterDeliveryPersistNothing(t *testing.T) {
 	defer cancel()
 
 	from := makeDiscv4Node(t)
-	req := h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	req, err := h.addPendingRequest([]byte("req"), from, FindnodePacket)
+	if err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
 
 	if err := h.handleNeighbors(from, from.Addr(), makeNeighbors(t, 2)); err != nil {
 		t.Fatal(err)
@@ -311,7 +323,7 @@ func TestNeighborsAfterDeliveryPersistNothing(t *testing.T) {
 		t.Fatalf("a post-delivery packet persisted %d records, want 0", after-before)
 	}
 	h.pendingNeighborsMu.RLock()
-	pending := h.pendingNeighbors["req"]
+	pending := h.pendingNeighbors[requestKey([]byte("req"), from.ID())]
 	h.pendingNeighborsMu.RUnlock()
 	if pending == nil || !pending.Closed || len(pending.Nodes) != 2 {
 		t.Fatalf("tombstone state = %+v, want closed with the delivered 2 nodes", pending)

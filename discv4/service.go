@@ -382,22 +382,6 @@ func (s *Service) Handler() *protocol.Handler {
 	return s.handler
 }
 
-// Statistics
-
-// Stats returns service statistics.
-func (s *Service) Stats() map[string]interface{} {
-	handler := s.Handler()
-	if handler == nil {
-		return map[string]interface{}{}
-	}
-
-	stats := handler.Stats()
-
-	// Note: Transport stats are not included since transport is managed externally
-
-	return stats
-}
-
 // Utility Methods
 
 // ParseNodeFromEnode creates a node from an enode:// URL.

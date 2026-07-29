@@ -61,9 +61,11 @@ type Handler struct {
 	nodesMu sync.RWMutex
 	nodes   map[node.ID]*node.Node
 
-	// Pending requests (hash -> PendingRequest)
+	// Pending requests, keyed by packet hash + destination node ID: the hash
+	// alone aliases across peers (deterministic signatures, 1s Expiration
+	// granularity), and identical requests to one peer share a key's slice.
 	requestsMu sync.RWMutex
-	requests   map[string]*PendingRequest
+	requests   map[string][]*PendingRequest
 
 	// Pending multi-packet FINDNODE responses
 	pendingNeighborsMu sync.RWMutex
@@ -223,7 +225,7 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 		ctx:              ctx,
 		transport:        transport,
 		nodes:            make(map[node.ID]*node.Node),
-		requests:         make(map[string]*PendingRequest),
+		requests:         make(map[string][]*PendingRequest),
 		pendingNeighbors: make(map[string]*PendingNeighborsResponse),
 		localENR:         config.LocalENR,
 	}
@@ -382,9 +384,8 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 		h.config.OnPongReceived(fromNode, pong.To.IP, pong.To.UDP)
 	}
 
-	// Match to pending request
-	req := h.getPendingRequest(string(pong.ReplyTok))
-	if req != nil {
+	// Match to pending requests
+	for _, req := range h.getPendingRequests(pong.ReplyTok, fromNode.ID()) {
 		h.deliverResponse(req, pong)
 	}
 
@@ -463,7 +464,7 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 	// a delivered one. Room is reserved before decoding, so records past the
 	// cap are never persisted in the global node map, even when packets are
 	// dispatched concurrently.
-	key := string(matchedReq.RequestHash)
+	key := requestKey(matchedReq.RequestHash, matchedReq.ToNode.ID())
 
 	h.pendingNeighborsMu.Lock()
 	pending := h.pendingNeighbors[key]
@@ -576,12 +577,31 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 		"enr_seq": resp.Record.Seq(),
 	}).Debug("Received ENRRESPONSE")
 
-	// Update node's ENR
-	fromNode.SetENR(resp.Record)
+	// Only a response to a request we actually sent to this peer may touch any
+	// state: ENRRESPONSE carries no expiration, so an unsolicited replay could
+	// otherwise roll the node back to an older record.
+	reqs := h.getPendingRequests(resp.ReplyTok, fromNode.ID())
+	if len(reqs) == 0 {
+		return nil
+	}
 
-	// Match to pending request
-	req := h.getPendingRequest(string(resp.ReplyTok))
-	if req != nil {
+	// Bind the record to the sender's identity before installing it, so a
+	// matched response cannot attach another node's ENR to this node.
+	if resp.Record == nil {
+		return nil
+	}
+	pub := resp.Record.PublicKey()
+	if pub == nil || node.PubkeyToID(pub) != fromNode.ID() {
+		logrus.WithFields(logrus.Fields{
+			"from":    from.String(),
+			"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
+		}).Debug("Dropping ENRRESPONSE: record does not match sender identity")
+		return nil
+	}
+
+	fromNode.UpdateENR(resp.Record)
+
+	for _, req := range reqs {
 		h.deliverResponse(req, resp.Record)
 	}
 
@@ -614,8 +634,11 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 	}
 
 	// Register pending request; removal is deferred so every exit path clears it.
-	req := h.addPendingRequest(hash, n, PingPacket)
-	defer h.removePendingRequest(string(hash))
+	req, err := h.addPendingRequest(hash, n, PingPacket)
+	if err != nil {
+		return nil, err
+	}
+	defer h.removePendingRequest(req)
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
@@ -674,8 +697,11 @@ func (h *Handler) Findnode(n *node.Node, target []byte) ([]*node.Node, error) {
 	// Register pending request. Removal is deferred so every exit path clears
 	// it: a completed request left in the map keeps matching later NEIGHBORS
 	// from that node and reopens collection windows until cleanup runs.
-	req := h.addPendingRequest(hash, n, FindnodePacket)
-	defer h.removePendingRequest(string(hash))
+	req, err := h.addPendingRequest(hash, n, FindnodePacket)
+	if err != nil {
+		return nil, err
+	}
+	defer h.removePendingRequest(req)
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
@@ -725,8 +751,11 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 	}
 
 	// Register pending request; removal is deferred so every exit path clears it.
-	pendingReq := h.addPendingRequest(hash, n, ENRRequestPacket)
-	defer h.removePendingRequest(string(hash))
+	pendingReq, err := h.addPendingRequest(hash, n, ENRRequestPacket)
+	if err != nil {
+		return nil, err
+	}
+	defer h.removePendingRequest(pendingReq)
 
 	// Send packet
 	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
@@ -904,8 +933,16 @@ func (h *Handler) AllNodes() []*node.Node {
 
 // Request Tracking
 
-// addPendingRequest registers a new pending request.
-func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte) *PendingRequest {
+// requestKey scopes a pending request to its destination, since the packet
+// hash alone aliases across peers (see the requests field).
+func requestKey(hash []byte, id node.ID) string {
+	return string(hash) + string(id[:])
+}
+
+// addPendingRequest registers a new pending request. A second FINDNODE to a
+// peer with one already in flight is rejected: NEIGHBORS carries no reply
+// token, so two in-flight FINDNODEs to one peer cannot be told apart.
+func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte) (*PendingRequest, error) {
 	req := &PendingRequest{
 		RequestHash:  hash,
 		ToNode:       toNode,
@@ -916,37 +953,68 @@ func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType b
 	}
 
 	h.requestsMu.Lock()
-	h.requests[string(hash)] = req
-	h.requestsMu.Unlock()
+	defer h.requestsMu.Unlock()
 
-	return req
+	if packetType == FindnodePacket && h.pendingFindnodeLocked(toNode.ID()) != nil {
+		return nil, fmt.Errorf("findnode already in flight to %x", toNode.IDBytes()[:8])
+	}
+
+	key := requestKey(hash, toNode.ID())
+	h.requests[key] = append(h.requests[key], req)
+
+	return req, nil
 }
 
-// getPendingRequest retrieves a pending request by hash.
-func (h *Handler) getPendingRequest(hash string) *PendingRequest {
+// getPendingRequests returns the pending requests matching a reply token and
+// its sender, so a response can only resolve requests sent to that peer.
+func (h *Handler) getPendingRequests(replyTok []byte, id node.ID) []*PendingRequest {
 	h.requestsMu.RLock()
 	defer h.requestsMu.RUnlock()
-	return h.requests[hash]
+	return append([]*PendingRequest(nil), h.requests[requestKey(replyTok, id)]...)
 }
 
-// findPendingFindnode returns a pending FINDNODE request awaiting a response
+// findPendingFindnode returns the pending FINDNODE request awaiting a response
 // from the given node, or nil if none exists.
 func (h *Handler) findPendingFindnode(id node.ID) *PendingRequest {
 	h.requestsMu.RLock()
 	defer h.requestsMu.RUnlock()
-	for _, req := range h.requests {
-		if req.PacketType == FindnodePacket && req.ToNode != nil && req.ToNode.ID() == id {
-			return req
+	return h.pendingFindnodeLocked(id)
+}
+
+func (h *Handler) pendingFindnodeLocked(id node.ID) *PendingRequest {
+	for _, reqs := range h.requests {
+		for _, req := range reqs {
+			if req.PacketType == FindnodePacket && req.ToNode != nil && req.ToNode.ID() == id {
+				return req
+			}
 		}
 	}
 	return nil
 }
 
-// removePendingRequest removes a pending request.
-func (h *Handler) removePendingRequest(hash string) {
+// removePendingRequest removes one pending request, leaving other waiters on
+// the same key in place so one caller's cleanup cannot orphan another's.
+func (h *Handler) removePendingRequest(req *PendingRequest) {
+	if req == nil || req.ToNode == nil {
+		return
+	}
+	key := requestKey(req.RequestHash, req.ToNode.ID())
+
 	h.requestsMu.Lock()
-	delete(h.requests, hash)
-	h.requestsMu.Unlock()
+	defer h.requestsMu.Unlock()
+
+	reqs := h.requests[key]
+	for i, r := range reqs {
+		if r == req {
+			reqs = append(reqs[:i], reqs[i+1:]...)
+			break
+		}
+	}
+	if len(reqs) == 0 {
+		delete(h.requests, key)
+	} else {
+		h.requests[key] = reqs
+	}
 }
 
 // deliverResponse hands a response to a waiting request without blocking.
@@ -986,9 +1054,17 @@ func (h *Handler) cleanup() {
 
 	// Clean up expired requests
 	h.requestsMu.Lock()
-	for hash, req := range h.requests {
-		if now.After(req.Timeout) {
-			delete(h.requests, hash)
+	for key, reqs := range h.requests {
+		kept := reqs[:0]
+		for _, req := range reqs {
+			if !now.After(req.Timeout) {
+				kept = append(kept, req)
+			}
+		}
+		if len(kept) == 0 {
+			delete(h.requests, key)
+		} else {
+			h.requests[key] = kept
 		}
 	}
 	h.requestsMu.Unlock()
@@ -1078,7 +1154,10 @@ func (h *Handler) GetStats() HandlerStats {
 	knownNodes := len(h.nodes)
 	h.nodesMu.RUnlock()
 	h.requestsMu.RLock()
-	pendingRequests := len(h.requests)
+	pendingRequests := 0
+	for _, reqs := range h.requests {
+		pendingRequests += len(reqs)
+	}
 	h.requestsMu.RUnlock()
 	h.pendingNeighborsMu.RLock()
 	pendingNeighbors := len(h.pendingNeighbors)
@@ -1098,24 +1177,6 @@ func (h *Handler) GetStats() HandlerStats {
 		KnownNodes:            knownNodes,
 		PendingRequests:       pendingRequests,
 		PendingNeighbors:      pendingNeighbors,
-	}
-}
-
-// Stats returns current statistics as a map, for callers that render it
-// generically.
-func (h *Handler) Stats() map[string]interface{} {
-	s := h.GetStats()
-	return map[string]interface{}{
-		"packets_received":        s.PacketsReceived,
-		"packets_sent":            s.PacketsSent,
-		"invalid_packets":         s.InvalidPackets,
-		"expired_packets":         s.ExpiredPackets,
-		"unbonded_findnode":       s.UnbondedFindnode,
-		"findnode_requests_recv":  s.FindnodeRequestsRecv,
-		"findnode_responses_recv": s.FindnodeResponsesRecv,
-		"known_nodes":             s.KnownNodes,
-		"pending_requests":        s.PendingRequests,
-		"pending_neighbors":       s.PendingNeighbors,
 	}
 }
 

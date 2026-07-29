@@ -192,6 +192,24 @@ func (n *Node) SetENR(record *enr.Record) {
 	n.mu.Unlock()
 }
 
+// UpdateENR installs the record only if it is newer than the current one, so
+// a replayed response cannot roll the node back to an older record.
+func (n *Node) UpdateENR(record *enr.Record) bool {
+	if record == nil {
+		return false
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.enr != nil && record.Seq() <= n.enr.Seq() {
+		return false
+	}
+	n.enr = record
+
+	return true
+}
+
 // statsRef returns the current shared stats pointer for use outside the lock.
 func (n *Node) statsRef() *stats.SharedStats {
 	n.mu.RLock()
