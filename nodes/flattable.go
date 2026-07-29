@@ -733,16 +733,31 @@ func (t *FlatTable) ActiveSize() int {
 }
 
 // GetStats returns statistics about the table.
+//
+// Active comes from memory and persisted from the database, so the two are
+// counted as sets rather than subtracted: an admission whose write has not
+// landed yet would otherwise report more active than total.
 func (t *FlatTable) GetStats() TableStats {
+	persisted := t.db.PersistedIDs()
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	activeCount := len(t.activeNodes)
-	totalCount := t.db.Count()
+
+	inactiveCount := 0
+	totalCount := activeCount
+	for _, id := range persisted {
+		if _, active := t.activeNodes[id]; !active {
+			inactiveCount++
+			totalCount++
+		}
+	}
 
 	return TableStats{
 		TotalNodes:          totalCount,
 		ActiveNodes:         activeCount,
+		InactiveNodes:       inactiveCount,
 		AdmissionRejections: t.admissionRejections,
 		IPLimitRejections:   t.ipLimitRejections,
 		DeadNodesRemoved:    t.deadNodesRemoved,

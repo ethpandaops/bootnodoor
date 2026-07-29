@@ -103,7 +103,7 @@ func (fh *FrontendHandler) CLNodes(w http.ResponseWriter, r *http.Request) {
 	pageData := CLNodesPageData{
 		TotalNodes:        stats.TotalNodes,
 		ActiveNodes:       stats.ActiveNodes,
-		InactiveNodes:     stats.TotalNodes - stats.ActiveNodes,
+		InactiveNodes:     stats.InactiveNodes,
 		AliveNodes:        aliveCount,
 		DeadNodes:         deadCount,
 		CurrentForkDigest: currentForkDigest,
@@ -180,7 +180,7 @@ func (fh *FrontendHandler) CLNodesJSON(w http.ResponseWriter, r *http.Request) {
 	pageData := CLNodesPageData{
 		TotalNodes:        stats.TotalNodes,
 		ActiveNodes:       stats.ActiveNodes,
-		InactiveNodes:     stats.TotalNodes - stats.ActiveNodes,
+		InactiveNodes:     stats.InactiveNodes,
 		AliveNodes:        aliveCount,
 		DeadNodes:         deadCount,
 		CurrentForkDigest: currentForkDigest,

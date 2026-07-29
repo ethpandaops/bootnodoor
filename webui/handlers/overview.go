@@ -333,7 +333,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	// Get EL table stats if available
 	if elTable := fh.bootnodeService.ELTable(); elTable != nil {
 		elStats := elTable.GetStats()
-		elInactiveNodes := elStats.TotalNodes - elStats.ActiveNodes
+		elInactiveNodes := elStats.InactiveNodes
 		pageData.ELActiveNodes = elStats.ActiveNodes
 		pageData.ELTotalNodes = elStats.TotalNodes
 		pageData.ELTableStats = TableStats{
@@ -350,7 +350,7 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 	// Get CL table stats if available
 	if clTable := fh.bootnodeService.CLTable(); clTable != nil {
 		clStats := clTable.GetStats()
-		clInactiveNodes := clStats.TotalNodes - clStats.ActiveNodes
+		clInactiveNodes := clStats.InactiveNodes
 		pageData.CLActiveNodes = clStats.ActiveNodes
 		pageData.CLTotalNodes = clStats.TotalNodes
 		pageData.CLTableStats = TableStats{

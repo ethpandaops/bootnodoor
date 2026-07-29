@@ -107,6 +107,14 @@ func (d *Database) CountNodes(layer NodeLayer) (int, error) {
 	return count, err
 }
 
+// GetNodeIDs returns the node IDs persisted for a specific layer.
+func (d *Database) GetNodeIDs(layer NodeLayer) ([][]byte, error) {
+	d.trackQuery()
+	var ids [][]byte
+	err := d.ReaderDb.Select(&ids, "SELECT nodeid FROM nodes WHERE layer = $1", string(layer))
+	return ids, err
+}
+
 // CountAllNodes returns the total number of nodes (all layers).
 func (d *Database) CountAllNodes() (int, error) {
 	d.trackQuery()

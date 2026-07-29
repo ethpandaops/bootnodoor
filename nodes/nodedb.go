@@ -609,6 +609,26 @@ func (ndb *NodeDB) List() []*Node {
 	return nodes
 }
 
+// PersistedIDs returns the node IDs persisted for this layer.
+func (ndb *NodeDB) PersistedIDs() [][32]byte {
+	rows, err := ndb.db.GetNodeIDs(ndb.layer)
+	if err != nil {
+		ndb.logger.WithError(err).Warn("failed to list persisted node ids")
+		return nil
+	}
+
+	ids := make([][32]byte, 0, len(rows))
+	for _, raw := range rows {
+		if len(raw) != 32 {
+			continue
+		}
+		var id [32]byte
+		copy(id[:], raw)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // Count returns the total number of nodes in the database.
 func (ndb *NodeDB) Count() int {
 	count, err := ndb.db.CountNodes(ndb.layer)
