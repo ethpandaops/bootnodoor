@@ -4,6 +4,7 @@ import (
 	"time"
 
 	v4protocol "github.com/ethpandaops/bootnodoor/discv4/protocol"
+	"github.com/ethpandaops/bootnodoor/discv5/session"
 	"github.com/ethpandaops/bootnodoor/services"
 	"github.com/ethpandaops/bootnodoor/transport"
 )
@@ -18,11 +19,11 @@ type Stats struct {
 	Discv5   Discv5Stats
 	Discv4   v4protocol.HandlerStats
 	HasV4    bool
-	Sessions SessionStats
+	Sessions session.Stats
 	Packets  transport.MetricsSnapshot
 }
 
-// Discv5Stats is the per-identity discv5 handler counters, summed.
+// Discv5Stats is the deliberate subset of protocol.HandlerStats the web UI renders, summed per identity.
 type Discv5Stats struct {
 	PacketsReceived   int
 	PacketsSent       int
@@ -31,13 +32,6 @@ type Discv5Stats struct {
 	FindNodeReceived  int
 	PendingHandshakes int
 	PendingChallenges int
-}
-
-// SessionStats is the discv5 session cache totals, summed per identity.
-type SessionStats struct {
-	Total   int
-	Active  int
-	Expired int
 }
 
 // GetStats returns a snapshot of the service's discovery counters.

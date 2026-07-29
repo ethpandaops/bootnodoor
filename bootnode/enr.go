@@ -228,6 +228,16 @@ func (m *ENRManager) GetELFilter() *elconfig.ForkFilter {
 	return m.elFilter
 }
 
+// RecordELAdmission records an EL admission decision on the filter stats.
+// Records without an eth entry are consensus nodes, not wrong-fork execution
+// nodes, and are not counted (see services.AdmissionRejectedLayer).
+func (m *ENRManager) RecordELAdmission(record *enr.Record, accepted bool, forkID elconfig.ForkID) {
+	if m.elFilter == nil || record == nil || !record.Has("eth") {
+		return
+	}
+	m.elFilter.RecordAdmission(accepted, forkID)
+}
+
 // GetCLFilter returns the CL fork digest filter (may be nil).
 func (m *ENRManager) GetCLFilter() *clconfig.ForkDigestFilter {
 	return m.clFilter

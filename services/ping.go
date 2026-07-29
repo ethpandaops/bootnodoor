@@ -65,7 +65,7 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 
 	// Try discv5 first if available
 	if v5Node := n.V5(); v5Node != nil && ps.v5Handler != nil {
-		ps.countProtocol(true)
+		ps.countV5Ping()
 		respChan, err := ps.v5Handler.SendPing(v5Node)
 		if err != nil {
 			// Failed to send ping - only increment failure if no v4 fallback available
@@ -136,7 +136,7 @@ func (ps *PingService) Ping(n *nodedb.Node) (bool, time.Duration, error) {
 
 	// Try discv4 fallback if available
 	if v4Node := n.V4(); v4Node != nil && ps.v4Service != nil {
-		ps.countProtocol(false)
+		ps.countV4Ping()
 		pong, err := ps.v4Service.Ping(v4Node)
 		rtt := time.Since(start)
 
@@ -441,13 +441,15 @@ func (ps *PingService) countPingSent() {
 	ps.mu.Unlock()
 }
 
-func (ps *PingService) countProtocol(isV5 bool) {
+func (ps *PingService) countV5Ping() {
 	ps.mu.Lock()
-	if isV5 {
-		ps.pingsV5++
-	} else {
-		ps.pingsV4++
-	}
+	ps.pingsV5++
+	ps.mu.Unlock()
+}
+
+func (ps *PingService) countV4Ping() {
+	ps.mu.Lock()
+	ps.pingsV4++
 	ps.mu.Unlock()
 }
 

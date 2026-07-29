@@ -120,13 +120,23 @@ func New(cfg *Config) (*Service, error) {
 			t.Close()
 		}
 	}
+
+	// Everything created below hangs off s.ctx (NodeDB queue processors,
+	// protocol-handler cleanup goroutines), so cancelling tears it all down.
+	ok := false
+	defer func() {
+		if !ok {
+			cancel()
+			closeTransports()
+		}
+	}()
+
 	for _, id := range s.identities {
 		if transports[id.bindPort] == nil {
 			// JoinHostPort so an IPv6 bind addr becomes [::]:port, not :::port.
 			listenAddr := net.JoinHostPort(cfg.BindIP.String(), fmt.Sprintf("%d", id.bindPort))
 			t, terr := transport.NewUDPTransport(&transport.Config{ListenAddr: listenAddr, Logger: cfg.Logger})
 			if terr != nil {
-				closeTransports()
 				return nil, fmt.Errorf("failed to create UDP transport on port %d: %w", id.bindPort, terr)
 			}
 			cfg.Logger.WithField("address", listenAddr).Info("listening for discovery")
@@ -143,7 +153,6 @@ func New(cfg *Config) (*Service, error) {
 
 		localNode, nerr := createLocalNode(cfg, id.key, id.enrIP, id.enrIP6, id.enrPort, storedENR)
 		if nerr != nil {
-			closeTransports()
 			return nil, fmt.Errorf("failed to create local node: %w", nerr)
 		}
 		id.localNode = localNode
@@ -191,14 +200,12 @@ func New(cfg *Config) (*Service, error) {
 	if cfg.HasEL() {
 		s.elTable, err = s.createTable(s.elIdentity().localNode.ID(), s.elNodeDB, "EL")
 		if err != nil {
-			closeTransports()
 			return nil, fmt.Errorf("failed to create EL table: %w", err)
 		}
 	}
 	if cfg.HasCL() {
 		s.clTable, err = s.createTable(s.clIdentity().localNode.ID(), s.clNodeDB, "CL")
 		if err != nil {
-			closeTransports()
 			return nil, fmt.Errorf("failed to create CL table: %w", err)
 		}
 	}
@@ -207,7 +214,6 @@ func New(cfg *Config) (*Service, error) {
 	if cfg.EnableDiscv5 {
 		for _, id := range s.identities {
 			if ierr := s.initDiscv5(id); ierr != nil {
-				closeTransports()
 				return nil, fmt.Errorf("failed to initialize discv5: %w", ierr)
 			}
 		}
@@ -217,12 +223,6 @@ func New(cfg *Config) (*Service, error) {
 	// Create the discv4 service (EL-only) on the EL identity.
 	if cfg.EnableDiscv4 {
 		if ierr := s.initDiscv4(s.elIdentity()); ierr != nil {
-			for _, id := range s.identities {
-				if id.discv5Service != nil {
-					id.discv5Service.Stop()
-				}
-			}
-			closeTransports()
 			return nil, fmt.Errorf("failed to initialize discv4: %w", ierr)
 		}
 	}
@@ -253,84 +253,8 @@ func New(cfg *Config) (*Service, error) {
 			Layer:         db.LayerEL,
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) services.AdmissionResult {
-				// Filter by fork ID before adding to table
-				if n.Record() != nil && s.enrManager != nil {
-					isEL, forkID := s.enrManager.FilterELNode(n.Record())
-					if !isEL {
-						// A record with no eth entry is a consensus node, not an
-						// execution node on the wrong fork. Counting those as
-						// fork rejections would make a healthy dual-layer network
-						// look like a fork-compatibility failure.
-						if !n.Record().Has("eth") {
-							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "not_el"); err != nil {
-								cfg.Logger.WithError(err).Debug("failed to store bad node")
-							}
-							return services.AdmissionRejectedLayer
-						}
-						if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-							elFilter.RecordAdmission(false, forkID)
-						}
-						cfg.Logger.WithFields(logrus.Fields{
-							"peerID": n.PeerID(),
-							"eth":    forkID.String(),
-						}).Debug("EL lookup admission rejected: incompatible fork id")
-						// Mark as bad node
-						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
-							cfg.Logger.WithError(err).Debug("failed to store bad node")
-						}
-						return services.AdmissionRejectedFilter
-					}
-					if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-						elFilter.RecordAdmission(true, forkID)
-					}
-				}
-
-				// If node was discovered via v4 (only has v4 support), immediately test for v5 support
-				if n.HasV4() && !n.HasV5() && s.getV5Handler() != nil {
-					record := n.Record()
-					if record != nil {
-						// Try to create v5 node from ENR
-						v5Node, err := nodes.NewV5NodeFromRecord(record)
-						if err == nil && s.getV5Handler() != nil {
-							// Ping on v5 to test support
-							start := time.Now()
-							respChan, err := s.getV5Handler().SendPing(v5Node)
-							if err == nil {
-								resp := <-respChan
-								rtt := time.Since(start)
-								if resp.Error == nil {
-									// v5 ping succeeded - add v5 support
-									n.SetV5(v5Node)
-									cfg.Logger.WithFields(logrus.Fields{
-										"peerID": n.PeerID(),
-										"addr":   n.Addr(),
-										"rtt":    rtt,
-									}).Debug("discovered v5 support on v4-discovered node")
-
-									// Queue protocol support update (SetV5 already marked it dirty)
-									if s.elNodeDB != nil {
-										if err := s.elNodeDB.QueueUpdate(n); err != nil {
-											cfg.Logger.WithError(err).Debug("failed to queue node for protocol support update")
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-
-				// Attempt to add to EL table
-				if !s.elTable.Add(n) {
-					return services.AdmissionRejectedPool
-				}
-				// Remove from bad nodes list if it was previously bad
-				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
-					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-				}
-				return services.AdmissionAccepted
-			},
-			Logger: cfg.Logger.WithField("service", "el-lookup"),
+			OnNodeFound:   s.admitELLookupNode,
+			Logger:        cfg.Logger.WithField("service", "el-lookup"),
 		})
 	}
 
@@ -356,38 +280,12 @@ func New(cfg *Config) (*Service, error) {
 			Layer:         db.LayerCL,
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) services.AdmissionResult {
-				// Filter by fork digest before adding to table
-				if n.Record() != nil && s.enrManager != nil {
-					if !s.enrManager.FilterCLNode(n.Record()) {
-						// No eth2 entry means an execution node, not a consensus
-						// node on the wrong digest; keep the two distinguishable.
-						if !n.Record().Has("eth2") {
-							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "not_cl"); err != nil {
-								cfg.Logger.WithError(err).Debug("failed to store bad node")
-							}
-							return services.AdmissionRejectedLayer
-						}
-						// Mark as bad node
-						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
-							cfg.Logger.WithError(err).Debug("failed to store bad node")
-						}
-						return services.AdmissionRejectedFilter
-					}
-				}
-				// Attempt to add to CL table
-				if !s.clTable.Add(n) {
-					return services.AdmissionRejectedPool
-				}
-				// Remove from bad nodes list if it was previously bad
-				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
-					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-				}
-				return services.AdmissionAccepted
-			},
-			Logger: cfg.Logger.WithField("service", "cl-lookup"),
+			OnNodeFound:   s.admitCLLookupNode,
+			Logger:        cfg.Logger.WithField("service", "cl-lookup"),
 		})
 	}
+
+	ok = true
 
 	return s, nil
 }
@@ -935,29 +833,17 @@ func (s *Service) connectELBootnodes() {
 
 // connectELBootnodeENR connects to an EL bootnode via ENR.
 func (s *Service) connectELBootnodeENR(record *enr.Record) {
-	// Convert to v5 node
+	// Convert to v5 node; this also rejects records missing an IP or UDP port.
 	v5, err := v5node.New(record)
 	if err != nil {
 		s.config.Logger.WithError(err).Warn("failed to create v5 node from ENR")
 		return
 	}
 
-	// Verify ENR has required fields (IP and port)
-	if record.IP() == nil && record.IP6() == nil {
-		s.config.Logger.Warn("bootnode ENR missing IP address, skipping")
-		return
-	}
-	if record.UDP() == 0 {
-		s.config.Logger.Warn("bootnode ENR missing UDP port, skipping")
-		return
-	}
-
 	// Filter by fork ID before adding
 	if s.enrManager != nil {
 		isEL, forkID := s.enrManager.FilterELNode(record)
-		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-			elFilter.RecordAdmission(isEL, forkID)
-		}
+		s.enrManager.RecordELAdmission(record, isEL, forkID)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", v5.ID().Bytes()[:8]),
@@ -967,23 +853,8 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 		}
 	}
 
-	// Create generic node and add to table
 	genericNode := nodes.NewFromV5(v5, s.elNodeDB)
-	if s.elTable != nil {
-		if !s.elTable.Add(genericNode) {
-			s.config.Logger.Debug("ENR bootnode not admitted to table, not persisting")
-			return
-		}
-		s.config.Logger.Info("added ENR bootnode to table")
-
-		// Persist to database
-		if s.elNodeDB != nil {
-			genericNode.MarkDirty(nodes.DirtyFull)
-			if err := s.elNodeDB.QueueUpdate(genericNode); err != nil {
-				s.config.Logger.WithError(err).Debug("failed to queue bootnode for database update")
-			}
-		}
-	}
+	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode, s.config.Logger.WithField("layer", "EL"))
 }
 
 // connectELBootnodeEnode connects to an EL bootnode via enode URL.
@@ -1027,9 +898,7 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	// Filter by fork ID before adding
 	if s.enrManager != nil {
 		isEL, forkID := s.enrManager.FilterELNode(enrRecord)
-		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-			elFilter.RecordAdmission(isEL, forkID)
-		}
+		s.enrManager.RecordELAdmission(enrRecord, isEL, forkID)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", nodeID[:8]),
@@ -1045,21 +914,8 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	// Track successful ENR exchange
 	genericNode.IncrementSuccess()
 
-	if s.elTable != nil {
-		if !s.elTable.Add(genericNode) {
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("enode bootnode not admitted to table, not persisting")
-			return
-		}
-		s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Info("added enode bootnode to table")
-
-		// Persist to database
-		if s.elNodeDB != nil {
-			genericNode.MarkDirty(nodes.DirtyFull)
-			if err := s.elNodeDB.QueueUpdate(genericNode); err != nil {
-				s.config.Logger.WithError(err).Debug("failed to queue bootnode for database update")
-			}
-		}
-	}
+	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode,
+		s.config.Logger.WithField("layer", "EL").WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])))
 }
 
 // connectCLBootnodes connects to CL bootnodes (ENR only).
@@ -1073,7 +929,7 @@ func (s *Service) connectCLBootnodes() {
 			continue
 		}
 
-		// Convert to v5 node to get node ID
+		// Convert to v5 node; this also rejects records missing an IP or UDP port.
 		v5, err := v5node.New(record)
 		if err != nil {
 			s.config.Logger.WithError(err).Warn("failed to create v5 node from ENR")
@@ -1082,40 +938,38 @@ func (s *Service) connectCLBootnodes() {
 
 		nodeID := v5.ID()
 
-		// Verify ENR has required fields (IP and port)
-		if record.IP() == nil && record.IP6() == nil {
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR missing IP address, skipping")
-			continue
-		}
-		if record.UDP() == 0 {
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR missing UDP port, skipping")
-			continue
-		}
-
 		// Filter by fork digest before adding
 		if s.enrManager != nil && !s.enrManager.FilterCLNode(record) {
 			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR has invalid fork digest, skipping")
 			continue
 		}
 
-		// Create generic node and add to table
 		genericNode := nodes.NewFromV5(v5, s.clNodeDB)
-		if s.clTable != nil {
-			if !s.clTable.Add(genericNode) {
-				s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("CL bootnode not admitted to table, not persisting")
-				continue
-			}
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Info("added CL ENR bootnode to table")
+		s.addBootnodeToTable(s.clTable, s.clNodeDB, genericNode,
+			s.config.Logger.WithField("layer", "CL").WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])))
+	}
+}
 
-			// Persist to database
-			if s.clNodeDB != nil {
-				genericNode.MarkDirty(nodes.DirtyFull)
-				if err := s.clNodeDB.QueueUpdate(genericNode); err != nil {
-					s.config.Logger.WithError(err).Debug("failed to queue bootnode for database update")
-				}
-			}
+// addBootnodeToTable admits a configured bootnode to a routing table and
+// persists it, reporting whether it was admitted.
+func (s *Service) addBootnodeToTable(table *nodes.FlatTable, nodeDB *nodes.NodeDB, n *nodes.Node, logger logrus.FieldLogger) bool {
+	if table == nil {
+		return false
+	}
+	if !table.Add(n) {
+		logger.Debug("bootnode not admitted to table, not persisting")
+		return false
+	}
+	logger.Info("added bootnode to table")
+
+	if nodeDB != nil {
+		n.MarkDirty(nodes.DirtyFull)
+		if err := nodeDB.QueueUpdate(n); err != nil {
+			logger.WithError(err).Debug("failed to queue bootnode for database update")
 		}
 	}
+
+	return true
 }
 
 // loadStoredENR loads the stored ENR from database.
@@ -1328,6 +1182,115 @@ func (s *Service) requestENRV4(n *v4node.Node) {
 	}()
 }
 
+// admitELLookupNode decides admission of a lookup-discovered node to the EL
+// table.
+func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
+	if n.Record() != nil && s.enrManager != nil {
+		isEL, forkID := s.enrManager.FilterELNode(n.Record())
+		s.enrManager.RecordELAdmission(n.Record(), isEL, forkID)
+		if !isEL {
+			// A record with no eth entry is a consensus node, not an
+			// execution node on the wrong fork.
+			if !n.Record().Has("eth") {
+				if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "not_el"); err != nil {
+					s.config.Logger.WithError(err).Debug("failed to store bad node")
+				}
+				return services.AdmissionRejectedLayer
+			}
+			s.config.Logger.WithFields(logrus.Fields{
+				"peerID": n.PeerID(),
+				"eth":    forkID.String(),
+			}).Debug("EL lookup admission rejected: incompatible fork id")
+			if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
+				s.config.Logger.WithError(err).Debug("failed to store bad node")
+			}
+			return services.AdmissionRejectedFilter
+		}
+	}
+
+	if n.HasV4() && !n.HasV5() {
+		s.probeV5Support(n)
+	}
+
+	if !s.elTable.Add(n) {
+		return services.AdmissionRejectedPool
+	}
+	if err := s.config.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
+		s.config.Logger.WithError(err).Debug("failed to remove from bad nodes")
+	}
+	return services.AdmissionAccepted
+}
+
+// admitCLLookupNode decides admission of a lookup-discovered node to the CL
+// table.
+func (s *Service) admitCLLookupNode(n *nodes.Node) services.AdmissionResult {
+	if n.Record() != nil && s.enrManager != nil {
+		if !s.enrManager.FilterCLNode(n.Record()) {
+			// No eth2 entry means an execution node, not a consensus
+			// node on the wrong digest; keep the two distinguishable.
+			if !n.Record().Has("eth2") {
+				if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "not_cl"); err != nil {
+					s.config.Logger.WithError(err).Debug("failed to store bad node")
+				}
+				return services.AdmissionRejectedLayer
+			}
+			if err := s.config.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
+				s.config.Logger.WithError(err).Debug("failed to store bad node")
+			}
+			return services.AdmissionRejectedFilter
+		}
+	}
+
+	if !s.clTable.Add(n) {
+		return services.AdmissionRejectedPool
+	}
+	if err := s.config.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
+		s.config.Logger.WithError(err).Debug("failed to remove from bad nodes")
+	}
+	return services.AdmissionAccepted
+}
+
+// probeV5Support pings a v4-discovered node over discv5 and, on success,
+// attaches v5 support so lookups prefer the richer protocol.
+func (s *Service) probeV5Support(n *nodes.Node) {
+	handler := s.getV5Handler()
+	if handler == nil {
+		return
+	}
+	record := n.Record()
+	if record == nil {
+		return
+	}
+	v5Node, err := nodes.NewV5NodeFromRecord(record)
+	if err != nil {
+		return
+	}
+
+	start := time.Now()
+	respChan, err := handler.SendPing(v5Node)
+	if err != nil {
+		return
+	}
+	resp := <-respChan
+	if resp.Error != nil {
+		return
+	}
+
+	n.SetV5(v5Node)
+	s.config.Logger.WithFields(logrus.Fields{
+		"peerID": n.PeerID(),
+		"addr":   n.Addr(),
+		"rtt":    time.Since(start),
+	}).Debug("discovered v5 support on v4-discovered node")
+
+	// Queue protocol support update (SetV5 already marked it dirty)
+	if s.elNodeDB != nil {
+		if err := s.elNodeDB.QueueUpdate(n); err != nil {
+			s.config.Logger.WithError(err).Debug("failed to queue node for protocol support update")
+		}
+	}
+}
+
 // checkAndAddNodeV4 adds a discv4 node to the EL table after filtering.
 func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	// Ensure we have an ENR for filtering
@@ -1352,11 +1315,7 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	// Filter the node using ENR manager (EL-only for discv4)
 	if s.enrManager != nil {
 		filter, forkID := s.enrManager.FilterELNode(n.ENR())
-		if n.ENR().Has("eth") {
-			if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-				elFilter.RecordAdmission(filter, forkID)
-			}
-		}
+		s.enrManager.RecordELAdmission(n.ENR(), filter, forkID)
 		if !filter {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
@@ -1393,14 +1352,7 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	// Determine layer
 	isEL, elForkID := s.enrManager.FilterELNode(n.Record())
 	isCL := s.enrManager.FilterCLNode(n.Record())
-	// Only an execution record is an execution admission decision; counting
-	// consensus nodes here made the rejection counter track cross-layer
-	// traffic, which on a dual-layer network is most of what arrives.
-	if n.Record().Has("eth") {
-		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-			elFilter.RecordAdmission(isEL, elForkID)
-		}
-	}
+	s.enrManager.RecordELAdmission(n.Record(), isEL, elForkID)
 
 	// Add to appropriate table(s)
 	added := false

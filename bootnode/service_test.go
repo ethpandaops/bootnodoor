@@ -90,6 +90,31 @@ func TestUpdateENR_DropsUnservedFields(t *testing.T) {
 	}
 }
 
+// A record without an eth entry is a consensus node, not a wrong-fork
+// execution node, so it must not move the EL admission counters.
+func TestRecordELAdmission_SkipsRecordsWithoutEth(t *testing.T) {
+	cfg := &Config{Logger: quietLogger(), ELConfig: &elconfig.ChainConfig{}, ELGenesisHash: [32]byte{1, 2, 3}, ELGenesisTime: 1000}
+	key := mustKey(t)
+	ln, err := createLocalNode(cfg, key, net.ParseIP("1.2.3.4"), nil, 9000, nil)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+	m := NewENRManager(cfg, key, ln, true, false)
+
+	clOnly := storedENRWith(t, key, map[string][]byte{"eth2": {0xaa, 0xbb, 0xcc, 0xdd}})
+	m.RecordELAdmission(clOnly, false, elconfig.ForkID{})
+	if got := m.GetELFilter().GetStats().TotalChecks; got != 0 {
+		t.Fatalf("TotalChecks = %d after CL-only record, want 0", got)
+	}
+
+	elRec := storedENRWith(t, key, map[string][]byte{"eth": {0x01, 0x02, 0x03, 0x04}})
+	m.RecordELAdmission(elRec, false, elconfig.ForkID{})
+	stats := m.GetELFilter().GetStats()
+	if stats.TotalChecks != 1 || stats.Rejected != 1 {
+		t.Fatalf("stats = %+v after eth record, want 1 check / 1 rejection", stats)
+	}
+}
+
 // newTestService builds a minimal Service with the given identities and an
 // in-memory database, enough to exercise updateENRWithDiscoveredIP.
 func newTestService(t *testing.T, ids []*identity) *Service {

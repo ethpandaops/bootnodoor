@@ -124,22 +124,27 @@ func (f *ForkDigestFilter) SetLogger(logger Logger) {
 //	    ResponseFilter: filter.ResponseFilter(),
 //	})
 func (f *ForkDigestFilter) Filter(record *enr.Record) bool {
-	f.mu.Lock()
-	f.totalChecks++
-	f.mu.Unlock()
-
-	// Get eth2 field from ENR
+	// No eth2 entry means an execution node, not an invalid consensus node:
+	// reject without moving counters (mirrors RecordELAdmission's eth gate).
+	// A present but undecodable entry is a broken consensus node: that counts.
 	var eth2Data []byte
 	if err := record.Get("eth2", &eth2Data); err != nil {
-		// No eth2 field, reject
+		if !record.Has("eth2") {
+			return false
+		}
 		f.mu.Lock()
+		f.totalChecks++
 		f.rejectedInvalid++
 		if f.logger != nil {
-			f.logger.Debugf("Rejected node: no eth2 field in ENR")
+			f.logger.Debugf("Rejected node: undecodable eth2 field - %v", err)
 		}
 		f.mu.Unlock()
 		return false
 	}
+
+	f.mu.Lock()
+	f.totalChecks++
+	f.mu.Unlock()
 
 	// Parse fork digest (first 4 bytes only)
 	forkDigest, err := ParseETH2Field(eth2Data)
