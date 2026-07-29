@@ -77,6 +77,29 @@ func (c *Config) getForks() []forkDefinition {
 	return c.forks
 }
 
+// ForkEpochs returns every scheduled fork epoch in ascending order, including
+// BPO entries and excluding far-future placeholders.
+//
+// Distinct from GetAllForkDigestInfos, which deduplicates by digest: the eth2
+// next-fork tuple changes at a boundary even when the current digest does not,
+// so a caller scheduling work per boundary needs the raw epochs.
+func (c *Config) ForkEpochs() []uint64 {
+	forks := c.getForks()
+
+	epochs := make([]uint64, 0, len(forks))
+	for i := range forks {
+		epoch := forks[i].epoch
+		if epoch == math.MaxUint64 {
+			continue
+		}
+		if len(epochs) > 0 && epochs[len(epochs)-1] == epoch {
+			continue
+		}
+		epochs = append(epochs, epoch)
+	}
+	return epochs
+}
+
 // GetForkEpoch returns the epoch for a given fork name.
 // Returns nil if the fork is not defined.
 func (c *Config) GetForkEpoch(forkName string) *uint64 {

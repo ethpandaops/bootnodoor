@@ -3,6 +3,7 @@ package bootnode
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"slices"
 	"sync"
@@ -538,7 +539,14 @@ func (s *Service) maintenanceLoop() {
 	supportCheck := time.NewTicker(30 * time.Minute)     // Check protocol support every 30 minutes
 	badNodesCleanup := time.NewTicker(24 * time.Hour)    // Cleanup bad nodes once per day
 	enrRequestCleanup := time.NewTicker(1 * time.Minute) // Cleanup stale ENR requests every minute
-	forkRefresh := time.NewTicker(1 * time.Minute)       // Re-publish eth/eth2 when a fork activates
+
+	// Fork fields are re-published on a timer armed for the next boundary rather
+	// than polled: peers see the transition immediately and re-request our record,
+	// so a free-running tick left us advertising the previous fork for up to its
+	// full period. forkReconcile is the backstop for a missing schedule, a clock
+	// jump, or a boundary that passed while we were starting.
+	forkRefresh := time.NewTimer(s.nextForkRefreshDelay())
+	forkReconcile := time.NewTicker(1 * time.Minute)
 
 	defer tableMaintenance.Stop()
 	defer alivenessCheck.Stop()
@@ -547,6 +555,7 @@ func (s *Service) maintenanceLoop() {
 	defer badNodesCleanup.Stop()
 	defer enrRequestCleanup.Stop()
 	defer forkRefresh.Stop()
+	defer forkReconcile.Stop()
 
 	for {
 		select {
@@ -573,8 +582,92 @@ func (s *Service) maintenanceLoop() {
 
 		case <-forkRefresh.C:
 			s.refreshForkENR()
+			forkRefresh.Reset(s.nextForkRefreshDelay())
+
+		case <-forkReconcile.C:
+			// Refresh before recomputing: if a boundary was missed, this is what
+			// corrects the record, and the delay must be measured from now.
+			s.refreshForkENR()
+			if !forkRefresh.Stop() {
+				select {
+				case <-forkRefresh.C:
+				default:
+				}
+			}
+			forkRefresh.Reset(s.nextForkRefreshDelay())
 		}
 	}
+}
+
+// forkRefreshLead re-publishes just before a boundary so the record is already
+// correct when peers act on the transition.
+const forkRefreshLead = 500 * time.Millisecond
+
+// maxForkRefreshDelay caps the wait so a schedule that yields no future boundary
+// still reaches refreshForkENR at the old cadence.
+const maxForkRefreshDelay = time.Minute
+
+// nextForkRefreshDelay returns how long until the next scheduled fork boundary.
+func (s *Service) nextForkRefreshDelay() time.Duration {
+	now := time.Now()
+
+	next, ok := s.nextForkBoundary(now)
+	if !ok {
+		return maxForkRefreshDelay
+	}
+
+	delay := next.Sub(now) + forkRefreshLead
+	if delay < time.Millisecond {
+		delay = time.Millisecond
+	}
+	if delay > maxForkRefreshDelay {
+		delay = maxForkRefreshDelay
+	}
+	return delay
+}
+
+// nextForkBoundary returns the earliest CL or EL fork activation after now.
+func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
+	var next time.Time
+	found := false
+
+	consider := func(t time.Time) {
+		if !t.After(now) {
+			return
+		}
+		if !found || t.Before(next) {
+			next = t
+			found = true
+		}
+	}
+
+	if cfg := s.config.CLConfig; cfg != nil {
+		genesis := cfg.GetGenesisTime()
+		slotsPerEpoch := cfg.GetSlotsPerEpoch()
+		secondsPerSlot := cfg.SecondsPerSlot
+		if genesis > 0 && slotsPerEpoch > 0 && secondsPerSlot > 0 {
+			for _, epoch := range cfg.ForkEpochs() {
+				// Overflow guard: a placeholder epoch would wrap the product.
+				if epoch > math.MaxUint64/(slotsPerEpoch*secondsPerSlot) {
+					continue
+				}
+				consider(time.Unix(int64(genesis+epoch*slotsPerEpoch*secondsPerSlot), 0))
+			}
+		}
+	}
+
+	if s.enrManager != nil {
+		if filter := s.enrManager.GetELFilter(); filter != nil {
+			for _, fork := range filter.GetAllForkIDsWithNames() {
+				// Block-numbered forks have no wall clock; only timestamps do.
+				if fork.IsTime && fork.Activation <= math.MaxInt64 {
+					consider(time.Unix(int64(fork.Activation), 0))
+				}
+			}
+		}
+	}
+
+	return next, found
 }
 
 // localIDs returns the node IDs of every discovery identity, so discovery can
