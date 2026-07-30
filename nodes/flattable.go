@@ -268,19 +268,9 @@ func (t *FlatTable) Add(n *Node) bool {
 		// Only from a record at least as new as the entry's: senders use the adopted
 		// protocol node's own address, so taking one from an older record would point
 		// that protocol at an endpoint the peer has already moved off.
-		changed := existing.AdoptProtocolsFrom(n)
-		newSeq := n.Record().Seq()
+		adopted, advanced := existing.AdoptProtocolsFrom(n)
 
-		// Update ENR if newer
-		if newSeq > existing.Record().Seq() {
-			existing.UpdateENR(n.Record())
-
-			// Queue ENR update (preserves stats)
-			existing.MarkDirty(DirtyENR)
-			changed = true
-		}
-
-		if changed {
+		if adopted || advanced {
 			if err := t.db.QueueUpdate(existing); err != nil {
 				t.logger.WithError(err).WithField("peerID", existing.PeerID()).Debug("failed to queue node update")
 			}

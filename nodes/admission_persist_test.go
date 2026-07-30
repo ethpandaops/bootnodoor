@@ -341,3 +341,27 @@ func TestAdoptProtocolsFromIsAtomicUnderRace(t *testing.T) {
 		}
 	}
 }
+
+// Re-admitting a table entry passes it to itself. Snapshotting its own pointers
+// and reinstalling them could resurrect a protocol a concurrent clear removed.
+func TestAdoptProtocolsFromSelfIsNoOp(t *testing.T) {
+	database := persistTestDB(t, filepath.Join(t.TempDir(), "self.db"))
+	defer database.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ndb := NewNodeDB(ctx, database, db.LayerEL, quietTableLogger())
+	v5 := makeV5At(t, net.IPv4(10, 6, 0, 1))
+	n := NewFromV5(v5, ndb)
+
+	adopted, advanced := n.AdoptProtocolsFrom(n)
+	if adopted || advanced {
+		t.Errorf("self-merge reported changes: adopted=%v advanced=%v", adopted, advanced)
+	}
+
+	n.SetV5(nil)
+	if _, _ = n.AdoptProtocolsFrom(n); n.HasV5() {
+		t.Error("self-merge resurrected a cleared protocol")
+	}
+}

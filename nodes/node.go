@@ -215,41 +215,49 @@ func (n *Node) SetV4(v4 *node.Node) {
 // pointer built from an older record could still be installed — and because
 // adoption only ever fills an empty slot, that stale endpoint would then be
 // permanent.
-func (n *Node) AdoptProtocolsFrom(other *Node) bool {
-	if other == nil {
-		return false
+func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
+	// Self-merge is a no-op, not a re-install: a caller re-admitting a table entry
+	// would otherwise snapshot its own pointer, race a concurrent clear, and
+	// resurrect a protocol the node no longer supports.
+	if other == nil || other == n {
+		return false, false
 	}
 
 	otherRecord := other.Record()
-	otherV4, otherV5 := other.V4(), other.V5()
-	if otherRecord == nil || (otherV4 == nil && otherV5 == nil) {
-		return false
+	if otherRecord == nil {
+		return false, false
 	}
+	otherV4, otherV5 := other.V4(), other.V5()
 
 	n.mu.Lock()
 	if n.enr != nil && otherRecord.Seq() < n.enr.Seq() {
 		n.mu.Unlock()
-		return false
+		return false, false
 	}
 
-	changed := false
 	if otherV4 != nil && n.v4Node == nil {
 		n.v4Node = otherV4
-		changed = true
+		adopted = true
 	}
 	if otherV5 != nil && n.v5Node == nil {
 		n.v5Node = otherV5
-		changed = true
+		adopted = true
 	}
+
+	// Advance the record in the same hold. Leaving it to a separate UpdateENR let
+	// a newer admission complete its adoption, an older one install its pointer,
+	// and the newer one then advance the record — stranding the older endpoint,
+	// which UpdateENR does not refresh for v4.
+	if n.enr == nil || otherRecord.Seq() > n.enr.Seq() {
+		n.enr = otherRecord
+		advanced = true
+	}
+
 	stats := n.nodeStats
 	v4, v5 := n.v4Node, n.v5Node
 	n.mu.Unlock()
 
-	if !changed {
-		return false
-	}
-
-	if stats != nil {
+	if adopted && stats != nil {
 		n.setupSharedStatsCallback()
 		if otherV4 != nil && v4 != nil {
 			v4.SetStats(stats)
@@ -258,8 +266,17 @@ func (n *Node) AdoptProtocolsFrom(other *Node) bool {
 			v5.SetStats(stats)
 		}
 	}
-	n.MarkDirty(DirtyProtocol)
-	return true
+	if advanced && v5 != nil {
+		v5.UpdateENR(otherRecord)
+	}
+
+	if adopted {
+		n.MarkDirty(DirtyProtocol)
+	}
+	if advanced {
+		n.MarkDirty(DirtyENR)
+	}
+	return adopted, advanced
 }
 
 // SetV5AtSeq installs a discv5 node only while the record it was probed from is
