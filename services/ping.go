@@ -6,7 +6,10 @@ import (
 	"time"
 
 	"github.com/ethpandaops/bootnodoor/discv4"
+	discv4node "github.com/ethpandaops/bootnodoor/discv4/node"
+	discv5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/discv5/protocol"
+	"github.com/ethpandaops/bootnodoor/enr"
 	nodedb "github.com/ethpandaops/bootnodoor/nodes"
 	"github.com/sirupsen/logrus"
 )
@@ -243,6 +246,9 @@ func (ps *PingService) CheckProtocolSupport(n *nodedb.Node) (bool, bool, error) 
 	if record == nil {
 		return false, false, fmt.Errorf("node has no ENR")
 	}
+	// Left alone until after the install, so the sequence the install is gated on
+	// cannot move underneath it.
+	probedSeq := record.Seq()
 
 	ps.logger.WithFields(logrus.Fields{
 		"peerID": n.PeerID(),
@@ -251,6 +257,13 @@ func (ps *PingService) CheckProtocolSupport(n *nodedb.Node) (bool, bool, error) 
 
 	var v4Supported, v5Supported bool
 	var v4RTT, v5RTT time.Duration
+
+	// Probe objects are kept for the install: the v4 one is refreshed in place by
+	// the ENR fetch below, and rebuilding from the pre-probe snapshot would discard
+	// exactly that refresh.
+	var probedV4 *discv4node.Node
+	var probedV5 *discv5node.Node
+	var refreshedRecord *enr.Record
 
 	// Test discv5 support
 	if ps.v5Handler != nil {
@@ -264,6 +277,8 @@ func (ps *PingService) CheckProtocolSupport(n *nodedb.Node) (bool, bool, error) 
 				ps.logger.WithError(err).Debug("failed to create v5 node for support check")
 			}
 		}
+
+		probedV5 = v5Node
 
 		if v5Node != nil {
 			start := time.Now()
@@ -296,6 +311,8 @@ func (ps *PingService) CheckProtocolSupport(n *nodedb.Node) (bool, bool, error) 
 			}
 		}
 
+		probedV4 = v4Node
+
 		if v4Node != nil {
 			start := time.Now()
 			_, err := ps.v4Service.Ping(v4Node)
@@ -308,44 +325,42 @@ func (ps *PingService) CheckProtocolSupport(n *nodedb.Node) (bool, bool, error) 
 					"rtt":    v4RTT,
 				}).Debug("v4 support confirmed")
 
-				// If v4 ping succeeded, request ENR to ensure we have latest record
+				// Fetched here but applied after the install: advancing the record
+				// mid-probe would move the very sequence the install is gated on.
 				if enrRecord, err := ps.v4Service.RequestENR(v4Node); err == nil {
-					v4Node.SetENR(enrRecord)
-					n.UpdateENR(enrRecord)
+					refreshedRecord = enrRecord
 				}
 			}
 		}
 	}
 
-	// Update node with discovered protocol support
-	// Add v5 support if confirmed and not present
-	if v5Supported && n.V5() == nil {
-		// Create and set v5 node
-		if v5Node, err := nodedb.NewV5NodeFromRecord(record); err == nil {
-			n.SetV5(v5Node)
-			ps.logger.WithField("peerID", n.PeerID()).Info("added v5 support to node")
+	// Apply both outcomes together, and only while the record they describe is
+	// still the node's current one. A probe that started before a newer record
+	// arrived knows nothing about it, so it must neither install a superseded
+	// endpoint nor clear a pointer that newer record brought in.
+	applied := n.ApplyProbeResult(probedSeq, probedV4, v4Supported, probedV5, v5Supported)
+
+	// Only now advance the record. Attaching it to the v4 node deliberately leaves
+	// that node's proven address alone, so its label keeps describing the endpoint
+	// the ping actually reached — which is what lets a correctly addressed pointer
+	// for this same record replace it later.
+	// Attach to the object that was probed, not to whatever V4() returns now: a
+	// concurrent admission may have replaced the pointer, and overwriting its ENR
+	// with this older response would leave that pointer's record disagreeing with
+	// both the node's record and its label.
+	if refreshedRecord != nil {
+		if probedV4 != nil {
+			probedV4.SetENR(refreshedRecord)
 		}
+		n.UpdateENR(refreshedRecord)
 	}
 
-	// Remove v5 support if not confirmed but present
-	if !v5Supported && n.V5() != nil {
-		n.SetV5(nil)
-		ps.logger.WithField("peerID", n.PeerID()).Warn("removed v5 support from node (no longer responding)")
-	}
-
-	// Add v4 support if confirmed and not present
-	if v4Supported && n.V4() == nil {
-		// Create and set v4 node
-		if v4Node, err := nodedb.NewV4NodeFromRecord(record, addr); err == nil {
-			n.SetV4(v4Node)
-			ps.logger.WithField("peerID", n.PeerID()).Info("added v4 support to node")
-		}
-	}
-
-	// Remove v4 support if not confirmed but present
-	if !v4Supported && n.V4() != nil {
-		n.SetV4(nil)
-		ps.logger.WithField("peerID", n.PeerID()).Warn("removed v4 support from node (no longer responding)")
+	if applied {
+		ps.logger.WithFields(logrus.Fields{
+			"peerID": n.PeerID(),
+			"v4":     v4Supported,
+			"v5":     v5Supported,
+		}).Info("updated protocol support from probe")
 	}
 
 	// Update RTT with best available
