@@ -1058,8 +1058,11 @@ func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPA
 
 // sendNeighbors sends NEIGHBORS response(s).
 func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, nodes []*node.Node) error {
-	// Split nodes into packets of MaxNeighbors
-	for i := 0; i < len(nodes); i += MaxNeighbors {
+	// Split nodes into packets of MaxNeighbors. Always send at least one packet,
+	// even when we have no nodes to offer: go-ethereum's querier waits for a
+	// NEIGHBORS reply and only stops early once at least one arrives, so a silent
+	// (zero-packet) response makes it wait out the full request timeout.
+	for i := 0; i == 0 || i < len(nodes); i += MaxNeighbors {
 		end := i + MaxNeighbors
 		if end > len(nodes) {
 			end = len(nodes)
@@ -1069,10 +1072,18 @@ func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net
 		nodeRecords := make([]NodeRecord, len(batch))
 
 		for j, n := range batch {
+			// Advertise the node's real TCP port from its ENR when known;
+			// only fall back to the UDP port if no ENR tcp entry is available.
+			tcpPort := uint16(n.Addr().Port)
+			if rec := n.ENR(); rec != nil {
+				if t := rec.TCP(); t != 0 {
+					tcpPort = t
+				}
+			}
 			nodeRecords[j] = NodeRecord{
 				IP:  n.Addr().IP,
 				UDP: uint16(n.Addr().Port),
-				TCP: uint16(n.Addr().Port),
+				TCP: tcpPort,
 				ID:  EncodePubkey(n.PublicKey()),
 			}
 		}
