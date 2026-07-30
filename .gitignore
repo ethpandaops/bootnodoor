@@ -46,6 +46,3 @@ tmp-*
 # Devnet files
 .hack/devnet/custom-*
 .hack/devnet/generated-*
-
-# Local devnet testing notes
-docs/testing-with-kurtosis.md
