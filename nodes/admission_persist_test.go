@@ -2,14 +2,17 @@ package nodes
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"net"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethpandaops/bootnodoor/db"
 	v4node "github.com/ethpandaops/bootnodoor/discv4/node"
 	discv5node "github.com/ethpandaops/bootnodoor/discv5/node"
+	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/sirupsen/logrus"
 )
 
@@ -240,4 +243,63 @@ func TestAddMergesProtocolCapabilities(t *testing.T) {
 func makeV4For(t *testing.T, v5 *discv5node.Node) *v4node.Node {
 	t.Helper()
 	return v4node.New(v5.PublicKey(), v5.Addr())
+}
+
+// Senders use the adopted protocol node's own address, so a protocol pointer from
+// an older record would aim that protocol at an endpoint the peer has left.
+func TestAddDoesNotAdoptProtocolFromStaleRecord(t *testing.T) {
+	database := persistTestDB(t, filepath.Join(t.TempDir(), "stale.db"))
+	defer database.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := quietTableLogger()
+	ndb := NewNodeDB(ctx, database, db.LayerEL, logger)
+	table := newPersistTable(t, ndb, logger)
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	newer := signedRecordAt(t, key, 5, net.IPv4(10, 8, 0, 1))
+	older := signedRecordAt(t, key, 2, net.IPv4(10, 8, 0, 2))
+
+	newerV5, err := discv5node.New(newer)
+	if err != nil {
+		t.Fatalf("v5 from newer: %v", err)
+	}
+	existing := NewFromV5(newerV5, ndb)
+	if !table.Add(existing) {
+		t.Fatal("first admission rejected")
+	}
+
+	olderV5, err := discv5node.New(older)
+	if err != nil {
+		t.Fatalf("v5 from older: %v", err)
+	}
+	stale := NewFromV5(olderV5, ndb)
+	stale.SetV4(v4node.New(olderV5.PublicKey(), olderV5.Addr()))
+	table.Add(stale)
+
+	if table.Get(existing.ID()).HasV4() {
+		t.Error("adopted a v4 pointer from a record older than the entry's")
+	}
+}
+
+func signedRecordAt(t *testing.T, key *ecdsa.PrivateKey, seq uint64, ip net.IP) *enr.Record {
+	t.Helper()
+	rec := enr.New()
+	if err := rec.Set("ip", ip); err != nil {
+		t.Fatalf("set ip: %v", err)
+	}
+	if err := rec.Set("udp", uint16(9000)); err != nil {
+		t.Fatalf("set udp: %v", err)
+	}
+	rec.SetSeq(seq)
+	if err := rec.Sign(key); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	return rec
 }

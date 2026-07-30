@@ -71,6 +71,9 @@ type Service struct {
 	// v5ProbeSem bounds concurrent v5 capability probes
 	v5ProbeSem chan struct{}
 
+	// v5ProbesInFlight keeps one probe per node in flight
+	v5ProbesInFlight sync.Map // map[[32]byte]struct{}
+
 	// Lifecycle
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -1446,26 +1449,43 @@ const maxConcurrentV5Probes = 8
 // scheduleV5Probe runs a v5 probe for an admitted node without blocking the
 // caller. Dropping the probe when saturated is fine: the node stays v4-only and
 // the next lookup that rediscovers it tries again.
+//
+// The table entry decides, not the wrapper the caller happened to hold: after a
+// merge the entry may already know v5, and re-probing it on every rediscovery
+// would occupy the slots that genuinely v4-only nodes need.
 func (s *Service) scheduleV5Probe(id [32]byte) {
+	if s.elTable == nil {
+		return
+	}
+	entry := s.elTable.Get(id)
+	if entry == nil || entry.HasV5() {
+		return
+	}
+	if _, inFlight := s.v5ProbesInFlight.LoadOrStore(id, struct{}{}); inFlight {
+		return
+	}
+
 	select {
 	case s.v5ProbeSem <- struct{}{}:
 	default:
+		s.v5ProbesInFlight.Delete(id)
 		return
 	}
 
 	go func() {
-		defer func() { <-s.v5ProbeSem }()
-
-		if s.elTable == nil {
-			return
-		}
-		if n := s.elTable.Get(id); n != nil {
-			s.probeV5Support(n)
-		}
+		defer func() {
+			<-s.v5ProbeSem
+			s.v5ProbesInFlight.Delete(id)
+		}()
+		s.probeV5Support(id, entry)
 	}()
 }
 
-func (s *Service) probeV5Support(n *nodes.Node) {
+// probeV5Support pings a v4-discovered node over discv5 and records the result on
+// whichever wrapper the table holds when the answer arrives — the entry can be
+// swept or replaced during the round trip, and writing to a detached object would
+// silently lose the capability.
+func (s *Service) probeV5Support(id [32]byte, n *nodes.Node) {
 	handler := s.getV5Handler()
 	if handler == nil {
 		return
@@ -1493,6 +1513,14 @@ func (s *Service) probeV5Support(n *nodes.Node) {
 	if resp == nil || resp.Error != nil {
 		return
 	}
+
+	// Re-resolve: this is the first moment the result can be applied, and the
+	// entry may have been swept or replaced while the ping was outstanding.
+	target := s.elTable.Get(id)
+	if target == nil {
+		return
+	}
+	n = target
 
 	n.SetV5(v5Node)
 	s.config.Logger.WithFields(logrus.Fields{
