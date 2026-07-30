@@ -48,8 +48,7 @@ func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, bo
 	// metrics endpoint
 	router.Handle("/metrics", promhttp.Handler()).Methods("GET")
 
-	// add pprof handler
-	router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
+	registerPprofHandler(router, config.Pprof)
 
 	router.PathPrefix("/").Handler(frontend)
 
@@ -78,4 +77,10 @@ func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, bo
 			logrus.WithError(err).Fatal("Error serving frontend")
 		}
 	}()
+}
+
+func registerPprofHandler(router *mux.Router, enabled bool) {
+	if enabled {
+		router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
+	}
 }
