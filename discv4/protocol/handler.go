@@ -1058,8 +1058,11 @@ func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPA
 
 // sendNeighbors sends NEIGHBORS response(s).
 func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, nodes []*node.Node) error {
-	// Split nodes into packets of MaxNeighbors
-	for i := 0; i < len(nodes); i += MaxNeighbors {
+	// Split nodes into packets of MaxNeighbors. Always send at least one packet,
+	// even when we have no nodes to offer: go-ethereum's querier waits for a
+	// NEIGHBORS reply and only stops early once at least one arrives, so a silent
+	// (zero-packet) response makes it wait out the full request timeout.
+	for i := 0; i == 0 || i < len(nodes); i += MaxNeighbors {
 		end := i + MaxNeighbors
 		if end > len(nodes) {
 			end = len(nodes)
@@ -1069,10 +1072,18 @@ func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net
 		nodeRecords := make([]NodeRecord, len(batch))
 
 		for j, n := range batch {
+			// Advertise the node's real TCP port from its ENR when known;
+			// only fall back to the UDP port if no ENR tcp entry is available.
+			tcpPort := uint16(n.Addr().Port)
+			if rec := n.ENR(); rec != nil {
+				if t := rec.TCP(); t != 0 {
+					tcpPort = t
+				}
+			}
 			nodeRecords[j] = NodeRecord{
 				IP:  n.Addr().IP,
 				UDP: uint16(n.Addr().Port),
-				TCP: uint16(n.Addr().Port),
+				TCP: tcpPort,
 				ID:  EncodePubkey(n.PublicKey()),
 			}
 		}
@@ -1157,12 +1168,26 @@ func (h *Handler) lookupOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *
 	n = node.New(pubkey, addr)
 	n.UpdateLastSeen()
 
-	// Bound the map so an unauthenticated flood of distinct node IDs (for
-	// example fabricated NEIGHBORS records) cannot grow it without limit. Stale
-	// unbonded entries are reclaimed by cleanup; until a slot frees up we still
-	// return the node so the packet is handled, but we do not retain it.
+	// Bound the map so an unauthenticated flood of distinct node IDs (for example
+	// fabricated NEIGHBORS records, or signed PINGs from generated keys) cannot grow
+	// it without limit. When full, evict one unbonded entry to make room rather than
+	// dropping the new node: otherwise a flood that pins the map at MaxNodes would
+	// lock out genuine new peers (their node is never retained, so their inbound PING
+	// can never lead to a bond). Bonded entries are real, endpoint-proven peers and
+	// are never evicted here; if every entry is bonded (genuine load, not a flood) we
+	// leave the map as-is and return the node without retaining it.
 	if len(h.nodes) >= h.config.MaxNodes {
-		return n
+		evicted := false
+		for eid, en := range h.nodes {
+			if !en.IsBonded() {
+				delete(h.nodes, eid)
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			return n
+		}
 	}
 
 	h.nodes[id] = n
