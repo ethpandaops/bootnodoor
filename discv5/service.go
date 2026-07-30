@@ -54,6 +54,7 @@ type Transport interface {
 	protocol.Transport
 	LocalAddr() *net.UDPAddr
 	AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
+	AddHandlerFor(protocol string, handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
 }
 
 // New creates a new discv5 service.
@@ -169,7 +170,7 @@ func New(cfg *Config, transport Transport) (*Service, error) {
 	protocolHandler.SetTransport(transport)
 
 	// Register packet handler with transport
-	transport.AddHandler(s.packetHandler)
+	transport.AddHandlerFor("discv5", s.packetHandler)
 
 	return s, nil
 }
@@ -367,10 +368,12 @@ func (s *Service) TalkReq(n *node.Node, protocolName string, request []byte) ([]
 		Request:   request,
 	}
 
-	// Register pending request and send
-	respChan := s.handler.Requests().AddRequest(requestID, n, talkReq)
+	destAddr := n.Addr()
 
-	if err := s.handler.SendMessage(talkReq, n.ID(), n.Addr(), n); err != nil {
+	// Register pending request and send
+	respChan := s.handler.Requests().AddRequest(requestID, n, talkReq, destAddr)
+
+	if err := s.handler.SendMessage(talkReq, n.ID(), destAddr, n); err != nil {
 		s.handler.Requests().CancelRequest(requestID)
 		return nil, fmt.Errorf("failed to send talkreq: %w", err)
 	}

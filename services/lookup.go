@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	mathrand "math/rand"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -123,12 +124,7 @@ type Config struct {
 // isLocal reports whether id belongs to one of our own identities. The
 // parameter is the raw array so both discv4 and discv5 node IDs can be passed.
 func (ls *LookupService) isLocal(id [32]byte) bool {
-	for _, local := range ls.config.LocalIDs {
-		if local == id {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(ls.config.LocalIDs, id)
 }
 
 // discoveries accumulates the records observed during a single lookup, keeping

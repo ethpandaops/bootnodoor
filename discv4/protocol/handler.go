@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -37,7 +38,12 @@ type OnNodeSeenCallback func(n *node.Node, timestamp time.Time)
 
 // OnPongReceivedCallback is called when a PONG response is received.
 // The ip and port parameters contain our external address as seen by the remote peer.
-type OnPongReceivedCallback func(from *node.Node, ip net.IP, port uint16)
+//
+// provenAddr is the address the answered PING was sent to. Callers must use it
+// rather than from.Addr(), which any later inbound packet rewrites, including a
+// spoofed one; attributing a report to that address would undo the endpoint
+// proof this callback is gated on.
+type OnPongReceivedCallback func(from *node.Node, provenAddr *net.UDPAddr, ip net.IP, port uint16)
 
 // Handler handles incoming and outgoing discv4 protocol messages.
 //
@@ -61,9 +67,17 @@ type Handler struct {
 	nodesMu sync.RWMutex
 	nodes   map[node.ID]*node.Node
 
-	// Pending requests (hash -> PendingRequest)
+	// In-flight PONG-driven ENR refreshes, keyed by node ID. The refresh cannot
+	// update the cached sequence before its own PING is answered, so without this
+	// every PONG on the way re-triggers it.
+	enrRefreshMu sync.Mutex
+	enrRefresh   map[node.ID]*enrRefreshState
+
+	// Pending requests, keyed by packet hash + destination node ID: the hash
+	// alone aliases across peers (deterministic signatures, 1s Expiration
+	// granularity), and identical requests to one peer share a key's slice.
 	requestsMu sync.RWMutex
-	requests   map[string]*PendingRequest
+	requests   map[string][]*PendingRequest
 
 	// Pending multi-packet FINDNODE responses
 	pendingNeighborsMu sync.RWMutex
@@ -131,6 +145,11 @@ type PendingRequest struct {
 
 	// ToNode is the destination node
 	ToNode *node.Node
+
+	// DestIP is the IP the request was sent to, snapshotted at send time; see
+	// lookupOrCreateNode. ToNode.Addr() cannot serve here because promoteAddr can
+	// move it between send and response.
+	DestIP net.IP
 
 	// PacketType is the type of request
 	PacketType byte
@@ -223,7 +242,8 @@ func NewHandler(ctx context.Context, config HandlerConfig, transport Transport) 
 		ctx:              ctx,
 		transport:        transport,
 		nodes:            make(map[node.ID]*node.Node),
-		requests:         make(map[string]*PendingRequest),
+		enrRefresh:       make(map[node.ID]*enrRefreshState),
+		requests:         make(map[string][]*PendingRequest),
 		pendingNeighbors: make(map[string]*PendingNeighborsResponse),
 		localENR:         config.LocalENR,
 	}
@@ -268,17 +288,11 @@ func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr, localAddr *net.UD
 
 	fromNodeID := node.PubkeyToID(pubkey)
 
-	// Get or create node
-	fromNode := h.getOrCreateNode(fromNodeID, pubkey, from)
-
-	// Update last seen
-	fromNode.UpdateLastSeen()
-	fromNode.IncrementPacketsReceived()
-
-	// Call OnNodeSeen callback
-	if h.config.OnNodeSeen != nil {
-		h.config.OnNodeSeen(fromNode, time.Now())
-	}
+	// Look up the node without promoting this packet's source to its canonical
+	// address, and without touching liveness or firing OnNodeSeen: none of that is
+	// warranted before the handler has checked expiration and solicitation. Each
+	// handler states its own gate and calls noteSeen/noteProven itself.
+	fromNode := h.lookupOrCreateNode(fromNodeID, pubkey, from)
 
 	// Dispatch by packet type
 	switch p := packet.(type) {
@@ -315,6 +329,15 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 		return ErrExpired
 	}
 
+	h.noteSeen(fromNode)
+
+	// Admission and its outbound traffic need a proven source; an already-bonded
+	// peer has one. Otherwise the reciprocal PING below proves it a moment later
+	// and its PONG runs noteProven then.
+	if fromNode.IsBondedFrom(from) {
+		h.noteProven(fromNode)
+	}
+
 	// Mark ping received
 	fromNode.MarkPingReceived()
 
@@ -330,9 +353,11 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 		return err
 	}
 
-	// Mark node as bonded: they pinged us, we ponged them.
-	// This allows THEM to query US with FINDNODE immediately.
-	fromNode.MarkPongReceived(h.config.BondExpiration)
+	// Receiving a PING grants no bond: we ponged whatever address the packet
+	// claimed, which proves nothing if that source was spoofed. Bonding here
+	// would let an attacker bond a victim's address and then have us reflect
+	// NEIGHBORS at it. The bond is established by the reciprocal PING below,
+	// when its PONG comes back from the address we sent it to.
 
 	// IMPORTANT: For bidirectional bonding (required by strict clients like reth for ENRRequest),
 	// we also need to establish that WE can reach THEM, not just that they can reach us.
@@ -343,11 +368,12 @@ func (h *Handler) handlePing(fromNode *node.Node, from *net.UDPAddr, localAddr *
 	lastPingSent := fromNode.LastPingSent()
 	timeSinceLastPing := time.Since(lastPingSent)
 
-	// Only spawn goroutine if we're actually going to ping (don't create unnecessary goroutines)
 	if timeSinceLastPing > 100*time.Millisecond {
-		// Send PING back in goroutine to establish bidirectional bond
+		// Ping the source we just ponged, not the canonical address: a peer that
+		// moved is only reachable at its new address, and its PONG from there is
+		// what proves the new endpoint.
 		go func() {
-			if _, err := h.Ping(fromNode); err != nil {
+			if _, err := h.pingTo(fromNode, from); err != nil {
 				logrus.WithFields(logrus.Fields{
 					"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
 					"error":   err,
@@ -373,30 +399,217 @@ func (h *Handler) handlePong(fromNode *node.Node, from *net.UDPAddr, pong *Pong)
 		return ErrExpired
 	}
 
-	// Mark pong received (establishes bond)
-	fromNode.MarkPongReceived(h.config.BondExpiration)
+	h.noteSeen(fromNode)
 
-	// Call OnPongReceived callback with the IP and port reported in the PONG
-	// The To field in PONG contains our address as seen by the remote peer
+	// Nothing below may run for a PONG we did not solicit from this address: it
+	// establishes a bond, casts a vote in the external-IP election that rewrites
+	// our published ENR, and can trigger outbound ENR traffic.
+	req := h.consumePendingPing(pong.ReplyTok, fromNode.ID(), from)
+	if req == nil {
+		return nil
+	}
+
+	// Bind the bond to the address we proved, not the packet's source.
+	provenAddr := &net.UDPAddr{IP: req.DestIP, Port: from.Port}
+	h.promoteAddr(fromNode, provenAddr)
+	h.promoteAddr(req.ToNode, provenAddr)
+	fromNode.MarkPongReceived(h.config.BondExpiration, provenAddr)
+	h.noteProven(fromNode)
+
+	// The To field in PONG contains our address as seen by the remote peer.
 	if h.config.OnPongReceived != nil && pong.To.IP != nil && pong.To.UDP > 0 {
-		h.config.OnPongReceived(fromNode, pong.To.IP, pong.To.UDP)
+		h.config.OnPongReceived(fromNode, provenAddr, pong.To.IP, pong.To.UDP)
 	}
 
-	// Match to pending request
-	req := h.getPendingRequest(string(pong.ReplyTok))
-	if req != nil {
-		h.deliverResponse(req, pong)
-	}
+	h.deliverResponse(req, pong)
 
 	// Check if remote node has newer ENR
 	if pong.ENRSeq > 0 && fromNode.ENR() != nil {
 		if pong.ENRSeq > fromNode.ENR().Seq() {
-			// Request updated ENR
-			go h.RequestENR(fromNode)
+			h.startENRRefresh(fromNode, pong.ENRSeq)
 		}
 	}
 
 	return nil
+}
+
+// maxENRRefreshRetries bounds retries after a failed refresh so a peer that
+// never answers cannot keep one running.
+const maxENRRefreshRetries = 2
+
+// maxENRRefreshRounds bounds the rounds one claim may run. Re-arming on a
+// sequence observed mid-refresh is otherwise unbounded: a peer that advertises a
+// higher sequence in every PONG keeps the goroutine and its PING/ENRREQUEST
+// traffic alive indefinitely. Past the bound the claim ends, and a later PONG has
+// to open a fresh one.
+const maxENRRefreshRounds = 4
+
+// enrRefreshCooldown follows a claim that exhausted its rounds.
+const enrRefreshCooldown = 30 * time.Second
+
+// enrRefreshMinInterval separates consecutive claims for one peer. Bounding
+// rounds alone is not enough: a peer can advertise one increment per claim, let
+// it finish in a single round, and reopen on the next PONG, sustaining the same
+// ENRREQUEST rate without ever exhausting a claim.
+const enrRefreshMinInterval = 5 * time.Second
+
+// enrRefreshState tracks one peer's automatic ENR refresh.
+type enrRefreshState struct {
+	inFlight bool
+
+	// targetSeq is what the running attempt is fetching; highestSeenSeq is the
+	// largest advertised since. Only highestSeenSeq > targetSeq means a genuinely
+	// newer record appeared mid-refresh and another round is warranted. Comparing
+	// against the installed record instead would also retry after a failed or
+	// stale response, which never terminates.
+	targetSeq      uint64
+	highestSeenSeq uint64
+
+	retries int
+	rounds  int
+
+	// cooldownUntil applies after a claim exhausts its rounds. Without it the
+	// bound is per claim only: one inbound PING earns a reciprocal PING, whose
+	// higher-sequence PONG opens a fresh claim, so a peer could sustain the same
+	// ENRREQUEST rate with one packet per claim.
+	cooldownUntil time.Time
+}
+
+// startENRRefresh claims the refresh for a peer and runs at most one at a time.
+// The claim is taken here rather than inside RequestENR because a goroutine
+// descheduled past the winner's release would otherwise become a new winner —
+// under exactly the load this is meant to prevent.
+func (h *Handler) startENRRefresh(n *node.Node, advertisedSeq uint64) {
+	id := n.ID()
+
+	h.enrRefreshMu.Lock()
+	state := h.enrRefresh[id]
+	if state == nil {
+		state = &enrRefreshState{}
+		h.enrRefresh[id] = state
+	}
+	if advertisedSeq > state.highestSeenSeq {
+		state.highestSeenSeq = advertisedSeq
+	}
+	if state.inFlight || time.Now().Before(state.cooldownUntil) {
+		h.enrRefreshMu.Unlock()
+		return
+	}
+	state.inFlight = true
+	state.targetSeq = state.highestSeenSeq
+	state.retries = 0
+	state.rounds = 0
+	h.enrRefreshMu.Unlock()
+
+	go h.runENRRefresh(n)
+}
+
+// runENRRefresh fetches a peer's record, repeating only for a sequence observed
+// after the current attempt started or a bounded number of failures.
+func (h *Handler) runENRRefresh(n *node.Node) {
+	id := n.ID()
+
+	for {
+		_, err := h.RequestENR(n)
+
+		h.enrRefreshMu.Lock()
+		state := h.enrRefresh[id]
+		if state == nil {
+			h.enrRefreshMu.Unlock()
+			return
+		}
+
+		state.rounds++
+
+		if state.highestSeenSeq > state.targetSeq && state.rounds < maxENRRefreshRounds {
+			state.targetSeq = state.highestSeenSeq
+			state.retries = 0
+			h.enrRefreshMu.Unlock()
+			continue
+		}
+
+		if err != nil && state.retries < maxENRRefreshRetries && state.rounds < maxENRRefreshRounds {
+			state.retries++
+			// ExpirationWindow can be zero in a bare config; a zero backoff would
+			// make the retry immediate rather than delayed.
+			unit := h.config.ExpirationWindow
+			if unit <= 0 {
+				unit = 20 * time.Second
+			}
+			backoff := time.Duration(state.retries) * unit
+			h.enrRefreshMu.Unlock()
+
+			select {
+			case <-time.After(backoff):
+			case <-h.ctx.Done():
+				h.releaseENRRefresh(id)
+				return
+			}
+			continue
+		}
+
+		cooldown := enrRefreshMinInterval
+		if state.rounds >= maxENRRefreshRounds {
+			cooldown = enrRefreshCooldown
+		}
+		state.cooldownUntil = time.Now().Add(cooldown)
+		state.inFlight = false
+		state.retries = 0
+		h.enrRefreshMu.Unlock()
+		return
+	}
+}
+
+// resumeDeferredENRRefreshes starts refreshes for peers whose newer sequence was
+// observed during a cooldown. Without this the bump is remembered but never
+// fetched unless another PONG happens to arrive after the cooldown expires.
+func (h *Handler) resumeDeferredENRRefreshes() {
+	now := time.Now()
+
+	type pending struct {
+		id  node.ID
+		seq uint64
+	}
+	var due []pending
+
+	h.enrRefreshMu.Lock()
+	for id, state := range h.enrRefresh {
+		if state.inFlight || now.Before(state.cooldownUntil) {
+			continue
+		}
+		if state.highestSeenSeq > state.targetSeq {
+			due = append(due, pending{id, state.highestSeenSeq})
+		}
+	}
+	h.enrRefreshMu.Unlock()
+
+	if len(due) == 0 {
+		return
+	}
+
+	h.nodesMu.RLock()
+	resume := make([]*node.Node, 0, len(due))
+	for _, p := range due {
+		if n, ok := h.nodes[p.id]; ok && n.ENR() != nil && p.seq > n.ENR().Seq() {
+			resume = append(resume, n)
+		}
+	}
+	h.nodesMu.RUnlock()
+
+	for _, n := range resume {
+		h.startENRRefresh(n, 0)
+	}
+}
+
+// releaseENRRefresh clears the in-flight claim without recreating a state entry
+// that eviction has already removed.
+func (h *Handler) releaseENRRefresh(id node.ID) {
+	h.enrRefreshMu.Lock()
+	if state := h.enrRefresh[id]; state != nil {
+		state.inFlight = false
+		state.retries = 0
+	}
+	h.enrRefreshMu.Unlock()
 }
 
 // handleFindnode processes a FINDNODE request.
@@ -413,14 +626,18 @@ func (h *Handler) handleFindnode(fromNode *node.Node, from *net.UDPAddr, localAd
 		return ErrExpired
 	}
 
-	// Check if node is bonded
-	if !fromNode.IsBonded() {
+	h.noteSeen(fromNode)
+
+	// Bonded at this source address specifically: a bond earned elsewhere would
+	// let a spoofed source have us reflect NEIGHBORS at a third party.
+	if !fromNode.IsBondedFrom(from) {
 		h.incrementUnbondedFindnode()
 		logrus.WithField("node_id", fmt.Sprintf("%x", fromNode.IDBytes()[:8])).
 			Debug("Rejected FINDNODE from unbonded node")
 		return fmt.Errorf("node not bonded")
 	}
 
+	h.noteProven(fromNode)
 	h.incrementFindnodeRequestsRecv()
 
 	// Call callback to get nodes
@@ -448,22 +665,29 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		return ErrExpired
 	}
 
-	h.incrementFindnodeResponsesRecv()
+	h.noteSeen(fromNode)
 
 	// Only accept NEIGHBORS in response to a FINDNODE we actually sent to this
-	// node. Dropping unsolicited NEIGHBORS prevents a peer we never queried from
-	// making us accumulate node records without bound.
-	matchedReq := h.findPendingFindnode(fromNode.ID())
+	// address. Dropping unsolicited NEIGHBORS prevents a peer we never queried
+	// from making us accumulate node records without bound; requiring the source
+	// to be the address queried stops a peer answering from a spoofed one.
+	// NEIGHBORS carries no reply token, so the match is by node ID plus endpoint.
+	matchedReq := h.findPendingFindnode(fromNode.ID(), from)
 	if matchedReq == nil {
 		return nil
 	}
+
+	// Counted after the gate: this reports responses to our queries, so counting
+	// unsolicited packets here would let any peer inflate it.
+	h.noteProven(fromNode)
+	h.incrementFindnodeResponsesRecv()
 
 	// Accumulate the response, keyed by the matched request's hash so each
 	// FINDNODE gets exactly one entry and a fresh request never collides with
 	// a delivered one. Room is reserved before decoding, so records past the
 	// cap are never persisted in the global node map, even when packets are
 	// dispatched concurrently.
-	key := string(matchedReq.RequestHash)
+	key := requestKey(matchedReq.RequestHash, matchedReq.ToNode.ID())
 
 	h.pendingNeighborsMu.Lock()
 	pending := h.pendingNeighbors[key]
@@ -497,7 +721,7 @@ func (h *Handler) handleNeighbors(fromNode *node.Node, from *net.UDPAddr, neighb
 		}
 
 		nodeID := node.PubkeyToID(pubkey)
-		nodes = append(nodes, h.getOrCreateNode(nodeID, pubkey, addr))
+		nodes = append(nodes, h.lookupOrCreateNode(nodeID, pubkey, addr))
 	}
 
 	h.pendingNeighborsMu.Lock()
@@ -544,18 +768,22 @@ func (h *Handler) handleENRRequest(fromNode *node.Node, from *net.UDPAddr, local
 		return ErrExpired
 	}
 
+	h.noteSeen(fromNode)
+
 	// IMPORTANT: Check if node is bonded (bidirectional bond required)
 	// This prevents amplification attacks and matches reth's behavior.
 	// Only respond to ENRRequest if we've established a bidirectional bond:
 	// - We sent them a PING
-	// - They sent us a PONG
-	if !fromNode.IsBonded() {
+	// - They sent us a PONG from this address
+	if !fromNode.IsBondedFrom(from) {
 		logrus.WithFields(logrus.Fields{
 			"from":    from.String(),
 			"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
 		}).Debug("Ignoring ENRREQUEST from unbonded node")
 		return fmt.Errorf("node not bonded")
 	}
+
+	h.noteProven(fromNode)
 
 	// Call callback
 	if h.config.OnENRRequest != nil {
@@ -576,12 +804,39 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 		"enr_seq": resp.Record.Seq(),
 	}).Debug("Received ENRRESPONSE")
 
-	// Update node's ENR
-	fromNode.SetENR(resp.Record)
+	h.noteSeen(fromNode)
 
-	// Match to pending request
-	req := h.getPendingRequest(string(resp.ReplyTok))
-	if req != nil {
+	// Only a response to an ENRREQUEST we actually sent to this address may touch
+	// any state: ENRRESPONSE carries no expiration, so an unsolicited replay could
+	// otherwise roll the node back to an older record. The type and destination
+	// must both match, or a peer could answer with the hash of some other packet
+	// we sent it and resolve the wrong waiter.
+	reqs := h.pendingRequestsFrom(resp.ReplyTok, fromNode.ID(), from, ENRRequestPacket)
+	if len(reqs) == 0 {
+		return nil
+	}
+
+	// Bind the record to the sender's identity before installing it, so a
+	// matched response cannot attach another node's ENR to this node.
+	if resp.Record == nil {
+		return nil
+	}
+	pub := resp.Record.PublicKey()
+	if pub == nil || node.PubkeyToID(pub) != fromNode.ID() {
+		logrus.WithFields(logrus.Fields{
+			"from":    from.String(),
+			"node_id": fmt.Sprintf("%x", fromNode.IDBytes()[:8]),
+		}).Debug("Dropping ENRRESPONSE: record does not match sender identity")
+		return nil
+	}
+
+	fromNode.UpdateENR(resp.Record)
+
+	// After UpdateENR, so OnNodeSeen sees the record and admits the node instead of
+	// requesting an ENR it already has.
+	h.noteProven(fromNode)
+
+	for _, req := range reqs {
 		h.deliverResponse(req, resp.Record)
 	}
 
@@ -590,15 +845,25 @@ func (h *Handler) handleENRResponse(fromNode *node.Node, from *net.UDPAddr, resp
 
 // Sending Methods
 
-// Ping sends a PING request to a node.
+// Ping sends a PING request to a node at its canonical address.
 func (h *Handler) Ping(n *node.Node) (*Pong, error) {
+	return h.pingTo(n, n.Addr())
+}
+
+// pingTo sends a PING to an explicit destination.
+//
+// handlePing uses it to ping back the source it just ponged, rather than the
+// node's canonical address. That is what lets a peer which moved re-prove its new
+// endpoint: without it, a moved peer would be pinged only at its old address, never
+// answer, and so never bond or be served again.
+func (h *Handler) pingTo(n *node.Node, destAddr *net.UDPAddr) (*Pong, error) {
 	// Build PING message
 	ping := &Ping{
 		Version: 4,
 		// A bootnode serves no RLPx, so it advertises tcp-port 0; the recipient's
 		// tcp is not the sender's to set (spec: to = [ip, udp-port, 0]).
 		From:       NewEndpoint(h.config.LocalAddr, 0),
-		To:         NewEndpoint(n.Addr(), 0),
+		To:         NewEndpoint(destAddr, 0),
 		Expiration: MakeExpiration(h.config.ExpirationWindow),
 	}
 
@@ -614,11 +879,14 @@ func (h *Handler) Ping(n *node.Node) (*Pong, error) {
 	}
 
 	// Register pending request; removal is deferred so every exit path clears it.
-	req := h.addPendingRequest(hash, n, PingPacket)
-	defer h.removePendingRequest(string(hash))
+	req, err := h.addPendingRequest(hash, n, PingPacket, destAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer h.removePendingRequest(req)
 
 	// Send packet
-	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
+	if err := h.transport.SendTo(packet, destAddr); err != nil {
 		return nil, err
 	}
 
@@ -674,11 +942,15 @@ func (h *Handler) Findnode(n *node.Node, target []byte) ([]*node.Node, error) {
 	// Register pending request. Removal is deferred so every exit path clears
 	// it: a completed request left in the map keeps matching later NEIGHBORS
 	// from that node and reopens collection windows until cleanup runs.
-	req := h.addPendingRequest(hash, n, FindnodePacket)
-	defer h.removePendingRequest(string(hash))
+	destAddr := n.Addr()
+	req, err := h.addPendingRequest(hash, n, FindnodePacket, destAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer h.removePendingRequest(req)
 
 	// Send packet
-	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
+	if err := h.transport.SendTo(packet, destAddr); err != nil {
 		return nil, err
 	}
 
@@ -725,11 +997,15 @@ func (h *Handler) RequestENR(n *node.Node) (*enr.Record, error) {
 	}
 
 	// Register pending request; removal is deferred so every exit path clears it.
-	pendingReq := h.addPendingRequest(hash, n, ENRRequestPacket)
-	defer h.removePendingRequest(string(hash))
+	destAddr := n.Addr()
+	pendingReq, err := h.addPendingRequest(hash, n, ENRRequestPacket, destAddr)
+	if err != nil {
+		return nil, err
+	}
+	defer h.removePendingRequest(pendingReq)
 
 	// Send packet
-	if err := h.transport.SendTo(packet, n.Addr()); err != nil {
+	if err := h.transport.SendTo(packet, destAddr); err != nil {
 		return nil, err
 	}
 
@@ -782,8 +1058,11 @@ func (h *Handler) sendPong(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPA
 
 // sendNeighbors sends NEIGHBORS response(s).
 func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net.UDPAddr, nodes []*node.Node) error {
-	// Split nodes into packets of MaxNeighbors
-	for i := 0; i < len(nodes); i += MaxNeighbors {
+	// Split nodes into packets of MaxNeighbors. Always send at least one packet,
+	// even when we have no nodes to offer: go-ethereum's querier waits for a
+	// NEIGHBORS reply and only stops early once at least one arrives, so a silent
+	// (zero-packet) response makes it wait out the full request timeout.
+	for i := 0; i == 0 || i < len(nodes); i += MaxNeighbors {
 		end := i + MaxNeighbors
 		if end > len(nodes) {
 			end = len(nodes)
@@ -793,10 +1072,18 @@ func (h *Handler) sendNeighbors(to *node.Node, addr *net.UDPAddr, localAddr *net
 		nodeRecords := make([]NodeRecord, len(batch))
 
 		for j, n := range batch {
+			// Advertise the node's real TCP port from its ENR when known;
+			// only fall back to the UDP port if no ENR tcp entry is available.
+			tcpPort := uint16(n.Addr().Port)
+			if rec := n.ENR(); rec != nil {
+				if t := rec.TCP(); t != 0 {
+					tcpPort = t
+				}
+			}
 			nodeRecords[j] = NodeRecord{
 				IP:  n.Addr().IP,
 				UDP: uint16(n.Addr().Port),
-				TCP: uint16(n.Addr().Port),
+				TCP: tcpPort,
 				ID:  EncodePubkey(n.PublicKey()),
 			}
 		}
@@ -851,17 +1138,27 @@ func (h *Handler) sendENRResponse(to *node.Node, addr *net.UDPAddr, localAddr *n
 
 // Node Management
 
-// getOrCreateNode gets an existing node or creates a new one.
-func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net.UDPAddr) *node.Node {
+// lookupOrCreateNode returns the tracked node for id, creating one at addr if the
+// id is unknown.
+//
+// addr is used ONLY when creating: an existing node's canonical address is never
+// rewritten here, because addr is either an unauthenticated packet source or an
+// address a peer claimed in a NEIGHBORS record. Every sender reads that address,
+// and sendNeighbors republishes it, so letting either source set it would steer
+// our outbound traffic and let a peer poison what we publish about a third party.
+// Only promoteAddr, on a proven endpoint, may move it.
+func (h *Handler) lookupOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net.UDPAddr) *node.Node {
+	h.nodesMu.RLock()
+	n, exists := h.nodes[id]
+	h.nodesMu.RUnlock()
+	if exists {
+		return n
+	}
+
 	h.nodesMu.Lock()
 	defer h.nodesMu.Unlock()
 
-	n, exists := h.nodes[id]
-	if exists {
-		// Update address if changed
-		if n.Addr().String() != addr.String() {
-			n.SetAddr(addr)
-		}
+	if n, exists := h.nodes[id]; exists {
 		return n
 	}
 
@@ -871,16 +1168,70 @@ func (h *Handler) getOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *net
 	n = node.New(pubkey, addr)
 	n.UpdateLastSeen()
 
-	// Bound the map so an unauthenticated flood of distinct node IDs (for
-	// example fabricated NEIGHBORS records) cannot grow it without limit. Stale
-	// unbonded entries are reclaimed by cleanup; until a slot frees up we still
-	// return the node so the packet is handled, but we do not retain it.
+	// Bound the map so an unauthenticated flood of distinct node IDs (for example
+	// fabricated NEIGHBORS records, or signed PINGs from generated keys) cannot grow
+	// it without limit. When full, evict one unbonded entry to make room rather than
+	// dropping the new node: otherwise a flood that pins the map at MaxNodes would
+	// lock out genuine new peers (their node is never retained, so their inbound PING
+	// can never lead to a bond). Bonded entries are real, endpoint-proven peers and
+	// are never evicted here; if every entry is bonded (genuine load, not a flood) we
+	// leave the map as-is and return the node without retaining it.
 	if len(h.nodes) >= h.config.MaxNodes {
-		return n
+		evicted := false
+		for eid, en := range h.nodes {
+			if !en.IsBonded() {
+				delete(h.nodes, eid)
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			return n
+		}
 	}
 
 	h.nodes[id] = n
 	return n
+}
+
+// promoteAddr installs a proven endpoint as n's canonical address. Only
+// handlePong may call it, for the address a matched PING was sent to; see
+// lookupOrCreateNode for why nothing else may move it.
+func (h *Handler) promoteAddr(n *node.Node, proven *net.UDPAddr) {
+	if n == nil || proven == nil || proven.IP == nil {
+		return
+	}
+	if n.Addr().String() == proven.String() {
+		return
+	}
+
+	n.SetAddr(proven)
+
+	logrus.WithFields(logrus.Fields{
+		"node_id": fmt.Sprintf("%x", n.IDBytes()[:8]),
+		"addr":    proven.String(),
+	}).Debug("promoted proven endpoint to canonical address")
+}
+
+// noteSeen refreshes identity-scoped liveness.
+//
+// Safe for any non-expired packet: the signature authenticates the identity, so a
+// peer can only refresh its own liveness. Withholding it until the source is
+// proven would evict a peer that is actively signing packets but whose bond has
+// lapsed, and it would come back with no proven addresses at all.
+func (h *Handler) noteSeen(n *node.Node) {
+	n.UpdateLastSeen()
+	n.IncrementPacketsReceived()
+}
+
+// noteProven fires OnNodeSeen, which admits the node to the routing table and can
+// spawn outbound PING/ENRREQUEST traffic toward it. It requires a proven or
+// solicited source, so it sits behind each handler's gate while noteSeen runs
+// ahead of it.
+func (h *Handler) noteProven(n *node.Node) {
+	if h.config.OnNodeSeen != nil {
+		h.config.OnNodeSeen(n, time.Now())
+	}
 }
 
 // GetNode returns a node by ID.
@@ -904,11 +1255,27 @@ func (h *Handler) AllNodes() []*node.Node {
 
 // Request Tracking
 
-// addPendingRequest registers a new pending request.
-func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte) *PendingRequest {
+// requestKey scopes a pending request to its destination, since the packet
+// hash alone aliases across peers (see the requests field).
+func requestKey(hash []byte, id node.ID) string {
+	return string(hash) + string(id[:])
+}
+
+// addPendingRequest registers a new pending request. A second FINDNODE to a
+// peer with one already in flight is rejected: NEIGHBORS carries no reply
+// token, so two in-flight FINDNODEs to one peer cannot be told apart.
+// destAddr must be the address the caller sends the packet to, captured once,
+// so the recorded and actual destinations cannot diverge.
+func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType byte, destAddr *net.UDPAddr) (*PendingRequest, error) {
+	var destIP net.IP
+	if destAddr != nil && destAddr.IP != nil {
+		destIP = append(net.IP(nil), destAddr.IP...)
+	}
+
 	req := &PendingRequest{
 		RequestHash:  hash,
 		ToNode:       toNode,
+		DestIP:       destIP,
 		PacketType:   packetType,
 		CreatedAt:    time.Now(),
 		Timeout:      time.Now().Add(h.config.RequestTimeout),
@@ -916,37 +1283,126 @@ func (h *Handler) addPendingRequest(hash []byte, toNode *node.Node, packetType b
 	}
 
 	h.requestsMu.Lock()
-	h.requests[string(hash)] = req
-	h.requestsMu.Unlock()
+	defer h.requestsMu.Unlock()
 
+	if packetType == FindnodePacket && h.pendingFindnodeLocked(toNode.ID()) != nil {
+		return nil, fmt.Errorf("findnode already in flight to %x", toNode.IDBytes()[:8])
+	}
+
+	key := requestKey(hash, toNode.ID())
+	h.requests[key] = append(h.requests[key], req)
+
+	return req, nil
+}
+
+// pendingRequestsFrom returns the pending requests of the given type that match
+// this reply token and were sent to this address.
+func (h *Handler) pendingRequestsFrom(replyTok []byte, id node.ID, from *net.UDPAddr, packetType byte) []*PendingRequest {
+	if from == nil || from.IP == nil {
+		return nil
+	}
+
+	h.requestsMu.RLock()
+	defer h.requestsMu.RUnlock()
+
+	var out []*PendingRequest
+	for _, req := range h.requests[requestKey(replyTok, id)] {
+		if req.PacketType == packetType && req.DestIP != nil && req.DestIP.Equal(from.IP) {
+			out = append(out, req)
+		}
+	}
+	return out
+}
+
+// consumePendingPing removes and returns the pending PING this PONG answers, or
+// nil if there is none.
+//
+// Three properties beyond "a token matched" are required before a PONG may
+// mutate state, and all three are enforced here so no caller can forget one:
+//
+//   - from must be the IP the PING was sent to. The token alone proves only that
+//     somebody received that PING; an attacker who receives it at their own
+//     address can replay it with a victim's source and bond the victim.
+//   - the request must be a PING. Peers know the hashes of packets we sent them,
+//     so an ENRREQUEST or FINDNODE hash would otherwise match as a reply token.
+//   - the entry is deleted here, under the same lock, so a replayed PONG finds
+//     nothing and the side effects run at most once per PING.
+func (h *Handler) consumePendingPing(replyTok []byte, id node.ID, from *net.UDPAddr) *PendingRequest {
+	if from == nil || from.IP == nil {
+		return nil
+	}
+
+	key := requestKey(replyTok, id)
+
+	h.requestsMu.Lock()
+	defer h.requestsMu.Unlock()
+
+	reqs := h.requests[key]
+	for i, req := range reqs {
+		if req.PacketType != PingPacket || req.DestIP == nil || !req.DestIP.Equal(from.IP) {
+			continue
+		}
+
+		reqs = slices.Delete(reqs, i, i+1)
+		if len(reqs) == 0 {
+			delete(h.requests, key)
+		} else {
+			h.requests[key] = reqs
+		}
+		return req
+	}
+
+	return nil
+}
+
+// findPendingFindnode returns the pending FINDNODE request awaiting a response
+// from the given node, or nil if none exists.
+func (h *Handler) findPendingFindnode(id node.ID, from *net.UDPAddr) *PendingRequest {
+	if from == nil || from.IP == nil {
+		return nil
+	}
+
+	h.requestsMu.RLock()
+	defer h.requestsMu.RUnlock()
+
+	req := h.pendingFindnodeLocked(id)
+	if req == nil || req.DestIP == nil || !req.DestIP.Equal(from.IP) {
+		return nil
+	}
 	return req
 }
 
-// getPendingRequest retrieves a pending request by hash.
-func (h *Handler) getPendingRequest(hash string) *PendingRequest {
-	h.requestsMu.RLock()
-	defer h.requestsMu.RUnlock()
-	return h.requests[hash]
-}
-
-// findPendingFindnode returns a pending FINDNODE request awaiting a response
-// from the given node, or nil if none exists.
-func (h *Handler) findPendingFindnode(id node.ID) *PendingRequest {
-	h.requestsMu.RLock()
-	defer h.requestsMu.RUnlock()
-	for _, req := range h.requests {
-		if req.PacketType == FindnodePacket && req.ToNode != nil && req.ToNode.ID() == id {
-			return req
+func (h *Handler) pendingFindnodeLocked(id node.ID) *PendingRequest {
+	for _, reqs := range h.requests {
+		for _, req := range reqs {
+			if req.PacketType == FindnodePacket && req.ToNode != nil && req.ToNode.ID() == id {
+				return req
+			}
 		}
 	}
 	return nil
 }
 
-// removePendingRequest removes a pending request.
-func (h *Handler) removePendingRequest(hash string) {
+// removePendingRequest removes one pending request, leaving other waiters on
+// the same key in place so one caller's cleanup cannot orphan another's.
+func (h *Handler) removePendingRequest(req *PendingRequest) {
+	if req == nil || req.ToNode == nil {
+		return
+	}
+	key := requestKey(req.RequestHash, req.ToNode.ID())
+
 	h.requestsMu.Lock()
-	delete(h.requests, hash)
-	h.requestsMu.Unlock()
+	defer h.requestsMu.Unlock()
+
+	reqs := h.requests[key]
+	if i := slices.Index(reqs, req); i >= 0 {
+		reqs = slices.Delete(reqs, i, i+1)
+	}
+	if len(reqs) == 0 {
+		delete(h.requests, key)
+	} else {
+		h.requests[key] = reqs
+	}
 }
 
 // deliverResponse hands a response to a waiting request without blocking.
@@ -974,6 +1430,7 @@ func (h *Handler) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			h.cleanup()
+			h.resumeDeferredENRRefreshes()
 		case <-h.ctx.Done():
 			return
 		}
@@ -986,9 +1443,12 @@ func (h *Handler) cleanup() {
 
 	// Clean up expired requests
 	h.requestsMu.Lock()
-	for hash, req := range h.requests {
-		if now.After(req.Timeout) {
-			delete(h.requests, hash)
+	for key, reqs := range h.requests {
+		kept := slices.DeleteFunc(reqs, func(req *PendingRequest) bool { return now.After(req.Timeout) })
+		if len(kept) == 0 {
+			delete(h.requests, key)
+		} else {
+			h.requests[key] = kept
 		}
 	}
 	h.requestsMu.Unlock()
@@ -1004,14 +1464,43 @@ func (h *Handler) cleanup() {
 
 	// Evict stale, unbonded nodes so the map stays bounded. Bonded nodes are
 	// kept until their bond expires, after which IsBonded reports false and they
-	// become eligible here.
+	// become eligible here. Scanning under the read lock keeps a full-map sweep
+	// from stalling every inbound packet in getOrCreateNode.
+	stale := h.staleNodes(now)
+	if len(stale) == 0 {
+		return
+	}
+
 	h.nodesMu.Lock()
-	for id, n := range h.nodes {
-		if !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
+	evicted := make([]node.ID, 0, len(stale))
+	for _, id := range stale {
+		// Re-check: a node may have been seen again since the scan.
+		if n, ok := h.nodes[id]; ok && !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
 			delete(h.nodes, id)
+			evicted = append(evicted, id)
 		}
 	}
 	h.nodesMu.Unlock()
+
+	h.enrRefreshMu.Lock()
+	for _, id := range evicted {
+		delete(h.enrRefresh, id)
+	}
+	h.enrRefreshMu.Unlock()
+}
+
+// staleNodes returns the IDs of unbonded nodes past their TTL.
+func (h *Handler) staleNodes(now time.Time) []node.ID {
+	h.nodesMu.RLock()
+	defer h.nodesMu.RUnlock()
+
+	var stale []node.ID
+	for id, n := range h.nodes {
+		if !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
+			stale = append(stale, id)
+		}
+	}
+	return stale
 }
 
 // Statistics
@@ -1078,7 +1567,10 @@ func (h *Handler) GetStats() HandlerStats {
 	knownNodes := len(h.nodes)
 	h.nodesMu.RUnlock()
 	h.requestsMu.RLock()
-	pendingRequests := len(h.requests)
+	pendingRequests := 0
+	for _, reqs := range h.requests {
+		pendingRequests += len(reqs)
+	}
 	h.requestsMu.RUnlock()
 	h.pendingNeighborsMu.RLock()
 	pendingNeighbors := len(h.pendingNeighbors)
@@ -1098,24 +1590,6 @@ func (h *Handler) GetStats() HandlerStats {
 		KnownNodes:            knownNodes,
 		PendingRequests:       pendingRequests,
 		PendingNeighbors:      pendingNeighbors,
-	}
-}
-
-// Stats returns current statistics as a map, for callers that render it
-// generically.
-func (h *Handler) Stats() map[string]interface{} {
-	s := h.GetStats()
-	return map[string]interface{}{
-		"packets_received":        s.PacketsReceived,
-		"packets_sent":            s.PacketsSent,
-		"invalid_packets":         s.InvalidPackets,
-		"expired_packets":         s.ExpiredPackets,
-		"unbonded_findnode":       s.UnbondedFindnode,
-		"findnode_requests_recv":  s.FindnodeRequestsRecv,
-		"findnode_responses_recv": s.FindnodeResponsesRecv,
-		"known_nodes":             s.KnownNodes,
-		"pending_requests":        s.PendingRequests,
-		"pending_neighbors":       s.PendingNeighbors,
 	}
 }
 

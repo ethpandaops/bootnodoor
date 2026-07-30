@@ -36,6 +36,7 @@ type NodeChangedCallback func(*Node)
 type TableStats struct {
 	TotalNodes          int
 	ActiveNodes         int
+	InactiveNodes       int
 	AdmissionRejections int
 	IPLimitRejections   int
 	DeadNodesRemoved    int

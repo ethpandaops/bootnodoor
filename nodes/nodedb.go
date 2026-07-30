@@ -28,6 +28,7 @@ type NodeDB struct {
 	updateQueue     chan *Node
 	updateQueueSet  map[[32]byte]*Node // Tracks pending updates by nodeID
 	updateQueueLock sync.Mutex
+	closing         bool // Set under updateQueueLock so no write is accepted after Close starts draining
 
 	// Stats tracking
 	stats     NodeDBStats
@@ -78,6 +79,10 @@ func (ndb *NodeDB) QueueUpdate(n *Node) error {
 	ndb.updateQueueLock.Lock()
 	defer ndb.updateQueueLock.Unlock()
 
+	if ndb.closing {
+		return fmt.Errorf("node db is closing")
+	}
+
 	// Check if there's already a pending update for this node
 	if _, ok := ndb.updateQueueSet[nodeID]; ok {
 		// Node already queued - dirty flags will accumulate automatically
@@ -125,10 +130,15 @@ func (ndb *NodeDB) processUpdateQueue() {
 	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
 
+	// Failures requeue their nodes so nothing is lost, which on a persistent
+	// database error would otherwise spin: the requeue refills the batch and the
+	// next pass runs immediately. Back off between consecutive failures instead.
+	failures := 0
+
 	for {
 		select {
 		case <-ndb.ctx.Done():
-			// Process remaining batch
+			batch = ndb.drainQueue(batch)
 			if len(batch) > 0 {
 				ndb.batchUpdate(batch)
 			}
@@ -139,7 +149,7 @@ func (ndb *NodeDB) processUpdateQueue() {
 
 			// Process when batch reaches 50 items
 			if len(batch) >= 50 {
-				ndb.batchUpdate(batch)
+				failures = ndb.runBatch(batch, failures)
 				batch = batch[:0]
 				time.Sleep(10 * time.Millisecond) // Avoid hammering DB
 			}
@@ -147,17 +157,54 @@ func (ndb *NodeDB) processUpdateQueue() {
 		case <-ticker.C:
 			// Process any pending items
 			if len(batch) > 0 {
-				ndb.batchUpdate(batch)
+				failures = ndb.runBatch(batch, failures)
 				batch = batch[:0]
 			}
 		}
 	}
 }
 
+// maxBatchBackoff caps the delay after repeated batch failures.
+const maxBatchBackoff = 5 * time.Second
+
+// runBatch writes a batch and sleeps proportionally to how many consecutive
+// batches have failed, returning the updated count.
+func (ndb *NodeDB) runBatch(batch []*Node, failures int) int {
+	if ndb.batchUpdate(batch) {
+		return 0
+	}
+
+	failures++
+
+	backoff := time.Duration(failures) * 100 * time.Millisecond
+	if backoff > maxBatchBackoff {
+		backoff = maxBatchBackoff
+	}
+
+	select {
+	case <-time.After(backoff):
+	case <-ndb.ctx.Done():
+	}
+	return failures
+}
+
+// drainQueue moves everything currently queued into batch without blocking.
+func (ndb *NodeDB) drainQueue(batch []*Node) []*Node {
+	for {
+		select {
+		case node := <-ndb.updateQueue:
+			batch = append(batch, node)
+		default:
+			return batch
+		}
+	}
+}
+
 // batchUpdate performs a batch update of nodes.
-func (ndb *NodeDB) batchUpdate(nodes []*Node) {
+// batchUpdate writes a batch and reports whether the transaction committed.
+func (ndb *NodeDB) batchUpdate(nodes []*Node) bool {
 	if len(nodes) == 0 {
-		return
+		return true
 	}
 
 	ndb.logger.WithFields(logrus.Fields{
@@ -165,10 +212,19 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 		"layer": ndb.layer,
 	}).Debug("processing batch update")
 
+	type written struct {
+		node  *Node
+		flags DirtyFlags
+		gen   uint64
+	}
+	var processed []written
+
 	err := ndb.db.RunDBTransaction(func(tx *sqlx.Tx) error {
+		processed = processed[:0]
 		for _, node := range nodes {
-			dirtyFlags := node.GetDirtyFlags()
+			dirtyFlags, dirtyGen := node.DirtySnapshot()
 			nodeID := node.ID()
+			writeFailed := false
 
 			ndb.logger.WithFields(logrus.Fields{
 				"nodeID":      fmt.Sprintf("%x", nodeID[:8]),
@@ -182,8 +238,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to upsert node in batch")
 					continue
 				}
-				// Full upsert covers everything, clear all dirty flags
-				node.ClearDirtyFlags()
+				processed = append(processed, written{node, dirtyFlags, dirtyGen})
 				continue
 			}
 
@@ -192,6 +247,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				ndb.logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("updating ENR")
 				if err := ndb.updateNodeENRTx(tx, node); err != nil {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update ENR in batch")
+					writeFailed = true
 				}
 			}
 
@@ -200,6 +256,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				ndb.logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("updating stats")
 				if err := ndb.updateNodeStatsTx(tx, node); err != nil {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update stats in batch")
+					writeFailed = true
 				}
 			}
 
@@ -209,6 +266,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				if !lastActive.IsZero() {
 					if err := ndb.db.UpdateNodeLastActive(tx, ndb.layer, nodeID[:], lastActive.Unix()); err != nil {
 						ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update last_active in batch")
+						writeFailed = true
 					}
 				}
 			}
@@ -219,6 +277,7 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 				if !lastSeen.IsZero() {
 					if err := ndb.db.UpdateNodeLastSeen(tx, ndb.layer, nodeID[:], lastSeen.Unix()); err != nil {
 						ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update last_seen in batch")
+						writeFailed = true
 					}
 				}
 			}
@@ -227,16 +286,21 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 			if dirtyFlags&DirtyProtocol != 0 {
 				if err := ndb.updateNodeProtocolSupportTx(tx, nodeID, node.HasV4(), node.HasV5()); err != nil {
 					ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Error("failed to update protocol support in batch")
+					writeFailed = true
 				}
 			}
 
-			// Clear dirty flags after successful update
-			node.ClearDirtyFlags()
+			if !writeFailed {
+				processed = append(processed, written{node, dirtyFlags, dirtyGen})
+			}
 		}
 		return nil
 	})
 
 	if err != nil {
+		// Nothing reached the database, so no snapshot may be cleared: the flags
+		// are all that will bring these nodes back on a later pass.
+		processed = processed[:0]
 		ndb.logger.WithError(err).Error("failed to commit batch transaction")
 	} else {
 		ndb.logger.WithFields(logrus.Fields{
@@ -252,10 +316,43 @@ func (ndb *NodeDB) batchUpdate(nodes []*Node) {
 	}
 	ndb.updateQueueLock.Unlock()
 
+	// Clear after the set entry is gone, so a caller that marked the node while
+	// the write was running either enqueued itself or is requeued here. Clearing
+	// first would let its QueueUpdate be swallowed as already-queued and then have
+	// the entry deleted underneath it.
+	persisted := make(map[[32]byte]bool, len(processed))
+	requeue := make([]*Node, 0, len(nodes))
+
+	for _, p := range processed {
+		persisted[p.node.ID()] = true
+		if p.node.ClearDirtySnapshot(p.flags, p.gen) {
+			requeue = append(requeue, p.node)
+		}
+	}
+
+	// A node whose write failed keeps its flags, but it is out of the queue set
+	// now, so nothing would bring it back until an unrelated update marked it.
+	for _, node := range nodes {
+		if !persisted[node.ID()] {
+			requeue = append(requeue, node)
+		}
+	}
+
+	for _, node := range requeue {
+		if err := ndb.QueueUpdate(node); err != nil {
+			ndb.logger.WithError(err).Debug("failed to requeue node after batch")
+		}
+	}
+
 	// Track processed updates
 	ndb.statsLock.Lock()
 	ndb.stats.ProcessedUpdates += int64(len(nodes))
 	ndb.statsLock.Unlock()
+
+	// Row-level failures leave the callback returning nil, so a committed
+	// transaction is not proof every node landed. Reporting success on a partial
+	// batch would reset the backoff while the requeued nodes retry immediately.
+	return err == nil && len(processed) == len(nodes)
 }
 
 // updateNodeENRTx updates only ENR info within a transaction.
@@ -297,7 +394,7 @@ func (ndb *NodeDB) updateNodeENRTx(tx *sqlx.Tx, n *Node) error {
 		}
 	}
 
-	enrBytes, err := n.ENR().EncodeRLP()
+	enrBytes, err := n.ENR().EncodeRLPBytes()
 	if err != nil {
 		return fmt.Errorf("failed to encode ENR: %w", err)
 	}
@@ -335,7 +432,7 @@ func (ndb *NodeDB) upsertNodeTx(tx *sqlx.Tx, n *Node) error {
 	port := n.Addr().Port
 	seq := n.ENR().Seq()
 
-	enrBytes, err := n.ENR().EncodeRLP()
+	enrBytes, err := n.ENR().EncodeRLPBytes()
 	if err != nil {
 		return fmt.Errorf("failed to encode ENR: %w", err)
 	}
@@ -347,6 +444,14 @@ func (ndb *NodeDB) upsertNodeTx(tx *sqlx.Tx, n *Node) error {
 	if !stats.LastSeen.IsZero() {
 		lastSeen.Valid = true
 		lastSeen.Int64 = stats.LastSeen.Unix()
+	}
+
+	// The DirtyFull branch clears every other flag once this upsert runs, so a
+	// DirtyLastActive set alongside it would otherwise be dropped.
+	lastActive := sql.NullInt64{}
+	if t := n.LastActive(); !t.IsZero() {
+		lastActive.Valid = true
+		lastActive.Int64 = t.Unix()
 	}
 
 	// Extract fork digest based on layer
@@ -383,7 +488,7 @@ func (ndb *NodeDB) upsertNodeTx(tx *sqlx.Tx, n *Node) error {
 		ForkDigest:   forkDigest,
 		FirstSeen:    firstSeen,
 		LastSeen:     lastSeen,
-		LastActive:   sql.NullInt64{}, // Updated separately
+		LastActive:   lastActive,
 		ENR:          enrBytes,
 		HasV4:        n.HasV4(),
 		HasV5:        n.HasV5(),
@@ -541,9 +646,21 @@ func (ndb *NodeDB) LoadRandom(limit int) ([]*Node, error) {
 }
 
 // Close stops the update queue processor and waits for pending updates.
+//
+// The processor exits on context cancellation, and Stop cancels before calling
+// here, so a producer can still enqueue after the processor is gone. Refusing
+// new work first and flushing afterwards is what makes that write-or-reject
+// rather than a silent drop.
 func (ndb *NodeDB) Close() {
-	// Wait for queue processor to finish
+	ndb.updateQueueLock.Lock()
+	ndb.closing = true
+	ndb.updateQueueLock.Unlock()
+
 	ndb.wg.Wait()
+
+	if batch := ndb.drainQueue(nil); len(batch) > 0 {
+		ndb.batchUpdate(batch)
+	}
 }
 
 // GetStats returns current database statistics.
@@ -570,6 +687,26 @@ func (ndb *NodeDB) GetStats() NodeDBStats {
 func (ndb *NodeDB) List() []*Node {
 	nodes, _ := ndb.LoadAll()
 	return nodes
+}
+
+// PersistedIDs returns the node IDs persisted for this layer.
+func (ndb *NodeDB) PersistedIDs() [][32]byte {
+	rows, err := ndb.db.GetNodeIDs(ndb.layer)
+	if err != nil {
+		ndb.logger.WithError(err).Warn("failed to list persisted node ids")
+		return nil
+	}
+
+	ids := make([][32]byte, 0, len(rows))
+	for _, raw := range rows {
+		if len(raw) != 32 {
+			continue
+		}
+		var id [32]byte
+		copy(id[:], raw)
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // Count returns the total number of nodes in the database.

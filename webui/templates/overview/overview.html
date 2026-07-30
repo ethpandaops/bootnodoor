@@ -464,6 +464,10 @@
                   <td class="text-end" data-stat="findnode-received">{{ .FindNodeReceived }}</td>
                 </tr>
                 <tr>
+                  <td class="text-muted">Other Protocol</td>
+                  <td class="text-end" data-stat="wrong-protocol-packets">{{ .WrongProtocolPackets }}</td>
+                </tr>
+                <tr>
                   <td class="text-muted">Invalid Packets</td>
                   <td class="text-end"><span class="badge rounded-pill text-bg-danger" data-stat="invalid-packets">{{ .InvalidPackets }}</span></td>
                 </tr>
@@ -892,6 +896,7 @@
         updateValue('[data-stat="packets-sent"]', data.PacketsSent);
         updateValue('[data-stat="findnode-received"]', data.FindNodeReceived);
         updateValue('[data-stat="invalid-packets"]', data.InvalidPackets);
+        updateValue('[data-stat="wrong-protocol-packets"]', data.WrongProtocolPackets);
         updateValue('[data-stat="filtered-responses"]', data.FilteredResponses);
 
         /* Fork info (if present) */

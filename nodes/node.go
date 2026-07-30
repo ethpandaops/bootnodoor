@@ -64,6 +64,7 @@ type Node struct {
 	// Dirty tracking for database updates
 	dirtyMu     sync.Mutex
 	dirtyFields DirtyFlags
+	dirtyGen    uint64
 }
 
 // NewFromV4 creates a generic Node from a discv4 node.
@@ -139,11 +140,9 @@ func (n *Node) PublicKey() *ecdsa.PublicKey {
 	return n.pubKey
 }
 
-// ENR returns the node's ENR record.
+// ENR returns the node's ENR record. Alias for Record.
 func (n *Node) ENR() *enr.Record {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.enr
+	return n.Record()
 }
 
 // Addr returns the node's UDP address.
@@ -151,18 +150,6 @@ func (n *Node) Addr() *net.UDPAddr {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.addr
-}
-
-// SetAddr updates the node's address.
-func (n *Node) SetAddr(addr *net.UDPAddr) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.addr = addr
-
-	// Update protocol-specific nodes
-	if n.v4Node != nil {
-		n.v4Node.SetAddr(addr)
-	}
 }
 
 // V4 returns the discv4 node if available.
@@ -206,6 +193,159 @@ func (n *Node) SetV4(v4 *node.Node) {
 		v4.SetStats(n.nodeStats)
 	}
 	n.MarkDirty(DirtyProtocol)
+}
+
+// AdoptProtocolsFrom fills protocol slots this node has empty from a wrapper for
+// the same peer, advances the record if the other's is newer, and reports each.
+//
+// It fills only: which endpoint a protocol should use is the discovery layer's
+// call, not the table's. discv4 moves an address solely on a matched PONG
+// (promoteAddr), and discv5 moves its own when its record advances. A table that
+// also ranked pointers would be arbitrating endpoints on weaker evidence.
+func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
+	// Self-merge is a no-op, not a re-install: a caller re-admitting a table entry
+	// would otherwise snapshot its own pointer, race a concurrent clear, and
+	// resurrect a protocol the node no longer supports.
+	if other == nil || other == n {
+		return false, false
+	}
+
+	otherRecord := other.Record()
+	if otherRecord == nil {
+		return false, false
+	}
+	otherV4, otherV5 := other.V4(), other.V5()
+	carrierSeq := otherRecord.Seq()
+
+	n.mu.Lock()
+	if n.enr != nil && carrierSeq < n.recordSeqLocked() {
+		n.mu.Unlock()
+		return false, false
+	}
+
+	if otherV4 != nil && n.v4Node == nil {
+		n.v4Node = otherV4
+		adopted = true
+	}
+	if otherV5 != nil && n.v5Node == nil {
+		n.v5Node = otherV5
+		adopted = true
+	}
+
+	if n.enr == nil || carrierSeq > n.recordSeqLocked() {
+		n.enr = otherRecord
+		advanced = true
+	}
+
+	stats := n.nodeStats
+	current := n.enr
+	v4, v5 := n.v4Node, n.v5Node
+	n.mu.Unlock()
+
+	if adopted && stats != nil {
+		n.setupSharedStatsCallback()
+		if otherV4 != nil && v4 != nil {
+			v4.SetStats(stats)
+		}
+		if otherV5 != nil && v5 != nil {
+			v5.SetStats(stats)
+		}
+	}
+	// Bring the v5 pointer up to the record the wrapper now holds, whether that is
+	// because the record advanced or because an older pointer just filled an empty
+	// slot. UpdateENR ignores anything not newer, and this stays outside n.mu so
+	// the two mutexes never nest.
+	if (adopted || advanced) && v5 != nil {
+		v5.UpdateENR(current)
+	}
+
+	if adopted {
+		n.MarkDirty(DirtyProtocol)
+	}
+	if advanced {
+		n.MarkDirty(DirtyENR)
+	}
+	return adopted, advanced
+}
+
+// ApplyProbeResult installs or clears both protocol pointers from a completed
+// probe, and reports whether anything changed.
+//
+// Gated on the record still being the one the probe measured: a result that
+// arrived after the peer published a new record describes endpoints it may have
+// left, so it must neither install nor clear. Both protocols are decided under one
+// lock hold so they see the same record.
+func (n *Node) ApplyProbeResult(probedSeq uint64, v4 *node.Node, v4OK bool, v5 *discv5node.Node, v5OK bool) bool {
+	n.mu.Lock()
+	if n.enr == nil || n.recordSeqLocked() != probedSeq {
+		n.mu.Unlock()
+		return false
+	}
+
+	changed := false
+	switch {
+	case v4OK && v4 != nil && n.v4Node == nil:
+		n.v4Node = v4
+		changed = true
+	case !v4OK && n.v4Node != nil:
+		n.v4Node = nil
+		changed = true
+	}
+
+	switch {
+	case v5OK && v5 != nil && n.v5Node == nil:
+		n.v5Node = v5
+		changed = true
+	case !v5OK && n.v5Node != nil:
+		n.v5Node = nil
+		changed = true
+	}
+
+	stats := n.nodeStats
+	installedV4, installedV5 := n.v4Node, n.v5Node
+	n.mu.Unlock()
+
+	if !changed {
+		return false
+	}
+
+	if stats != nil {
+		n.setupSharedStatsCallback()
+		if installedV4 != nil {
+			installedV4.SetStats(stats)
+		}
+		if installedV5 != nil {
+			installedV5.SetStats(stats)
+		}
+	}
+	n.MarkDirty(DirtyProtocol)
+	return true
+}
+
+// SetV5AtSeq installs a discv5 node only while the record it was probed from is
+// still current, so a result that arrived after the peer moved is discarded
+// rather than pinning traffic to the old endpoint.
+func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
+	if v5 == nil {
+		return false
+	}
+	v5Seq := v5RecordSeq(v5)
+
+	n.mu.Lock()
+	if n.enr == nil || n.enr.Seq() != seq || v5Seq != seq {
+		n.mu.Unlock()
+		return false
+	}
+	n.v5Node = v5
+	stats := n.nodeStats
+	n.mu.Unlock()
+
+	if stats != nil {
+		n.setupSharedStatsCallback()
+		v5.SetStats(stats)
+	}
+	n.MarkDirty(DirtyProtocol)
+	return true
 }
 
 // SetV5 sets the discv5 node and marks protocol support dirty.
@@ -433,7 +573,7 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 
 	// Update our ENR
 	n.mu.Lock()
-	if newRecord.Seq() <= n.enr.Seq() {
+	if n.enr != nil && newRecord.Seq() <= n.recordSeqLocked() {
 		n.mu.Unlock()
 		return false
 	}
@@ -497,6 +637,7 @@ func (n *Node) CalculateScore(forkInfo *ForkScoringInfo) float64 {
 func (n *Node) MarkDirty(flags DirtyFlags) {
 	n.dirtyMu.Lock()
 	n.dirtyFields |= flags
+	n.dirtyGen++
 	n.dirtyMu.Unlock()
 }
 
@@ -513,6 +654,29 @@ func (n *Node) ClearDirtyFlags() {
 	n.dirtyMu.Lock()
 	n.dirtyFields = 0
 	n.dirtyMu.Unlock()
+}
+
+// DirtySnapshot returns the current flags and a generation that changes on every
+// subsequent MarkDirty, so a writer can tell whether anything was marked while it
+// was working.
+func (n *Node) DirtySnapshot() (DirtyFlags, uint64) {
+	n.dirtyMu.Lock()
+	defer n.dirtyMu.Unlock()
+	return n.dirtyFields, n.dirtyGen
+}
+
+// ClearDirtySnapshot clears the snapshotted flags and reports whether the node is
+// still dirty. Clearing is skipped entirely when the generation moved: the same
+// bit may have been re-marked for a newer value, which is indistinguishable from
+// the one just written, so the field would otherwise be dropped unwritten.
+func (n *Node) ClearDirtySnapshot(flags DirtyFlags, gen uint64) bool {
+	n.dirtyMu.Lock()
+	defer n.dirtyMu.Unlock()
+	if n.dirtyGen != gen {
+		return true
+	}
+	n.dirtyFields &^= flags
+	return n.dirtyFields != 0
 }
 
 // LastActive returns the last active timestamp.
@@ -540,4 +704,24 @@ func NewV5NodeFromRecord(record *enr.Record) (*discv5node.Node, error) {
 // This is a helper for protocol support checks.
 func NewV4NodeFromRecord(record *enr.Record, addr *net.UDPAddr) (*node.Node, error) {
 	return node.FromENR(record, addr)
+}
+
+// recordSeq reads a record's sequence, treating a missing record as sequence 0.
+func recordSeq(rec *enr.Record) uint64 {
+	if rec == nil {
+		return 0
+	}
+	return rec.Seq()
+}
+
+// v5RecordSeq reads the sequence of the record a discv5 pointer was built from.
+func v5RecordSeq(v5 *discv5node.Node) uint64 {
+	if v5 == nil {
+		return 0
+	}
+	return recordSeq(v5.Record())
+}
+
+func (n *Node) recordSeqLocked() uint64 {
+	return recordSeq(n.enr)
 }

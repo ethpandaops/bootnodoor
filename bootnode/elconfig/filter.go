@@ -2,8 +2,9 @@ package elconfig
 
 import (
 	"fmt"
-	"hash/crc32"
 	"math"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,19 +32,11 @@ type ForkFilter struct {
 	// special casing.
 	forks []uint64
 
-	// numBlockForks is the boundary index separating block forks from time
-	// forks in forks, including go-ethereum's rule that the sentry counts as
-	// a block fork when the chain has no time forks at all.
+	// numBlockForks indexes the first time fork in forks. Every block fork is
+	// passed under the static head stance, so validation starts scanning here.
 	numBlockForks int
 
-	// blockHead is the static block head: at or past every canonical block
-	// fork, before the sentry.
-	blockHead uint64
-
-	// sums[i] is the checksum after passing the first i fork boundaries.
-	sums [][4]byte
-
-	// allForkIDs contains the complete canonical list for display
+	// allForkIDs[i].Hash is the checksum after passing the first i boundaries.
 	allForkIDs []ForkID
 
 	// Admission outcomes, recorded by the admission call sites only (the
@@ -79,38 +72,15 @@ func NewForkFilter(genesisHash [32]byte, config *ChainConfig, genesisTime uint64
 	forksByBlock, forksByTime := GatherForks(config, genesisTime)
 
 	forks := append(append([]uint64{}, forksByBlock...), forksByTime...)
-	sums := make([][4]byte, len(forks)+1)
-	hash := crc32.ChecksumIEEE(genesisHash[:])
-	sums[0] = checksumToBytes(hash)
-	for i, fork := range forks {
-		hash = checksumUpdate(hash, fork)
-		sums[i+1] = checksumToBytes(hash)
-	}
-
-	blockHead := uint64(0)
-	if len(forksByBlock) > 0 {
-		blockHead = forksByBlock[len(forksByBlock)-1]
-	}
-
-	numBlockForks := len(forksByBlock)
 	forks = append(forks, math.MaxUint64)
-	if len(forksByTime) == 0 {
-		// In purely block based forks, keep the sentry out of timestamp
-		// territory (go-ethereum's rule).
-		numBlockForks++
-	}
-
-	allForkIDs := ComputeAllForkIDs(genesisHash, forksByBlock, forksByTime)
 
 	return &ForkFilter{
 		genesisHash:   genesisHash,
 		chainConfig:   config,
 		genesisTime:   genesisTime,
 		forks:         forks,
-		numBlockForks: numBlockForks,
-		blockHead:     blockHead,
-		sums:          sums,
-		allForkIDs:    allForkIDs,
+		numBlockForks: len(forksByBlock),
+		allForkIDs:    ComputeAllForkIDs(genesisHash, forksByBlock, forksByTime),
 	}
 }
 
@@ -137,16 +107,12 @@ func (f *ForkFilter) Filter(id ForkID) bool {
 //     be completed with locally known future forks: accept (we are syncing).
 //  4. Reject in all other cases.
 func (f *ForkFilter) validate(id ForkID, now uint64) error {
-	for i, fork := range f.forks {
-		head := f.blockHead
-		if i >= f.numBlockForks {
-			head = now
-		}
-		if head >= fork {
+	for i := f.numBlockForks; i < len(f.forks); i++ {
+		if now >= f.forks[i] {
 			continue
 		}
 		// Found the first unpassed fork, check the remote against it (rule #1).
-		if f.sums[i] == id.Hash {
+		if f.allForkIDs[i].Hash == id.Hash {
 			// A remote-announced fork we have already passed means the remote
 			// is stale (rule #1a). Every unpassed fork here is time-scheduled
 			// (block forks are all passed under the static stance), so the
@@ -158,7 +124,7 @@ func (f *ForkFilter) validate(id ForkID, now uint64) error {
 		}
 		// Different fork state: subset means the remote is syncing (rule #2).
 		for j := 0; j < i; j++ {
-			if f.sums[j] == id.Hash {
+			if f.allForkIDs[j].Hash == id.Hash {
 				if f.forks[j] != id.Next {
 					return fmt.Errorf("remote is stale: subset checksum with next %d, want %d", id.Next, f.forks[j])
 				}
@@ -166,8 +132,8 @@ func (f *ForkFilter) validate(id ForkID, now uint64) error {
 			}
 		}
 		// Superset means we would be the one syncing (rule #3).
-		for j := i + 1; j < len(f.sums); j++ {
-			if f.sums[j] == id.Hash {
+		for j := i + 1; j < len(f.allForkIDs); j++ {
+			if f.allForkIDs[j].Hash == id.Hash {
 				return nil
 			}
 		}
@@ -177,8 +143,9 @@ func (f *ForkFilter) validate(id ForkID, now uint64) error {
 	return nil
 }
 
-// RecordAdmission records an admission decision for the stats surface. Call
-// this from admission paths only, never from layer classification.
+// RecordAdmission records an admission decision for the stats surface. Its only
+// caller is ENRManager.AdmitELNode, which owns the eth-entry gate; the pure
+// predicate path (ClassifyELNode) must never reach here.
 func (f *ForkFilter) RecordAdmission(acceptedNode bool, id ForkID) {
 	f.statsMu.Lock()
 	defer f.statsMu.Unlock()
@@ -203,9 +170,11 @@ func (f *ForkFilter) GetStats() FilterStats {
 	}
 }
 
-// GetAllForkIDs returns all valid fork IDs for debugging.
+// GetAllForkIDs returns all valid fork IDs for debugging. Copied because
+// validate reads allForkIDs to decide admission; mutating it would corrupt
+// peer filtering.
 func (f *ForkFilter) GetAllForkIDs() []ForkID {
-	return f.allForkIDs
+	return slices.Clone(f.allForkIDs)
 }
 
 // GetCurrentForkID calculates the current fork ID based on chain state.
@@ -273,19 +242,16 @@ func (f *ForkFilter) GetAllForkIDsWithNames() []ForkIDWithName {
 		if i+1 >= len(f.allForkIDs) {
 			break
 		}
-		name := ""
-		for j, n := range b.names {
+		names := make([]string, 0, len(b.names))
+		for _, n := range b.names {
 			if len(n) > 0 {
-				n = string(n[0]-32) + n[1:]
+				n = strings.ToUpper(n[:1]) + n[1:]
 			}
-			if j > 0 {
-				name += "/"
-			}
-			name += n
+			names = append(names, n)
 		}
 		result = append(result, ForkIDWithName{
 			ForkID:     f.allForkIDs[i+1],
-			Name:       name,
+			Name:       strings.Join(names, "/"),
 			Activation: b.value,
 			IsTime:     b.isTime,
 		})

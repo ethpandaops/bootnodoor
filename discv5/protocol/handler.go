@@ -431,27 +431,12 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr, localA
 	var srcNodeID node.ID
 	copy(srcNodeID[:], packet.SrcID)
 
-	// Look up session by node ID first (most efficient and handles IP changes)
+	// Sessions are keyed by the sender's node ID and every creation site uses the
+	// correct ID, so this always hits when a session exists. There is deliberately
+	// no address fallback: srcID is unauthenticated, so matching a session by
+	// source address alone let anyone who could guess a peer's IP:port reach the
+	// failure path below and tear that peer's session down.
 	sess := h.config.Sessions.Get(srcNodeID)
-
-	// If session exists, verify and update address if needed
-	if sess != nil {
-		// Check if the address has changed
-		if sess.RemoteAddr.String() != from.String() {
-			h.config.Logger.WithFields(logrus.Fields{
-				"nodeID":  srcNodeID.String()[:16],
-				"oldAddr": sess.RemoteAddr,
-				"newAddr": from,
-			}).Info("handler: node address changed, updating session")
-
-			// Update the session's remote address
-			sess.UpdateAddr(from)
-		}
-	} else {
-		// No session by node ID, try lookup by address (slower fallback)
-		sess = h.config.Sessions.GetByAddr(from)
-	}
-
 	if sess == nil {
 		// No session exists, send WHOAREYOU challenge
 		h.config.Logger.WithFields(logrus.Fields{
@@ -470,22 +455,39 @@ func (h *Handler) handleOrdinaryPacket(packet *Packet, from *net.UDPAddr, localA
 		packet.Message,
 	)
 	if err != nil {
-		// Decryption failed - session is corrupted/expired
-		// Delete the session immediately to force a new handshake
-		h.config.Sessions.Delete(sess.RemoteID)
+		// Keep the session. Anyone can send an undecryptable packet naming this
+		// node ID, so deleting here let an attacker who knows only a peer's public
+		// ID destroy that peer's session at will. A peer that genuinely lost its
+		// keys recovers via the handshake, and Cache.Put replaces this entry by
+		// node ID when it lands, so deletion buys nothing.
+		//
+		// The challenge still goes to the packet source: the legitimate "restarted
+		// and lost my keys" case is a random packet, which by definition fails to
+		// decrypt, and the source is the only address such a peer is reachable at.
+		// Answering at sess.Addr() instead would be a reflection primitive.
 		h.config.Logger.WithFields(logrus.Fields{
 			"nodeID": sess.RemoteID.String()[:16],
 			"addr":   from,
 			"error":  err,
-		}).Debug("handler: decryption failed, deleted session and sending WHOAREYOU")
+		}).Debug("handler: decryption failed, keeping session and sending WHOAREYOU")
 
-		// Extract dest node ID from packet srcID and send WHOAREYOU
-		if len(packet.SrcID) != 32 {
-			return fmt.Errorf("no source node ID in packet")
-		}
-		var destNodeID node.ID
-		copy(destNodeID[:], packet.SrcID)
-		return h.sendWHOAREYOU(from, destNodeID, packet.Header.Nonce, localAddr)
+		return h.sendWHOAREYOU(from, srcNodeID, packet.Header.Nonce, localAddr)
+	}
+
+	// Only now is the sender proven: AES-GCM over the header authenticates
+	// possession of the session key, and the source address is not part of the
+	// AAD, so a NAT-rebound peer decrypts fine from its new address.
+	// Zone is part of the comparison because Cache.GetByAddr matches on the full
+	// address string; ignoring it here would let the two disagree for scoped IPv6
+	// and strand a peer that changed interface.
+	if cur := sess.Addr(); cur == nil || cur.Port != from.Port || cur.Zone != from.Zone || !cur.IP.Equal(from.IP) {
+		h.config.Logger.WithFields(logrus.Fields{
+			"nodeID":  srcNodeID.String()[:16],
+			"oldAddr": sess.Addr(),
+			"newAddr": from,
+		}).Info("handler: node address changed, updating session")
+
+		sess.UpdateAddr(from)
 	}
 
 	// Decode message from plaintext
@@ -556,16 +558,29 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 			return fmt.Errorf("no pending handshake for %s", from)
 		}
 
+		// Answering this challenge derives fresh keys and replaces the session, so
+		// a WHOAREYOU nobody authenticated must not reach that path: otherwise
+		// anyone able to reach us from this address could swap a working session
+		// for keys the real peer never agreed to. Only a peer that actually
+		// received one of our packets can quote its nonce.
+		if !sess.SentNonce(packet.Header.Nonce) {
+			h.config.Logger.WithFields(logrus.Fields{
+				"nodeID": sess.RemoteID.String()[:16],
+				"addr":   from,
+			}).Debug("handler: ignoring WHOAREYOU referencing a nonce we never sent")
+			return fmt.Errorf("unsolicited WHOAREYOU from %s", from)
+		}
+
 		// Look up pending request for this node to get the message to replay
 		pendingReq := h.requests.GetPendingRequestForNode(sess.RemoteID)
 		if pendingReq == nil {
-			// No pending request either - just delete stale session
+			// Keep the session: the handshake replaces it by node ID if the peer
+			// really did lose its keys, so deleting here only helps an attacker.
 			h.config.Logger.WithFields(logrus.Fields{
 				"nodeID": sess.RemoteID.String()[:16],
 				"addr":   from,
 				"age":    sess.Age(),
-			}).Info("handler: received unexpected WHOAREYOU with no pending request, deleting stale session")
-			h.config.Sessions.Delete(sess.RemoteID)
+			}).Debug("handler: received unexpected WHOAREYOU with no pending request")
 			return fmt.Errorf("no pending handshake or request for %s", from)
 		}
 
@@ -587,8 +602,9 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 		h.pendingHandshakes[pendingKey] = pending
 		h.mu.Unlock()
 
-		// Delete the stale session - we'll create a new one during handshake
-		h.config.Sessions.Delete(sess.RemoteID)
+		// The stale session is not deleted here: sendHandshakePacket's Put replaces
+		// it by node ID once the new keys exist, so deleting first only widens the
+		// window in which the peer has no session at all.
 
 		// Continue processing the WHOAREYOU with our pending handshake
 		// After handshake completes, the message will be sent with the SAME request ID,
@@ -648,7 +664,7 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 	var enrBytes []byte
 	localENR := h.config.LocalNode.Record()
 	if packet.Challenge.ENRSeq == 0 || packet.Challenge.ENRSeq < localENR.Seq() {
-		enrBytes, err = localENR.EncodeRLP()
+		enrBytes, err = localENR.EncodeRLPBytes()
 		if err != nil {
 			h.config.Logger.WithError(err).Warn("handler: failed to encode ENR")
 		} else {
@@ -870,7 +886,7 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr, local
 	h.config.Logger.WithFields(logrus.Fields{
 		"sourceNodeID": sourceNodeID.String()[:16],
 		"from":         from,
-	}).Info("handler: session established successfully")
+	}).Debug("handler: session established successfully")
 
 	// Store node in session and call OnHandshakeComplete callback
 	if remoteNodeFromENR != nil {
@@ -977,12 +993,21 @@ func (h *Handler) handlePong(msg *Pong, remoteID node.ID, from *net.UDPAddr, rem
 		"nodeID": remoteID,
 	}).Debug("handler: received PONG")
 
-	// Match with pending request
-	h.requests.MatchResponse(msg.RequestID, remoteID, msg)
+	// An unsolicited PONG must not reach the side effects below: OnPongReceived
+	// casts a vote in the external-IP election that rewrites our published ENR,
+	// and the ENR branch triggers outbound traffic.
+	req := h.requests.MatchResponse(msg.RequestID, remoteID, msg)
+	if req == nil {
+		return nil
+	}
 
-	// Call OnPongReceived callback with the source IP and the IP/port reported in the PONG
-	// The IP and Port fields in PONG contain our address as seen by the remote peer
-	if h.config.OnPongReceived != nil && len(msg.IP) > 0 && msg.Port > 0 {
+	// The IP-discovery vote additionally requires the PONG to come from the address
+	// we pinged. A session peer can send an authenticated PONG from a forged source,
+	// and from.IP is what feeds the distinct-reporter threshold. Delivery above
+	// stays source-agnostic so NAT rebinding and mobile peers keep working; only
+	// this vote needs the endpoint proven.
+	if h.config.OnPongReceived != nil && len(msg.IP) > 0 && msg.Port > 0 &&
+		req.DestAddr != nil && req.DestAddr.IP.Equal(from.IP) {
 		reportedIP := net.IP(msg.IP)
 		h.config.OnPongReceived(remoteID, from.IP, reportedIP, msg.Port)
 	}
@@ -1040,9 +1065,18 @@ func (h *Handler) handleFindNode(msg *FindNode, remoteID node.ID, from *net.UDPA
 		}).Debug("handler: FINDNODE lookup completed via callback")
 	}
 
-	// Split nodes into multiple packets if needed to stay under max packet size
-	// Each ENR is typically 200-400 bytes, so we limit to 3 nodes per packet to be safe
+	// Split nodes into multiple packets if needed to stay under max packet size.
+	// Each ENR is typically 200-400 bytes, so we limit to 3 nodes per packet to be safe.
 	const maxNodesPerPacket = 3
+
+	// Cap the total response so it never exceeds what real clients consume. go-ethereum
+	// honours only the first packet's `total` and reads at most 5 NODES packets
+	// (totalNodesResponseLimit); anything beyond that is dropped as unsolicited. sigp/discv5
+	// caps at 16 nodes. Keep to <=5 packets / <=15 nodes so no served node is silently lost.
+	const maxNodesPerResponse = 15
+	if len(nodes) > maxNodesPerResponse {
+		nodes = nodes[:maxNodesPerResponse]
+	}
 
 	// Calculate total number of packets needed
 	totalPackets := (len(nodes) + maxNodesPerPacket - 1) / maxNodesPerPacket
@@ -1137,122 +1171,7 @@ func (h *Handler) handleTalkResp(msg *TalkResp, remoteID node.ID, from *net.UDPA
 // to send arbitrary messages through the protocol handler.
 // remoteNode is optional - if provided, it will be stored in pending handshakes for WHOAREYOU responses.
 func (h *Handler) SendMessage(msg Message, remoteID node.ID, to *net.UDPAddr, remoteNode *node.Node) error {
-	// Look up session
-	sess := h.config.Sessions.Get(remoteID)
-
-	var packetBytes []byte
-	var err error
-
-	if sess == nil {
-		// No session - send random packet to trigger WHOAREYOU from receiver
-
-		// Store pending message for handshake completion
-		// Include the node object if we have it (needed for handshake)
-		handshakeKey := makeHandshakeKey(remoteID, to)
-		now := time.Now()
-		pending := &PendingHandshake{
-			Message:    msg,
-			ToNode:     remoteNode,
-			ToAddr:     to,
-			ToNodeID:   remoteID,
-			CreatedAt:  now,
-			LastRetry:  now,
-			RetryCount: 0,
-			MaxRetries: 3, // Retry up to 3 times before giving up
-		}
-
-		h.mu.Lock()
-		accepted := h.addPendingHandshake(handshakeKey, pending)
-		h.mu.Unlock()
-
-		if !accepted {
-			return fmt.Errorf("pending handshake limit reached")
-		}
-
-		// Log if we don't have node info for potential handshake
-		if remoteNode == nil {
-			h.config.Logger.WithField("remoteID", remoteID).Debug("handler: sending random packet without node info, may fail handshake if WHOAREYOU received")
-		}
-
-		// Encode random packet (go-ethereum style)
-		// This will be 91 bytes: IV(16) + header(23) + authdata(32) + random(20)
-		packetBytes, err = EncodeRandomPacket(h.config.LocalNode.ID(), remoteID)
-		if err != nil {
-			return fmt.Errorf("failed to encode random packet: %w", err)
-		}
-	} else {
-		// Have session - encrypt and send normally
-
-		// Encode message plaintext: message-type (1 byte) + RLP-encoded message
-		msgBytes, err := msg.Encode()
-		if err != nil {
-			return fmt.Errorf("failed to encode message: %w", err)
-		}
-
-		// Build plaintext: message type + message data
-		plaintext := make([]byte, 1+len(msgBytes))
-		plaintext[0] = msg.Type()
-		copy(plaintext[1:], msgBytes)
-
-		// Generate nonce
-		nonce, err := crypto.GenerateRandomBytes(12)
-		if err != nil {
-			return fmt.Errorf("failed to generate nonce: %w", err)
-		}
-
-		// Get local node ID
-		localNodeID := h.config.LocalNode.ID()
-
-		// Authdata for ordinary message with session: srcID (32 bytes)
-		authdata := localNodeID[:]
-
-		// Build unmasked header data for GCM authentication
-		// This returns: maskingIV, unmasked headerData (IV || header || authdata)
-		maskingIV, headerData, err := BuildOrdinaryHeaderData(localNodeID, nonce, authdata)
-		if err != nil {
-			return fmt.Errorf("failed to build header data: %w", err)
-		}
-
-		// Encrypt message using session key
-		// GCM uses unmasked headerData as additional authenticated data
-		ciphertext, err := session.EncryptMessage(sess.EncryptionKey(), nonce, headerData, plaintext)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt message: %w", err)
-		}
-
-		// Now encode the full packet with the encrypted message
-		// This uses the same maskingIV to ensure consistency
-		packetBytes, err = EncodeOrdinaryPacket(localNodeID, remoteID, maskingIV, nonce, authdata, ciphertext)
-		if err != nil {
-			return fmt.Errorf("failed to encode ordinary packet: %w", err)
-		}
-	}
-
-	// Send via UDP transport
-	h.mu.RLock()
-	transport := h.transport
-	h.mu.RUnlock()
-
-	if transport == nil {
-		return fmt.Errorf("transport not initialized")
-	}
-
-	if err := transport.SendTo(packetBytes, to); err != nil {
-		return fmt.Errorf("failed to send packet: %w", err)
-	}
-
-	h.mu.Lock()
-	h.packetsSent++
-	h.mu.Unlock()
-
-	h.config.Logger.WithFields(logrus.Fields{
-		"type":   msg.Type(),
-		"to":     to,
-		"nodeID": remoteID,
-		"size":   len(packetBytes),
-	}).Trace("sent message")
-
-	return nil
+	return h.SendMessageFrom(msg, remoteID, to, remoteNode, nil)
 }
 
 // SendMessageFrom sends a message to a remote node from a specific local address.
@@ -1351,6 +1270,10 @@ func (h *Handler) SendMessageFrom(msg Message, remoteID node.ID, to *net.UDPAddr
 		if err != nil {
 			return fmt.Errorf("failed to encode ordinary packet: %w", err)
 		}
+
+		// Remembered so a WHOAREYOU quoting this nonce can be told apart from a
+		// forged one; answering a forged challenge would replace the session keys.
+		sess.RecordSentNonce(nonce)
 	}
 
 	// Send via UDP transport from the specified local address
@@ -1627,11 +1550,15 @@ func (h *Handler) SendPing(n *node.Node) (<-chan *Response, error) {
 		ENRSeq:    h.config.LocalNode.Record().Seq(),
 	}
 
+	// One read of the address for both the record and the send: a newer ENR can
+	// move it in between, and the endpoint proof needs them to agree.
+	destAddr := n.Addr()
+
 	// Register pending request (store message and node for replay if session becomes stale)
-	respChan := h.requests.AddRequest(requestID, n, ping)
+	respChan := h.requests.AddRequest(requestID, n, ping, destAddr)
 
 	// Send PING (pass node object so it's available for handshake if needed)
-	if err := h.SendMessage(ping, n.ID(), n.Addr(), n); err != nil {
+	if err := h.SendMessage(ping, n.ID(), destAddr, n); err != nil {
 		h.config.Logger.WithFields(logrus.Fields{
 			"to":     n.Addr(),
 			"nodeID": n.ID(),
@@ -1800,11 +1727,13 @@ func (h *Handler) SendFindNode(n *node.Node, distances []uint) (<-chan *Response
 		Distances: distances,
 	}
 
+	destAddr := n.Addr()
+
 	// Register pending request (store message and node for replay if session becomes stale)
-	respChan := h.requests.AddRequest(requestID, n, findNode)
+	respChan := h.requests.AddRequest(requestID, n, findNode, destAddr)
 
 	// Send FINDNODE (pass node object so it's available for handshake if needed)
-	if err := h.SendMessage(findNode, n.ID(), n.Addr(), n); err != nil {
+	if err := h.SendMessage(findNode, n.ID(), destAddr, n); err != nil {
 		h.config.Logger.WithFields(logrus.Fields{
 			"to":        n.Addr(),
 			"nodeID":    n.ID(),

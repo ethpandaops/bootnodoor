@@ -22,7 +22,7 @@ func TestResolveHandshakeSender(t *testing.T) {
 		t.Fatalf("create node: %v", err)
 	}
 
-	encoded, err := record.EncodeRLP()
+	encoded, err := record.EncodeRLPBytes()
 	if err != nil {
 		t.Fatalf("encode record: %v", err)
 	}

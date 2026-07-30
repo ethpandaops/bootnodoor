@@ -112,6 +112,12 @@ type Config struct {
 	// EnableDiscv5 enables Discovery v5 protocol (default: true)
 	EnableDiscv5 bool
 
+	// ServeAll disables EL/CL classification and fork-ID/digest filtering. Every
+	// discovered node is pooled (into every enabled table) and served to every
+	// requester, turning the bootnode into a plain discv5 rendezvous that relays
+	// all peers regardless of eth/eth2 fields. Default: false (classify + filter).
+	ServeAll bool
+
 	// SessionLifetime is the discv5 session lifetime (default: 12 hours)
 	SessionLifetime time.Duration
 
@@ -120,7 +126,9 @@ type Config struct {
 
 	// Discovery configuration
 
-	// EnableIPDiscovery enables automatic IP discovery from PONG responses (default: false)
+	// EnableIPDiscovery enables automatic IP discovery from PONG responses
+	// (default: true). An explicitly configured ENRIP/ENRIP6 is never overridden
+	// by discovery regardless of this setting.
 	EnableIPDiscovery bool
 
 	// GracePeriod is the grace period for accepting old fork digests (default: 60 minutes)
@@ -151,7 +159,7 @@ func DefaultConfig() *Config {
 		EnableDiscv5:      true,
 		SessionLifetime:   12 * time.Hour,
 		MaxSessions:       1024,
-		EnableIPDiscovery: false,
+		EnableIPDiscovery: true,
 		GracePeriod:       60 * time.Minute,
 	}
 }

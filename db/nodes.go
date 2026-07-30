@@ -107,6 +107,14 @@ func (d *Database) CountNodes(layer NodeLayer) (int, error) {
 	return count, err
 }
 
+// GetNodeIDs returns the node IDs persisted for a specific layer.
+func (d *Database) GetNodeIDs(layer NodeLayer) ([][]byte, error) {
+	d.trackQuery()
+	var ids [][]byte
+	err := d.ReaderDb.Select(&ids, "SELECT nodeid FROM nodes WHERE layer = $1", string(layer))
+	return ids, err
+}
+
 // CountAllNodes returns the total number of nodes (all layers).
 func (d *Database) CountAllNodes() (int, error) {
 	d.trackQuery()
@@ -134,13 +142,15 @@ func (d *Database) UpsertNode(tx *sqlx.Tx, node *Node) error {
 	_, err := tx.Exec(`
 		INSERT INTO nodes (nodeid, layer, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active, enr, has_v4, has_v5, success_count, failure_count, avg_rtt)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-		ON CONFLICT(nodeid) DO UPDATE SET
+		ON CONFLICT(nodeid, layer) DO UPDATE SET
 			ip = excluded.ip,
 			ipv6 = excluded.ipv6,
 			port = excluded.port,
 			seq = excluded.seq,
 			fork_digest = excluded.fork_digest,
 			last_seen = excluded.last_seen,
+			-- COALESCE so a caller without a timestamp cannot blank a stored one.
+			last_active = COALESCE(excluded.last_active, nodes.last_active),
 			enr = excluded.enr,
 			has_v4 = excluded.has_v4,
 			has_v5 = excluded.has_v5,
@@ -159,7 +169,7 @@ func (d *Database) UpdateNodeENR(tx *sqlx.Tx, layer NodeLayer, nodeID []byte, ip
 	_, err := tx.Exec(`
 		INSERT INTO nodes (nodeid, layer, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active, enr, has_v4, has_v5, success_count, failure_count, avg_rtt)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, $9, $10, $11, 0, 0, 0)
-		ON CONFLICT(nodeid) DO UPDATE SET
+		ON CONFLICT(nodeid, layer) DO UPDATE SET
 			ip = excluded.ip,
 			ipv6 = excluded.ipv6,
 			port = excluded.port,

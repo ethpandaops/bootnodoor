@@ -109,8 +109,11 @@ func (c *Cache) Put(session *Session) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Check if we need to evict
-	if len(c.sessions) >= c.maxSessions {
+	// Replacing an existing key frees no slot, so only evict when this Put grows
+	// the map. Handshake recovery replaces a retained session by node ID; without
+	// this check it would evict an unrelated live peer and leave the map short.
+	_, replacing := c.sessions[session.RemoteID]
+	if !replacing && len(c.sessions) >= c.maxSessions {
 		// Find and remove the least recently used session
 		c.evictLRU()
 	}
@@ -118,7 +121,7 @@ func (c *Cache) Put(session *Session) {
 	// Store the session
 	c.sessions[session.RemoteID] = session
 
-	c.logger.WithField("nodeID", session.RemoteID).WithField("addr", session.RemoteAddr).WithField("lifetime", c.sessionLifetime).Trace("cached new session")
+	c.logger.WithField("nodeID", session.RemoteID).WithField("addr", session.Addr()).WithField("lifetime", c.sessionLifetime).Trace("cached new session")
 }
 
 // Delete removes a session from the cache.
@@ -216,7 +219,7 @@ func (c *Cache) GetByAddr(addr *net.UDPAddr) *Session {
 	defer c.mu.RUnlock()
 
 	for _, session := range c.sessions {
-		if session.RemoteAddr.String() == addr.String() {
+		if session.Addr().String() == addr.String() {
 			if !session.IsExpired() {
 				session.Touch()
 				return session

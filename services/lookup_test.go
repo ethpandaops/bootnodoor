@@ -288,7 +288,11 @@ func TestPingServiceStatsRace(t *testing.T) {
 			defer writers.Done()
 			for j := 0; j < 200; j++ {
 				ps.countPingSent()
-				ps.countProtocol(j%2 == 0)
+				if j%2 == 0 {
+					ps.countV5Ping()
+				} else {
+					ps.countV4Ping()
+				}
 				ps.countPong(time.Millisecond)
 				ps.countTimeout()
 			}

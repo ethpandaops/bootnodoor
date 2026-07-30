@@ -39,7 +39,7 @@ func TestGetOrCreateNodeRespectsMaxNodes(t *testing.T) {
 
 	for i := 0; i < maxNodes*5; i++ {
 		pub, id := makeNodeID(t)
-		h.getOrCreateNode(id, pub, testAddr())
+		h.lookupOrCreateNode(id, pub, testAddr())
 	}
 
 	if got := len(h.AllNodes()); got != maxNodes {
@@ -56,11 +56,11 @@ func TestCleanupEvictsStaleUnbondedNodes(t *testing.T) {
 	h := NewHandler(ctx, HandlerConfig{MaxNodes: 1000, NodeTTL: 20 * time.Millisecond}, nil)
 
 	pubStale, idStale := makeNodeID(t)
-	h.getOrCreateNode(idStale, pubStale, testAddr())
+	h.lookupOrCreateNode(idStale, pubStale, testAddr())
 
 	pubBonded, idBonded := makeNodeID(t)
-	bonded := h.getOrCreateNode(idBonded, pubBonded, testAddr())
-	bonded.MarkPongReceived(time.Hour) // establish a live bond
+	bonded := h.lookupOrCreateNode(idBonded, pubBonded, testAddr())
+	bonded.MarkPongReceived(time.Hour, testAddr()) // establish a live bond
 
 	time.Sleep(40 * time.Millisecond) // age both past NodeTTL
 
@@ -84,7 +84,7 @@ func TestCleanupReclaimsFloodedNodes(t *testing.T) {
 
 	for i := 0; i < 500; i++ {
 		pub, id := makeNodeID(t)
-		h.getOrCreateNode(id, pub, testAddr())
+		h.lookupOrCreateNode(id, pub, testAddr())
 	}
 	if got := len(h.AllNodes()); got != 500 {
 		t.Fatalf("setup: expected 500 tracked nodes, got %d", got)

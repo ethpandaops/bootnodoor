@@ -4,6 +4,7 @@ import (
 	"time"
 
 	v4protocol "github.com/ethpandaops/bootnodoor/discv4/protocol"
+	"github.com/ethpandaops/bootnodoor/discv5/session"
 	"github.com/ethpandaops/bootnodoor/services"
 	"github.com/ethpandaops/bootnodoor/transport"
 )
@@ -18,26 +19,17 @@ type Stats struct {
 	Discv5   Discv5Stats
 	Discv4   v4protocol.HandlerStats
 	HasV4    bool
-	Sessions SessionStats
+	Sessions session.Stats
 	Packets  transport.MetricsSnapshot
 }
 
-// Discv5Stats is the per-identity discv5 handler counters, summed.
+// Discv5Stats is the deliberate subset of protocol.HandlerStats the web UI renders, summed per identity.
 type Discv5Stats struct {
-	PacketsReceived   int
-	PacketsSent       int
 	InvalidPackets    int
 	FilteredResponses int
 	FindNodeReceived  int
 	PendingHandshakes int
 	PendingChallenges int
-}
-
-// SessionStats is the discv5 session cache totals, summed per identity.
-type SessionStats struct {
-	Total   int
-	Active  int
-	Expired int
 }
 
 // GetStats returns a snapshot of the service's discovery counters.
@@ -69,17 +61,18 @@ func (s *Service) GetStats() Stats {
 			out.Ping.PingTimeouts += p.PingTimeouts
 			out.Ping.PingsV5 += p.PingsV5
 			out.Ping.PingsV4 += p.PingsV4
-			if p.AverageRTT > 0 {
-				totalRTT += p.AverageRTT
-				rttSamples++
+			// Weight by the sample count behind each average: EL and CL rarely
+			// answer the same number of pings, and averaging the averages would
+			// let the quieter identity move the aggregate as much as the busier one.
+			if p.AverageRTT > 0 && p.PongsReceived > 0 {
+				totalRTT += p.AverageRTT * time.Duration(p.PongsReceived)
+				rttSamples += p.PongsReceived
 			}
 		}
 
 		if id.discv5Service != nil {
 			if h := id.discv5Service.Handler(); h != nil {
 				d := h.GetStats()
-				out.Discv5.PacketsReceived += d.PacketsReceived
-				out.Discv5.PacketsSent += d.PacketsSent
 				out.Discv5.InvalidPackets += d.InvalidPackets
 				out.Discv5.FilteredResponses += d.FilteredResponses
 				out.Discv5.FindNodeReceived += d.FindNodeReceived
@@ -107,6 +100,8 @@ func (s *Service) GetStats() Stats {
 			out.Packets.SendErrors += m.SendErrors
 			out.Packets.ReceiveErrors += m.ReceiveErrors
 			out.Packets.RateLimited += m.RateLimited
+			out.Packets.PacketsFellThrough += m.PacketsFellThrough
+			out.Packets.PacketsUnhandled += m.PacketsUnhandled
 		}
 	}
 

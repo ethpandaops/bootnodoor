@@ -2,6 +2,7 @@ package session
 
 import (
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -20,8 +21,10 @@ type Session struct {
 	// RemoteID is the node ID of the remote peer
 	RemoteID node.ID
 
-	// RemoteAddr is the network address of the remote peer
-	RemoteAddr *net.UDPAddr
+	// remoteAddr is the network address of the remote peer. Unexported because it
+	// is mutated by UpdateAddr under mu while packets are handled concurrently;
+	// read it through Addr().
+	remoteAddr *net.UDPAddr
 
 	// Node is the full node information (ENR, etc.)
 	// This allows protocol operations to access node data without a separate table lookup
@@ -41,6 +44,9 @@ type Session struct {
 
 	// LastUsed is the last time this session was used
 	LastUsed time.Time
+
+	// sentNonces holds the nonces of recent ordinary packets we sent, oldest first.
+	sentNonces []string
 
 	// mu protects mutable fields
 	mu sync.RWMutex
@@ -69,7 +75,7 @@ func NewSession(
 
 	return &Session{
 		RemoteID:    remoteID,
-		RemoteAddr:  remoteAddr,
+		remoteAddr:  remoteAddr,
 		Keys:        keys,
 		IsInitiator: isInitiator,
 		CreatedAt:   now,
@@ -109,14 +115,62 @@ func (s *Session) SetNode(n *node.Node) {
 	s.Node = n
 }
 
+// maxSentNonces bounds the remembered nonces. A WHOAREYOU answers a packet we
+// sent moments ago, so the window only has to cover the traffic we can send to
+// one peer within a request lifetime; sized well above that, because being too
+// small silently drops a legitimate peer's restart recovery until its next
+// packet, while being generous costs a few hundred bytes per session.
+const maxSentNonces = 64
+
+// RecordSentNonce remembers the nonce of an ordinary packet we sent on this
+// session, so a WHOAREYOU claiming to answer it can be verified.
+func (s *Session) RecordSentNonce(nonce []byte) {
+	if len(nonce) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.sentNonces = append(s.sentNonces, string(nonce))
+	if len(s.sentNonces) > maxSentNonces {
+		s.sentNonces = s.sentNonces[1:]
+	}
+}
+
+// SentNonce reports whether nonce belongs to a packet we sent on this session.
+//
+// WHOAREYOU is unauthenticated, and answering one replaces this session's keys,
+// so a forged challenge must not be able to reach that path. Only a peer that
+// actually received one of our packets can quote its nonce back.
+func (s *Session) SentNonce(nonce []byte) bool {
+	if len(nonce) == 0 {
+		return false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return slices.Contains(s.sentNonces, string(nonce))
+}
+
+// Addr returns the remote address for this session.
+func (s *Session) Addr() *net.UDPAddr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.remoteAddr
+}
+
 // UpdateAddr updates the remote address for this session.
 //
-// This is called when we detect that a node has moved to a different IP address.
+// Only call this once the sender is authenticated: an unauthenticated packet
+// naming this node ID must not be able to steer where the session points.
 func (s *Session) UpdateAddr(addr *net.UDPAddr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.RemoteAddr = addr
+	s.remoteAddr = addr
 }
 
 // GetNode returns the node reference for this session.
@@ -181,14 +235,13 @@ func (s *Session) TimeUntilExpiry() time.Duration {
 
 // String returns a human-readable representation of the session.
 func (s *Session) String() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	role := "recipient"
 	if s.IsInitiator {
 		role = "initiator"
 	}
 
+	// Age and IdleTime take the read lock themselves; holding it here as well
+	// would be a recursive RLock, which deadlocks if a writer queues in between.
 	return "Session{" +
 		"RemoteID: " + s.RemoteID.String() +
 		", Role: " + role +

@@ -21,7 +21,11 @@ func TestDeliverResponseNeverBlocks(t *testing.T) {
 	h, cancel := newTestHandler(t)
 	defer cancel()
 
-	req := h.addPendingRequest([]byte("reqhash"), nil, PingPacket)
+	dest := makeDiscv4Node(t)
+	req, err := h.addPendingRequest([]byte("reqhash"), dest, PingPacket, dest.Addr())
+	if err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
 
 	const dups = 200
 	var wg sync.WaitGroup
@@ -63,7 +67,11 @@ func TestDuplicateResponsesWaiterGetsOneNoLeak(t *testing.T) {
 	defer cancel()
 
 	hash := []byte("reqhash")
-	req := h.addPendingRequest(hash, nil, PingPacket)
+	to := makeDiscv4Node(t)
+	req, err := h.addPendingRequest(hash, to, PingPacket, to.Addr())
+	if err != nil {
+		t.Fatalf("addPendingRequest: %v", err)
+	}
 
 	got := make(chan interface{}, 1)
 	var waiter sync.WaitGroup
@@ -71,7 +79,7 @@ func TestDuplicateResponsesWaiterGetsOneNoLeak(t *testing.T) {
 	go func() {
 		defer waiter.Done()
 		resp := <-req.ResponseChan
-		h.removePendingRequest(string(hash))
+		h.removePendingRequest(req)
 		got <- resp
 	}()
 
@@ -81,7 +89,7 @@ func TestDuplicateResponsesWaiterGetsOneNoLeak(t *testing.T) {
 	for i := 0; i < dups; i++ {
 		go func() {
 			defer wg.Done()
-			if r := h.getPendingRequest(string(hash)); r != nil {
+			for _, r := range h.pendingRequestsFrom(hash, to.ID(), to.Addr(), PingPacket) {
 				h.deliverResponse(r, "pong")
 			}
 		}()

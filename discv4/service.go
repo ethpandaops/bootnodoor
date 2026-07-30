@@ -32,6 +32,7 @@ type Transport interface {
 	protocol.Transport
 	LocalAddr() *net.UDPAddr
 	AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
+	AddHandlerFor(protocol string, handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
 }
 
 // Service represents a discv4 service instance.
@@ -125,7 +126,7 @@ func New(config *Config, transport Transport) (*Service, error) {
 	}
 
 	// Register packet handler with transport
-	transport.AddHandler(s.packetHandler)
+	transport.AddHandlerFor("discv4", s.packetHandler)
 
 	return s, nil
 }
@@ -380,22 +381,6 @@ func (s *Service) Handler() *protocol.Handler {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.handler
-}
-
-// Statistics
-
-// Stats returns service statistics.
-func (s *Service) Stats() map[string]interface{} {
-	handler := s.Handler()
-	if handler == nil {
-		return map[string]interface{}{}
-	}
-
-	stats := handler.Stats()
-
-	// Note: Transport stats are not included since transport is managed externally
-
-	return stats
 }
 
 // Utility Methods

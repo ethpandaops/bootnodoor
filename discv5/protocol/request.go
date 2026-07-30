@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"net"
 	"sync"
 	"time"
 
@@ -40,6 +41,11 @@ type PendingRequest struct {
 
 	// Message is the original message that was sent (for replay after re-handshake)
 	Message Message
+
+	// DestAddr is the address this request was sent to, captured at send time.
+	// Node.Addr() cannot verify a response's origin because a newer ENR moves it,
+	// including one supplied by the peer being verified.
+	DestAddr *net.UDPAddr
 
 	// Timeout is when the request expires
 	Timeout time.Time
@@ -101,8 +107,12 @@ func NewRequestTracker(timeout time.Duration) *RequestTracker {
 //
 // The message and node parameters are stored for replay if the session becomes stale.
 //
+// destAddr must be the address the caller sends this request to, captured once:
+// n.Addr() is derived from the ENR and moves when a newer record arrives, so
+// reading it again at send time can record an endpoint the request never went to.
+//
 // Returns a channel that will receive the response or timeout.
-func (rt *RequestTracker) AddRequest(requestID []byte, n *node.Node, msg Message) <-chan *Response {
+func (rt *RequestTracker) AddRequest(requestID []byte, n *node.Node, msg Message, destAddr *net.UDPAddr) <-chan *Response {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
@@ -113,6 +123,7 @@ func (rt *RequestTracker) AddRequest(requestID []byte, n *node.Node, msg Message
 		NodeID:       n.ID(),
 		Node:         n,
 		Message:      msg,
+		DestAddr:     destAddr,
 		Timeout:      now.Add(rt.timeout),
 		ResponseChan: make(chan *Response, 1),
 		Retries:      0,
@@ -129,22 +140,52 @@ func (rt *RequestTracker) AddRequest(requestID []byte, n *node.Node, msg Message
 	return req.ResponseChan
 }
 
+// respondsTo reports whether resp is the response type request expects.
+//
+// An unknown request type matches nothing: a new request/response pair must be
+// registered here deliberately rather than defaulting to accepting any reply.
+func respondsTo(request, resp Message) bool {
+	if request == nil || resp == nil {
+		return false
+	}
+
+	switch request.Type() {
+	case PingMsg:
+		return resp.Type() == PongMsg
+	case FindNodeMsg:
+		return resp.Type() == NodesMsg
+	case TalkReqMsg:
+		return resp.Type() == TalkRespMsg
+	default:
+		return false
+	}
+}
+
 // MatchResponse matches a response to a pending request.
 //
-// Returns true if the request was matched and notified.
-func (rt *RequestTracker) MatchResponse(requestID []byte, nodeID node.ID, msg Message) bool {
+// Returns the matched request, or nil if there was none. Callers that gate a side
+// effect on where the request was sent need DestAddr from the result.
+func (rt *RequestTracker) MatchResponse(requestID []byte, nodeID node.ID, msg Message) *PendingRequest {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 
 	key := string(requestID)
 	req, exists := rt.requests[key]
 	if !exists {
-		return false
+		return nil
 	}
 
 	// Verify node ID matches
 	if req.NodeID != nodeID {
-		return false
+		return nil
+	}
+
+	// The response must be the kind this request asked for. Request IDs are ours
+	// but the peer learns them, so without this a PONG can match a pending
+	// FINDNODE: it would both fire the PONG side effects and consume the entry
+	// below, silently stranding the lookup that was waiting on it.
+	if !respondsTo(req.Message, msg) {
+		return nil
 	}
 
 	// Handle multi-packet NODES responses
@@ -166,7 +207,7 @@ func (rt *RequestTracker) MatchResponse(requestID []byte, nodeID node.ID, msg Me
 
 		// If we haven't received all packets yet, keep waiting
 		if req.ReceivedCount < req.ExpectedTotal {
-			return true
+			return req
 		}
 
 		// All packets received, send accumulated response
@@ -189,7 +230,7 @@ func (rt *RequestTracker) MatchResponse(requestID []byte, nodeID node.ID, msg Me
 	delete(rt.requests, key)
 	close(req.ResponseChan)
 
-	return true
+	return req
 }
 
 // handleTimeout handles request timeout.

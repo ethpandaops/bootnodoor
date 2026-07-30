@@ -3,7 +3,9 @@ package bootnode
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -66,6 +68,12 @@ type Service struct {
 	// ENR request tracking (prevents duplicate requests)
 	pendingENRRequestsV4 sync.Map // map[node.ID]time.Time
 
+	// v5ProbeSem bounds concurrent v5 capability probes
+	v5ProbeSem chan struct{}
+
+	// v5ProbesInFlight keeps one probe per node in flight
+	v5ProbesInFlight sync.Map // map[[32]byte]struct{}
+
 	// Lifecycle
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -104,9 +112,10 @@ func New(cfg *Config) (*Service, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Service{
-		config: cfg,
-		ctx:    ctx,
-		cancel: cancel,
+		config:     cfg,
+		ctx:        ctx,
+		cancel:     cancel,
+		v5ProbeSem: make(chan struct{}, maxConcurrentV5Probes),
 	}
 
 	// Resolve discovery identities (one shared, or separate EL/CL keys).
@@ -120,13 +129,23 @@ func New(cfg *Config) (*Service, error) {
 			t.Close()
 		}
 	}
+
+	// Everything created below hangs off s.ctx (NodeDB queue processors,
+	// protocol-handler cleanup goroutines), so cancelling tears it all down.
+	ok := false
+	defer func() {
+		if !ok {
+			cancel()
+			closeTransports()
+		}
+	}()
+
 	for _, id := range s.identities {
 		if transports[id.bindPort] == nil {
 			// JoinHostPort so an IPv6 bind addr becomes [::]:port, not :::port.
 			listenAddr := net.JoinHostPort(cfg.BindIP.String(), fmt.Sprintf("%d", id.bindPort))
 			t, terr := transport.NewUDPTransport(&transport.Config{ListenAddr: listenAddr, Logger: cfg.Logger})
 			if terr != nil {
-				closeTransports()
 				return nil, fmt.Errorf("failed to create UDP transport on port %d: %w", id.bindPort, terr)
 			}
 			cfg.Logger.WithField("address", listenAddr).Info("listening for discovery")
@@ -143,7 +162,6 @@ func New(cfg *Config) (*Service, error) {
 
 		localNode, nerr := createLocalNode(cfg, id.key, id.enrIP, id.enrIP6, id.enrPort, storedENR)
 		if nerr != nil {
-			closeTransports()
 			return nil, fmt.Errorf("failed to create local node: %w", nerr)
 		}
 		id.localNode = localNode
@@ -154,10 +172,14 @@ func New(cfg *Config) (*Service, error) {
 
 		id.enrManager = NewENRManager(cfg, id.key, localNode, id.servesEL, id.servesCL)
 		headBlock, headTime := StaticHead()
-		if uerr := id.enrManager.UpdateENR(headBlock, headTime); uerr != nil {
+		changed, uerr := id.enrManager.UpdateENR(headBlock, headTime)
+		switch {
+		case uerr != nil:
 			cfg.Logger.WithError(uerr).Warn("failed to update ENR with eth/eth2 fields")
-		} else if serr := s.storeENR(id.storeKey, localNode.Record()); serr != nil {
-			cfg.Logger.WithError(serr).Warn("failed to store updated ENR")
+		case changed:
+			if serr := s.storeENR(id.storeKey, localNode.Record()); serr != nil {
+				cfg.Logger.WithError(serr).Warn("failed to store updated ENR")
+			}
 		}
 	}
 
@@ -166,16 +188,19 @@ func New(cfg *Config) (*Service, error) {
 	s.localNode = primary.localNode
 	s.enrManager = primary.enrManager
 
-	// Create IP discovery service
-	ipDiscoveryCfg := services.IPDiscoveryConfig{
-		MinReports:     5, // Require 5 reports
-		MinDistinctIPs: 3, // From at least 3 distinct IPs
-		Logger:         cfg.Logger,
-		OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
-			s.updateENRWithDiscoveredIP(ip, port, isIPv6)
-		},
+	// Create IP discovery service. Leaving it nil when disabled is the whole
+	// enforcement: onPongReceived already returns early on a nil service, so no
+	// peer report can reach consensus and rewrite the ENR.
+	if cfg.EnableIPDiscovery {
+		s.ipDiscovery = services.NewIPDiscovery(services.IPDiscoveryConfig{
+			MinReports:     5, // Require 5 reports
+			MinDistinctIPs: 3, // From at least 3 distinct IPs
+			Logger:         cfg.Logger,
+			OnConsensusReached: func(ip net.IP, port uint16, isIPv6 bool) {
+				s.updateENRWithDiscoveredIP(ip, port, isIPv6)
+			},
+		})
 	}
-	s.ipDiscovery = services.NewIPDiscovery(ipDiscoveryCfg)
 
 	// Create node databases for enabled layers
 	var err error
@@ -191,14 +216,12 @@ func New(cfg *Config) (*Service, error) {
 	if cfg.HasEL() {
 		s.elTable, err = s.createTable(s.elIdentity().localNode.ID(), s.elNodeDB, "EL")
 		if err != nil {
-			closeTransports()
 			return nil, fmt.Errorf("failed to create EL table: %w", err)
 		}
 	}
 	if cfg.HasCL() {
 		s.clTable, err = s.createTable(s.clIdentity().localNode.ID(), s.clNodeDB, "CL")
 		if err != nil {
-			closeTransports()
 			return nil, fmt.Errorf("failed to create CL table: %w", err)
 		}
 	}
@@ -207,7 +230,6 @@ func New(cfg *Config) (*Service, error) {
 	if cfg.EnableDiscv5 {
 		for _, id := range s.identities {
 			if ierr := s.initDiscv5(id); ierr != nil {
-				closeTransports()
 				return nil, fmt.Errorf("failed to initialize discv5: %w", ierr)
 			}
 		}
@@ -217,12 +239,6 @@ func New(cfg *Config) (*Service, error) {
 	// Create the discv4 service (EL-only) on the EL identity.
 	if cfg.EnableDiscv4 {
 		if ierr := s.initDiscv4(s.elIdentity()); ierr != nil {
-			for _, id := range s.identities {
-				if id.discv5Service != nil {
-					id.discv5Service.Stop()
-				}
-			}
-			closeTransports()
 			return nil, fmt.Errorf("failed to initialize discv4: %w", ierr)
 		}
 	}
@@ -253,84 +269,8 @@ func New(cfg *Config) (*Service, error) {
 			Layer:         db.LayerEL,
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) services.AdmissionResult {
-				// Filter by fork ID before adding to table
-				if n.Record() != nil && s.enrManager != nil {
-					isEL, forkID := s.enrManager.FilterELNode(n.Record())
-					if !isEL {
-						// A record with no eth entry is a consensus node, not an
-						// execution node on the wrong fork. Counting those as
-						// fork rejections would make a healthy dual-layer network
-						// look like a fork-compatibility failure.
-						if !n.Record().Has("eth") {
-							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "not_el"); err != nil {
-								cfg.Logger.WithError(err).Debug("failed to store bad node")
-							}
-							return services.AdmissionRejectedLayer
-						}
-						if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-							elFilter.RecordAdmission(false, forkID)
-						}
-						cfg.Logger.WithFields(logrus.Fields{
-							"peerID": n.PeerID(),
-							"eth":    forkID.String(),
-						}).Debug("EL lookup admission rejected: incompatible fork id")
-						// Mark as bad node
-						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerEL, "invalid_fork_id"); err != nil {
-							cfg.Logger.WithError(err).Debug("failed to store bad node")
-						}
-						return services.AdmissionRejectedFilter
-					}
-					if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-						elFilter.RecordAdmission(true, forkID)
-					}
-				}
-
-				// If node was discovered via v4 (only has v4 support), immediately test for v5 support
-				if n.HasV4() && !n.HasV5() && s.getV5Handler() != nil {
-					record := n.Record()
-					if record != nil {
-						// Try to create v5 node from ENR
-						v5Node, err := nodes.NewV5NodeFromRecord(record)
-						if err == nil && s.getV5Handler() != nil {
-							// Ping on v5 to test support
-							start := time.Now()
-							respChan, err := s.getV5Handler().SendPing(v5Node)
-							if err == nil {
-								resp := <-respChan
-								rtt := time.Since(start)
-								if resp.Error == nil {
-									// v5 ping succeeded - add v5 support
-									n.SetV5(v5Node)
-									cfg.Logger.WithFields(logrus.Fields{
-										"peerID": n.PeerID(),
-										"addr":   n.Addr(),
-										"rtt":    rtt,
-									}).Debug("discovered v5 support on v4-discovered node")
-
-									// Queue protocol support update (SetV5 already marked it dirty)
-									if s.elNodeDB != nil {
-										if err := s.elNodeDB.QueueUpdate(n); err != nil {
-											cfg.Logger.WithError(err).Debug("failed to queue node for protocol support update")
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-
-				// Attempt to add to EL table
-				if !s.elTable.Add(n) {
-					return services.AdmissionRejectedPool
-				}
-				// Remove from bad nodes list if it was previously bad
-				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerEL); err != nil {
-					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-				}
-				return services.AdmissionAccepted
-			},
-			Logger: cfg.Logger.WithField("service", "el-lookup"),
+			OnNodeFound:   s.admitELLookupNode,
+			Logger:        cfg.Logger.WithField("service", "el-lookup"),
 		})
 	}
 
@@ -356,38 +296,12 @@ func New(cfg *Config) (*Service, error) {
 			Layer:         db.LayerCL,
 			Alpha:         3,
 			LookupTimeout: 30 * time.Second,
-			OnNodeFound: func(n *nodes.Node) services.AdmissionResult {
-				// Filter by fork digest before adding to table
-				if n.Record() != nil && s.enrManager != nil {
-					if !s.enrManager.FilterCLNode(n.Record()) {
-						// No eth2 entry means an execution node, not a consensus
-						// node on the wrong digest; keep the two distinguishable.
-						if !n.Record().Has("eth2") {
-							if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "not_cl"); err != nil {
-								cfg.Logger.WithError(err).Debug("failed to store bad node")
-							}
-							return services.AdmissionRejectedLayer
-						}
-						// Mark as bad node
-						if err := cfg.Database.StoreBadNode(n.IDBytes(), db.LayerCL, "invalid_fork_digest"); err != nil {
-							cfg.Logger.WithError(err).Debug("failed to store bad node")
-						}
-						return services.AdmissionRejectedFilter
-					}
-				}
-				// Attempt to add to CL table
-				if !s.clTable.Add(n) {
-					return services.AdmissionRejectedPool
-				}
-				// Remove from bad nodes list if it was previously bad
-				if err := cfg.Database.RemoveBadNode(n.IDBytes(), db.LayerCL); err != nil {
-					cfg.Logger.WithError(err).Debug("failed to remove from bad nodes")
-				}
-				return services.AdmissionAccepted
-			},
-			Logger: cfg.Logger.WithField("service", "cl-lookup"),
+			OnNodeFound:   s.admitCLLookupNode,
+			Logger:        cfg.Logger.WithField("service", "cl-lookup"),
 		})
 	}
+
+	ok = true
 
 	return s, nil
 }
@@ -437,9 +351,8 @@ func (s *Service) initDiscv4(id *identity) error {
 	discv4Config.OnNodeSeen = func(n *v4node.Node, timestamp time.Time) {
 		s.onNodeSeenV4(n, timestamp)
 	}
-	discv4Config.OnPongReceived = func(from *v4node.Node, ip net.IP, port uint16) {
-		sourceIP := from.Addr().IP
-		s.onPongReceived(from.IDBytes(), sourceIP, ip, port)
+	discv4Config.OnPongReceived = func(from *v4node.Node, provenAddr *net.UDPAddr, ip net.IP, port uint16) {
+		s.onPongReceived(from.IDBytes(), provenAddr.IP, ip, port)
 	}
 	// OnENRRequest: discv4 service handles this internally using LocalENR from config
 	// No callback needed - it will automatically respond with the ENR
@@ -633,7 +546,14 @@ func (s *Service) maintenanceLoop() {
 	supportCheck := time.NewTicker(30 * time.Minute)     // Check protocol support every 30 minutes
 	badNodesCleanup := time.NewTicker(24 * time.Hour)    // Cleanup bad nodes once per day
 	enrRequestCleanup := time.NewTicker(1 * time.Minute) // Cleanup stale ENR requests every minute
-	forkRefresh := time.NewTicker(1 * time.Minute)       // Re-publish eth/eth2 when a fork activates
+
+	// Fork fields are re-published on a timer armed for the next boundary rather
+	// than polled: peers see the transition immediately and re-request our record,
+	// so a free-running tick left us advertising the previous fork for up to its
+	// full period. forkReconcile is the backstop for a missing schedule, a clock
+	// jump, or a boundary that passed while we were starting.
+	forkRefresh := time.NewTimer(s.nextForkRefreshDelay())
+	forkReconcile := time.NewTicker(1 * time.Minute)
 
 	defer tableMaintenance.Stop()
 	defer alivenessCheck.Stop()
@@ -642,6 +562,7 @@ func (s *Service) maintenanceLoop() {
 	defer badNodesCleanup.Stop()
 	defer enrRequestCleanup.Stop()
 	defer forkRefresh.Stop()
+	defer forkReconcile.Stop()
 
 	for {
 		select {
@@ -668,6 +589,148 @@ func (s *Service) maintenanceLoop() {
 
 		case <-forkRefresh.C:
 			s.refreshForkENR()
+			forkRefresh.Reset(s.nextForkRefreshDelay())
+
+		case <-forkReconcile.C:
+			// Refresh before recomputing: if a boundary was missed, this is what
+			// corrects the record, and the delay must be measured from now.
+			s.refreshForkENR()
+			if !forkRefresh.Stop() {
+				select {
+				case <-forkRefresh.C:
+				default:
+				}
+			}
+			forkRefresh.Reset(s.nextForkRefreshDelay())
+		}
+	}
+}
+
+// forkRefreshLead re-publishes just after a boundary, once the new fork is what
+// the clock reports.
+const forkRefreshLead = 500 * time.Millisecond
+
+// maxForkRefreshDelay caps the wait so a schedule that yields no future boundary
+// still reaches refreshForkENR at the old cadence.
+const maxForkRefreshDelay = time.Minute
+
+// forkSettleWindow is how long after a boundary the refresh keeps polling.
+//
+// A boundary that has just passed is skipped by nextForkBoundary, so arming for
+// the following one leaves a full maxForkRefreshDelay hole: a fire landing on the
+// boundary before the digest is computable finds no change and does not look
+// again for a minute. A devnet BPO transition took 75s that way. Polling until
+// the change appears bounds the lag to forkSettlePoll instead.
+const forkSettleWindow = 90 * time.Second
+
+// forkSettlePoll is the retry interval inside forkSettleWindow.
+const forkSettlePoll = time.Second
+
+// nextForkRefreshDelay returns how long to wait before the next refresh attempt.
+func (s *Service) nextForkRefreshDelay() time.Duration {
+	now := time.Now()
+
+	if last, ok := s.lastForkBoundary(now); ok && now.Sub(last) < forkSettleWindow {
+		return forkSettlePoll
+	}
+
+	next, ok := s.nextForkBoundary(now)
+	if !ok {
+		return maxForkRefreshDelay
+	}
+
+	delay := next.Sub(now) + forkRefreshLead
+	if delay < time.Millisecond {
+		delay = time.Millisecond
+	}
+	if delay > maxForkRefreshDelay {
+		delay = maxForkRefreshDelay
+	}
+	return delay
+}
+
+// forkOffsetSeconds returns seconds from genesis to an epoch, reporting false if
+// any step would overflow. Each multiplication is checked before it happens: a
+// placeholder epoch or an absurd slot length would otherwise wrap, and dividing
+// by an already-wrapped product panics.
+func forkOffsetSeconds(epoch, slotsPerEpoch, secondsPerSlot uint64) (uint64, bool) {
+	if slotsPerEpoch == 0 || secondsPerSlot == 0 {
+		return 0, false
+	}
+	if slotsPerEpoch > math.MaxUint64/secondsPerSlot {
+		return 0, false
+	}
+	epochSeconds := slotsPerEpoch * secondsPerSlot
+	if epoch > math.MaxUint64/epochSeconds {
+		return 0, false
+	}
+	return epoch * epochSeconds, true
+}
+
+// nextForkBoundary returns the earliest CL or EL fork activation after now.
+func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
+	var next time.Time
+	found := false
+
+	s.eachForkBoundary(func(t time.Time) {
+		if !t.After(now) {
+			return
+		}
+		if !found || t.Before(next) {
+			next = t
+			found = true
+		}
+	})
+
+	return next, found
+}
+
+// lastForkBoundary returns the most recent CL or EL fork activation at or before
+// now, so a refresh can keep polling until the transition is observable.
+func (s *Service) lastForkBoundary(now time.Time) (time.Time, bool) {
+	var last time.Time
+	found := false
+
+	s.eachForkBoundary(func(t time.Time) {
+		if t.After(now) {
+			return
+		}
+		if !found || t.After(last) {
+			last = t
+			found = true
+		}
+	})
+
+	return last, found
+}
+
+// eachForkBoundary calls fn with every scheduled fork activation time.
+func (s *Service) eachForkBoundary(consider func(time.Time)) {
+	if cfg := s.config.CLConfig; cfg != nil {
+		genesis := cfg.GetGenesisTime()
+		slotsPerEpoch := cfg.GetSlotsPerEpoch()
+		secondsPerSlot := cfg.SecondsPerSlot
+		if genesis > 0 && slotsPerEpoch > 0 && secondsPerSlot > 0 {
+			for _, epoch := range cfg.ForkEpochs() {
+				offset, ok := forkOffsetSeconds(epoch, slotsPerEpoch, secondsPerSlot)
+				// Bound offset first: MaxInt64-offset is unsigned arithmetic and
+				// would wrap for an offset past MaxInt64, letting the guard pass.
+				if !ok || offset > math.MaxInt64 || genesis > math.MaxInt64-offset {
+					continue
+				}
+				consider(time.Unix(int64(genesis+offset), 0))
+			}
+		}
+	}
+
+	if s.enrManager != nil {
+		if filter := s.enrManager.GetELFilter(); filter != nil {
+			for _, fork := range filter.GetAllForkIDsWithNames() {
+				// Block-numbered forks have no wall clock; only timestamps do.
+				if fork.IsTime && fork.Activation <= math.MaxInt64 {
+					consider(time.Unix(int64(fork.Activation), 0))
+				}
+			}
 		}
 	}
 }
@@ -705,22 +768,32 @@ func (s *Service) refreshForkENR() {
 			clFilter.Update()
 		}
 
-		beforeSeq := id.localNode.Record().Seq()
-		if err := id.enrManager.UpdateENR(headBlock, headTime); err != nil {
+		changed, err := id.enrManager.UpdateENR(headBlock, headTime)
+		if err != nil {
 			s.config.Logger.WithError(err).Error("failed to refresh fork fields in ENR")
 			continue
 		}
-		if id.localNode.Record().Seq() == beforeSeq {
+		if !changed {
 			continue
 		}
 
-		if err := s.storeENR(id.storeKey, id.localNode.Record()); err != nil {
-			s.config.Logger.WithError(err).Warn("failed to store refreshed ENR")
-		}
-		if id.servesEL && s.discv4Service != nil {
-			s.discv4Service.SetLocalENR(id.localNode.Record())
-		}
+		s.publishENR(id)
 		s.config.Logger.WithField("seq", id.localNode.Record().Seq()).Info("fork transition: re-published ENR fork fields")
+	}
+}
+
+// publishENR persists an identity's current record and pushes it to every
+// service that caches a copy. The discv4 handler answers ENRRESPONSE from its
+// own copy, so skipping it would keep serving a stale record. Callers must
+// hold s.mu.
+func (s *Service) publishENR(id *identity) {
+	record := id.localNode.Record()
+
+	if err := s.storeENR(id.storeKey, record); err != nil {
+		s.config.Logger.WithError(err).Warn("failed to store updated ENR")
+	}
+	if id.servesEL && s.discv4Service != nil {
+		s.discv4Service.SetLocalENR(record)
 	}
 }
 
@@ -886,8 +959,9 @@ func (s *Service) cleanupStaleENRRequests() {
 
 	s.pendingENRRequestsV4.Range(func(key, value interface{}) bool {
 		if timestamp, ok := value.(time.Time); ok {
-			if now.Sub(timestamp) > staleThreshold {
-				s.pendingENRRequestsV4.Delete(key)
+			// Delete only the entry we just judged stale: a fresh claim may have
+			// replaced it between the Range read and here.
+			if now.Sub(timestamp) > staleThreshold && s.pendingENRRequestsV4.CompareAndDelete(key, value) {
 				cleanedCount++
 			}
 		}
@@ -935,29 +1009,17 @@ func (s *Service) connectELBootnodes() {
 
 // connectELBootnodeENR connects to an EL bootnode via ENR.
 func (s *Service) connectELBootnodeENR(record *enr.Record) {
-	// Convert to v5 node
+	// Convert to v5 node; this also rejects records missing an IP or UDP port.
 	v5, err := v5node.New(record)
 	if err != nil {
 		s.config.Logger.WithError(err).Warn("failed to create v5 node from ENR")
 		return
 	}
 
-	// Verify ENR has required fields (IP and port)
-	if record.IP() == nil && record.IP6() == nil {
-		s.config.Logger.Warn("bootnode ENR missing IP address, skipping")
-		return
-	}
-	if record.UDP() == 0 {
-		s.config.Logger.Warn("bootnode ENR missing UDP port, skipping")
-		return
-	}
-
-	// Filter by fork ID before adding
-	if s.enrManager != nil {
-		isEL, forkID := s.enrManager.FilterELNode(record)
-		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-			elFilter.RecordAdmission(isEL, forkID)
-		}
+	// Filter by fork ID before adding. Serve-all must not drop a configured seed:
+	// rejecting the only seed leaves the table empty, so discovery never starts.
+	if !s.config.ServeAll && s.enrManager != nil {
+		isEL, forkID := s.enrManager.AdmitELNode(record)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", v5.ID().Bytes()[:8]),
@@ -967,23 +1029,8 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 		}
 	}
 
-	// Create generic node and add to table
 	genericNode := nodes.NewFromV5(v5, s.elNodeDB)
-	if s.elTable != nil {
-		if !s.elTable.Add(genericNode) {
-			s.config.Logger.Debug("ENR bootnode not admitted to table, not persisting")
-			return
-		}
-		s.config.Logger.Info("added ENR bootnode to table")
-
-		// Persist to database
-		if s.elNodeDB != nil {
-			genericNode.MarkDirty(nodes.DirtyFull)
-			if err := s.elNodeDB.QueueUpdate(genericNode); err != nil {
-				s.config.Logger.WithError(err).Debug("failed to queue bootnode for database update")
-			}
-		}
-	}
+	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode, s.config.Logger.WithField("layer", "EL"))
 }
 
 // connectELBootnodeEnode connects to an EL bootnode via enode URL.
@@ -1006,11 +1053,9 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 
 	// Never dial ourselves: our own enode in the bootnode list would otherwise
 	// race our handshake challenges against our own identity.
-	for _, local := range s.localIDs() {
-		if local == nodeID {
-			s.config.Logger.WithField("enode", enodeURL).Debug("skipping bootnode: it is our own identity")
-			return
-		}
+	if slices.Contains(s.localIDs(), [32]byte(nodeID)) {
+		s.config.Logger.WithField("enode", enodeURL).Debug("skipping bootnode: it is our own identity")
+		return
 	}
 
 	// Request ENR from the node
@@ -1025,11 +1070,8 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	v4Node.SetENR(enrRecord)
 
 	// Filter by fork ID before adding
-	if s.enrManager != nil {
-		isEL, forkID := s.enrManager.FilterELNode(enrRecord)
-		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-			elFilter.RecordAdmission(isEL, forkID)
-		}
+	if !s.config.ServeAll && s.enrManager != nil {
+		isEL, forkID := s.enrManager.AdmitELNode(enrRecord)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", nodeID[:8]),
@@ -1045,21 +1087,8 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	// Track successful ENR exchange
 	genericNode.IncrementSuccess()
 
-	if s.elTable != nil {
-		if !s.elTable.Add(genericNode) {
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("enode bootnode not admitted to table, not persisting")
-			return
-		}
-		s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Info("added enode bootnode to table")
-
-		// Persist to database
-		if s.elNodeDB != nil {
-			genericNode.MarkDirty(nodes.DirtyFull)
-			if err := s.elNodeDB.QueueUpdate(genericNode); err != nil {
-				s.config.Logger.WithError(err).Debug("failed to queue bootnode for database update")
-			}
-		}
-	}
+	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode,
+		s.config.Logger.WithField("layer", "EL").WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])))
 }
 
 // connectCLBootnodes connects to CL bootnodes (ENR only).
@@ -1073,7 +1102,7 @@ func (s *Service) connectCLBootnodes() {
 			continue
 		}
 
-		// Convert to v5 node to get node ID
+		// Convert to v5 node; this also rejects records missing an IP or UDP port.
 		v5, err := v5node.New(record)
 		if err != nil {
 			s.config.Logger.WithError(err).Warn("failed to create v5 node from ENR")
@@ -1082,38 +1111,34 @@ func (s *Service) connectCLBootnodes() {
 
 		nodeID := v5.ID()
 
-		// Verify ENR has required fields (IP and port)
-		if record.IP() == nil && record.IP6() == nil {
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR missing IP address, skipping")
-			continue
-		}
-		if record.UDP() == 0 {
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR missing UDP port, skipping")
-			continue
-		}
-
 		// Filter by fork digest before adding
-		if s.enrManager != nil && !s.enrManager.FilterCLNode(record) {
+		if !s.config.ServeAll && s.enrManager != nil && !s.enrManager.AdmitCLNode(record) {
 			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR has invalid fork digest, skipping")
 			continue
 		}
 
-		// Create generic node and add to table
 		genericNode := nodes.NewFromV5(v5, s.clNodeDB)
-		if s.clTable != nil {
-			if !s.clTable.Add(genericNode) {
-				s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Debug("CL bootnode not admitted to table, not persisting")
-				continue
-			}
-			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Info("added CL ENR bootnode to table")
+		s.addBootnodeToTable(s.clTable, s.clNodeDB, genericNode,
+			s.config.Logger.WithField("layer", "CL").WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])))
+	}
+}
 
-			// Persist to database
-			if s.clNodeDB != nil {
-				genericNode.MarkDirty(nodes.DirtyFull)
-				if err := s.clNodeDB.QueueUpdate(genericNode); err != nil {
-					s.config.Logger.WithError(err).Debug("failed to queue bootnode for database update")
-				}
-			}
+// addBootnodeToTable admits a configured bootnode to a routing table and
+// persists it.
+func (s *Service) addBootnodeToTable(table *nodes.FlatTable, nodeDB *nodes.NodeDB, n *nodes.Node, logger logrus.FieldLogger) {
+	if table == nil {
+		return
+	}
+	if !table.Add(n) {
+		logger.Debug("bootnode not admitted to table, not persisting")
+		return
+	}
+	logger.Info("added bootnode to table")
+
+	if nodeDB != nil {
+		n.MarkDirty(nodes.DirtyFull)
+		if err := nodeDB.QueueUpdate(n); err != nil {
+			logger.WithError(err).Debug("failed to queue bootnode for database update")
 		}
 	}
 }
@@ -1130,7 +1155,7 @@ func (s *Service) loadStoredENR(key string) (*enr.Record, error) {
 
 // storeENR stores an identity's ENR to the database under its state key.
 func (s *Service) storeENR(key string, record *enr.Record) error {
-	data, err := record.EncodeRLP()
+	data, err := record.EncodeRLPBytes()
 	if err != nil {
 		return err
 	}
@@ -1153,16 +1178,27 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 	if s.enrManager != nil {
 		nodeID := n.ID()
 
-		if isEL, _ := s.enrManager.FilterELNode(n.Record()); isEL && s.elTable != nil && s.elNodeDB != nil {
-			// Look up the generic node from the table
+		// Both layers, independently, as checkAndAddNode admits them: a dual-layer
+		// record becomes two node objects with their own last-seen, so refreshing
+		// only one lets the other age out while the peer is actively talking.
+		var isEL, isCL bool
+		if s.config.ServeAll {
+			isEL = s.elTable != nil
+			isCL = s.clTable != nil
+		} else {
+			isEL, _ = s.enrManager.ClassifyELNode(n.Record())
+			isCL = s.enrManager.ClassifyCLNode(n.Record())
+		}
+
+		if isEL && s.elTable != nil && s.elNodeDB != nil {
 			if genericNode := s.elTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
 				// Get falls back to the DB, so Add re-admits demoted nodes
 				s.elTable.Add(genericNode)
 				s.elNodeDB.QueueUpdate(genericNode)
 			}
-		} else if s.enrManager.FilterCLNode(n.Record()) && s.clTable != nil && s.clNodeDB != nil {
-			// Look up the generic node from the table
+		}
+		if isCL && s.clTable != nil && s.clNodeDB != nil {
 			if genericNode := s.clTable.Get(nodeID); genericNode != nil {
 				genericNode.SetLastSeen(timestamp) // This marks it dirty
 				s.clTable.Add(genericNode)
@@ -1183,10 +1219,11 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	// A shared identity serves both layers under one ID, so classify a known
 	// requester by its ENR and serve only its layer(s); an unclassifiable known
 	// peer gets nothing, an unknown one (no ENR yet) falls through to both.
-	if id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
+	// Serve-all skips this: every requester gets nodes from every served layer.
+	if !s.config.ServeAll && id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
-		serveEL, _ = s.enrManager.FilterELNode(sourceRecord)
-		serveCL = s.enrManager.FilterCLNode(sourceRecord)
+		serveEL, _ = s.enrManager.ClassifyELNode(sourceRecord)
+		serveCL = s.enrManager.ClassifyCLNode(sourceRecord)
 	}
 
 	if serveEL && s.elTable != nil {
@@ -1282,24 +1319,28 @@ func (s *Service) requestENRV4(n *v4node.Node) {
 	nodeID := n.ID()
 	now := time.Now()
 
-	// Check if we already have a recent pending ENR request for this node
-	if val, exists := s.pendingENRRequestsV4.Load(nodeID); exists {
-		if timestamp, ok := val.(time.Time); ok {
-			// If request is less than 30 seconds old, skip (still pending)
-			if time.Since(timestamp) < 30*time.Second {
-				return
-			}
-			// Request is stale (>30s), replace it
+	// Claim the slot atomically: a Load followed by a Store lets two callers both
+	// through, and takeover of an entry older than 30s has to stay possible, so a
+	// bare LoadOrStore is not enough either.
+	for {
+		val, loaded := s.pendingENRRequestsV4.LoadOrStore(nodeID, now)
+		if !loaded {
+			break
+		}
+		timestamp, ok := val.(time.Time)
+		if ok && time.Since(timestamp) < 30*time.Second {
+			return
+		}
+		if s.pendingENRRequestsV4.CompareAndSwap(nodeID, val, now) {
+			break
 		}
 	}
 
-	// Mark as pending with current timestamp
-	s.pendingENRRequestsV4.Store(nodeID, now)
-
 	// Run in goroutine to avoid blocking packet handling
 	go func() {
-		// Remove from pending when done
-		defer s.pendingENRRequestsV4.Delete(nodeID)
+		// Release only our own claim: an unconditional delete would drop the entry
+		// of whoever took over after our 30s window expired.
+		defer s.pendingENRRequestsV4.CompareAndDelete(nodeID, now)
 
 		// IMPORTANT: Some clients (like reth) require bidirectional bonding before responding to ENRRequest.
 		// Bidirectional bonding means:
@@ -1328,6 +1369,179 @@ func (s *Service) requestENRV4(n *v4node.Node) {
 	}()
 }
 
+// admitELLookupNode decides admission of a lookup-discovered node to the EL
+// table.
+func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
+	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
+		isEL, forkID := s.enrManager.AdmitELNode(n.Record())
+		if !isEL {
+			// A record with no eth entry is a consensus node, not an
+			// execution node on the wrong fork.
+			if !n.Record().Has("eth") {
+				s.markBadNode(n, db.LayerEL, "not_el")
+				return services.AdmissionRejectedLayer
+			}
+			s.config.Logger.WithFields(logrus.Fields{
+				"peerID": n.PeerID(),
+				"eth":    forkID.String(),
+			}).Debug("EL lookup admission rejected: incompatible fork id")
+			s.markBadNode(n, db.LayerEL, "invalid_fork_id")
+			return services.AdmissionRejectedFilter
+		}
+	}
+
+	result := s.admitToTable(n, s.elTable, db.LayerEL)
+
+	// After admission, and off this goroutine: each probe waits a request timeout,
+	// so probing a 16-node NEIGHBORS response inline stalled the lookup and the
+	// whole maintenance loop for over a minute. Resolving the table entry rather
+	// than reusing n also means the result lands on the object the table kept.
+	if result == services.AdmissionAccepted && n.HasV4() && !n.HasV5() {
+		s.scheduleV5Probe(n.ID())
+	}
+
+	return result
+}
+
+// admitCLLookupNode decides admission of a lookup-discovered node to the CL
+// table.
+func (s *Service) admitCLLookupNode(n *nodes.Node) services.AdmissionResult {
+	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
+		if !s.enrManager.AdmitCLNode(n.Record()) {
+			// No eth2 entry means an execution node, not a consensus
+			// node on the wrong digest; keep the two distinguishable.
+			if !n.Record().Has("eth2") {
+				s.markBadNode(n, db.LayerCL, "not_cl")
+				return services.AdmissionRejectedLayer
+			}
+			s.markBadNode(n, db.LayerCL, "invalid_fork_digest")
+			return services.AdmissionRejectedFilter
+		}
+	}
+
+	return s.admitToTable(n, s.clTable, db.LayerCL)
+}
+
+// markBadNode records a rejected node so it is not retried on restart.
+func (s *Service) markBadNode(n *nodes.Node, layer db.NodeLayer, reason string) {
+	if err := s.config.Database.StoreBadNode(n.IDBytes(), layer, reason); err != nil {
+		s.config.Logger.WithError(err).Debug("failed to store bad node")
+	}
+}
+
+// admitToTable pools an accepted node and clears any prior bad-node record.
+func (s *Service) admitToTable(n *nodes.Node, table *nodes.FlatTable, layer db.NodeLayer) services.AdmissionResult {
+	if !table.Add(n) {
+		return services.AdmissionRejectedPool
+	}
+	if err := s.config.Database.RemoveBadNode(n.IDBytes(), layer); err != nil {
+		s.config.Logger.WithError(err).Debug("failed to remove from bad nodes")
+	}
+	return services.AdmissionAccepted
+}
+
+// probeV5Support pings a v4-discovered node over discv5 and, on success,
+// attaches v5 support so lookups prefer the richer protocol.
+// maxConcurrentV5Probes bounds the probes in flight so a large NEIGHBORS response
+// cannot spawn one goroutine per node.
+const maxConcurrentV5Probes = 8
+
+// scheduleV5Probe runs a v5 probe for an admitted node without blocking the
+// caller. Dropping the probe when saturated is fine: the node stays v4-only and
+// the next lookup that rediscovers it tries again.
+//
+// The table entry decides, not the wrapper the caller happened to hold: after a
+// merge the entry may already know v5, and re-probing it on every rediscovery
+// would occupy the slots that genuinely v4-only nodes need.
+func (s *Service) scheduleV5Probe(id [32]byte) {
+	if s.elTable == nil {
+		return
+	}
+	entry := s.elTable.Get(id)
+	if entry == nil || entry.HasV5() {
+		return
+	}
+	if _, inFlight := s.v5ProbesInFlight.LoadOrStore(id, struct{}{}); inFlight {
+		return
+	}
+
+	select {
+	case s.v5ProbeSem <- struct{}{}:
+	default:
+		s.v5ProbesInFlight.Delete(id)
+		return
+	}
+
+	go func() {
+		defer func() {
+			<-s.v5ProbeSem
+			s.v5ProbesInFlight.Delete(id)
+		}()
+		s.probeV5Support(id, entry)
+	}()
+}
+
+// probeV5Support pings a v4-discovered node over discv5 and records the result on
+// whichever wrapper the table holds when the answer arrives — the entry can be
+// swept or replaced during the round trip, and writing to a detached object would
+// silently lose the capability.
+func (s *Service) probeV5Support(id [32]byte, n *nodes.Node) {
+	handler := s.getV5Handler()
+	if handler == nil {
+		return
+	}
+	record := n.Record()
+	if record == nil {
+		return
+	}
+	probedSeq := record.Seq()
+	v5Node, err := nodes.NewV5NodeFromRecord(record)
+	if err != nil {
+		return
+	}
+
+	start := time.Now()
+	respChan, err := handler.SendPing(v5Node)
+	if err != nil {
+		return
+	}
+	var resp *v5protocol.Response
+	select {
+	case resp = <-respChan:
+	case <-s.ctx.Done():
+		return
+	}
+	if resp == nil || resp.Error != nil {
+		return
+	}
+
+	// Re-resolve: this is the first moment the result can be applied, and the
+	// entry may have been swept or replaced while the ping was outstanding.
+	// SetV5AtSeq then discards the result if the peer moved on from the record we
+	// probed, rather than pinning v5 traffic to the address we happened to test.
+	target := s.elTable.Get(id)
+	if target == nil {
+		return
+	}
+	n = target
+
+	if !n.SetV5AtSeq(v5Node, probedSeq) {
+		return
+	}
+	s.config.Logger.WithFields(logrus.Fields{
+		"peerID": n.PeerID(),
+		"addr":   n.Addr(),
+		"rtt":    time.Since(start),
+	}).Debug("discovered v5 support on v4-discovered node")
+
+	// Queue protocol support update (SetV5 already marked it dirty)
+	if s.elNodeDB != nil {
+		if err := s.elNodeDB.QueueUpdate(n); err != nil {
+			s.config.Logger.WithError(err).Debug("failed to queue node for protocol support update")
+		}
+	}
+}
+
 // checkAndAddNodeV4 adds a discv4 node to the EL table after filtering.
 func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	// Ensure we have an ENR for filtering
@@ -1350,13 +1564,8 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 	alreadyKnown := s.elTable.Get(n.ID()) != nil
 
 	// Filter the node using ENR manager (EL-only for discv4)
-	if s.enrManager != nil {
-		filter, forkID := s.enrManager.FilterELNode(n.ENR())
-		if n.ENR().Has("eth") {
-			if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-				elFilter.RecordAdmission(filter, forkID)
-			}
-		}
+	if !s.config.ServeAll && s.enrManager != nil {
+		filter, forkID := s.enrManager.AdmitELNode(n.ENR())
 		if !filter {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
@@ -1376,7 +1585,7 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
 				"addr":   n.Addr().String(),
-			}).Info("Added discv4 node to EL table")
+			}).Debug("Added discv4 node to EL table")
 		}
 		return true
 	}
@@ -1390,16 +1599,15 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 		return false
 	}
 
-	// Determine layer
-	isEL, elForkID := s.enrManager.FilterELNode(n.Record())
-	isCL := s.enrManager.FilterCLNode(n.Record())
-	// Only an execution record is an execution admission decision; counting
-	// consensus nodes here made the rejection counter track cross-layer
-	// traffic, which on a dual-layer network is most of what arrives.
-	if n.Record().Has("eth") {
-		if elFilter := s.enrManager.GetELFilter(); elFilter != nil {
-			elFilter.RecordAdmission(isEL, elForkID)
-		}
+	// Serve-all skips the filters rather than overriding their results: calling
+	// them would move admission counters for decisions never made.
+	var isEL, isCL bool
+	if s.config.ServeAll {
+		isEL = s.elTable != nil
+		isCL = s.clTable != nil
+	} else {
+		isEL, _ = s.enrManager.AdmitELNode(n.Record())
+		isCL = s.enrManager.AdmitCLNode(n.Record())
 	}
 
 	// Add to appropriate table(s)
@@ -1420,7 +1628,10 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 	return added
 }
 
-// filterNodesForRequester applies LAN-aware and protocol filtering.
+// filterNodesForRequester applies LAN-aware and protocol filtering. It is the
+// single funnel for both protocols' FINDNODE responses, so it also enforces
+// that a response never repeats a node ID — a node can sit in both tables (any
+// dual-stack peer, and every peer under serve-all).
 func (s *Service) filterNodesForRequester(nodeList []*nodes.Node, requester *net.UDPAddr, needsV5 bool) []*nodes.Node {
 	requesterIsLAN := v5node.IsLANAddress(requester.IP)
 
@@ -1445,6 +1656,11 @@ func (s *Service) filterNodesForRequester(nodeList []*nodes.Node, requester *net
 
 		// WAN requesters only get WAN nodes
 		if !requesterIsLAN && v5node.IsLANAddress(nodeIP) {
+			continue
+		}
+
+		id := n.ID()
+		if slices.ContainsFunc(filtered, func(kept *nodes.Node) bool { return kept.ID() == id }) {
 			continue
 		}
 
@@ -1616,12 +1832,24 @@ func (s *Service) onPongReceived(remoteID []byte, sourceIP net.IP, reportedIP ne
 		port = s.primaryIdentity().enrPort
 	}
 
-	reporterIDStr := fmt.Sprintf("%x", remoteID[:8])
-	s.ipDiscovery.ReportIP(reportedIP, port, reporterIDStr, sourceIP)
+	// The full ID, not a prefix: this keys the distinct-reporter threshold, so a
+	// truncated key would let two peers count as one.
+	s.ipDiscovery.ReportIP(reportedIP, port, fmt.Sprintf("%x", remoteID), sourceIP)
 }
 
 // updateENRWithDiscoveredIP updates every identity's ENR with the discovered IP.
 func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool) {
+	// An explicitly configured address is authoritative (see Config.ENRIPProvided),
+	// so peer reports must not move it. reconcileStoredENR already honours this at
+	// startup; without the same check here a configured address is overwritten
+	// while running and only restored on restart.
+	if isIPv6 && s.config.ENRIP6Provided {
+		return
+	}
+	if !isIPv6 && s.config.ENRIPProvided {
+		return
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1663,13 +1891,6 @@ func (s *Service) updateENRWithDiscoveredIP(ip net.IP, port uint16, isIPv6 bool)
 			"isIPv6": isIPv6,
 		}).Info("IP discovery: consensus reached, updated ENR")
 
-		if err := s.storeENR(id.storeKey, id.localNode.Record()); err != nil {
-			s.config.Logger.WithError(err).Warn("failed to store updated ENR")
-		}
-
-		// Keep the discv4 service's ENR in sync (EL identity only).
-		if id.servesEL && s.discv4Service != nil {
-			s.discv4Service.SetLocalENR(id.localNode.Record())
-		}
+		s.publishENR(id)
 	}
 }

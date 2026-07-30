@@ -58,8 +58,9 @@ type UDPTransport struct {
 	ipv6Conn *ipv6.PacketConn
 
 	// handlers is a list of packet handlers (tried in order)
-	handlers   []PacketHandler
-	handlersMu sync.RWMutex
+	handlers         []PacketHandler
+	handlerProtocols []string
+	handlersMu       sync.RWMutex
 
 	// logger for debug and error messages
 	logger logrus.FieldLogger
@@ -265,9 +266,20 @@ func (t *UDPTransport) Conn() *net.UDPConn {
 //	    return err == nil
 //	})
 func (t *UDPTransport) AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool) {
+	t.AddHandlerFor("", handler)
+}
+
+// AddHandlerFor registers a packet handler under a protocol label.
+//
+// The label only affects accounting: two discv5 identities share a socket and
+// each rejects the other's packets, which is identity demultiplexing rather than
+// a protocol mismatch. Without the label that rejection would be reported as
+// other-protocol traffic.
+func (t *UDPTransport) AddHandlerFor(protocol string, handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool) {
 	t.handlersMu.Lock()
 	defer t.handlersMu.Unlock()
 	t.handlers = append(t.handlers, PacketHandler(handler))
+	t.handlerProtocols = append(t.handlerProtocols, protocol)
 }
 
 // SendTo sends a packet to the specified address.
@@ -382,20 +394,44 @@ func (t *UDPTransport) sendWithSource(data []byte, to *net.UDPAddr, from *net.UD
 	}
 }
 
+// crossedProtocol reports whether any handler before accepted was registered
+// under a different protocol label.
+func crossedProtocol(protocols []string, accepted int) bool {
+	if accepted >= len(protocols) {
+		return accepted > 0
+	}
+	for i := 0; i < accepted && i < len(protocols); i++ {
+		if protocols[i] != protocols[accepted] {
+			return true
+		}
+	}
+	return false
+}
+
 // dispatchPacket routes a packet to the registered handlers.
 //
 // Handlers are tried in order until one returns true.
 func (t *UDPTransport) dispatchPacket(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) {
 	t.handlersMu.RLock()
 	handlers := t.handlers
+	protocols := t.handlerProtocols
 	t.handlersMu.RUnlock()
 
 	// Try each handler in order
-	for _, handler := range handlers {
+	for i, handler := range handlers {
 		if handler(data, from, localAddr) {
-			// Handler accepted the packet
+			// Only a handler for a different protocol counts as fallthrough. An
+			// earlier handler of the same protocol rejecting the packet is one
+			// identity declining another's traffic on a shared socket.
+			if t.metrics != nil && crossedProtocol(protocols, i) {
+				t.metrics.RecordFellThrough()
+			}
 			return
 		}
+	}
+
+	if t.metrics != nil {
+		t.metrics.RecordUnhandled()
 	}
 
 	// No handler recognized the packet

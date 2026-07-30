@@ -169,7 +169,7 @@ func (n *Nodes) Encode() ([]byte, error) {
 	// Encode each ENR record and wrap in rlp.RawValue to prevent double-encoding
 	records := make([]interface{}, len(n.Records))
 	for i, record := range n.Records {
-		encoded, err := record.EncodeRLP()
+		encoded, err := record.EncodeRLPBytes()
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode ENR %d: %w", i, err)
 		}
@@ -248,7 +248,7 @@ func (r *RegTopic) Type() byte {
 
 // Encode returns the RLP encoding of the REGTOPIC message
 func (r *RegTopic) Encode() ([]byte, error) {
-	enrBytes, err := r.ENR.EncodeRLP()
+	enrBytes, err := r.ENR.EncodeRLPBytes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode ENR: %w", err)
 	}

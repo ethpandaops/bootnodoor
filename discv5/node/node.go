@@ -107,25 +107,9 @@ func New(record *enr.Record) (*Node, error) {
 	}
 	id := PubkeyToID(pubKey)
 
-	// Extract IP address
-	ip := record.IP()
-	if ip == nil {
-		ip = record.IP6()
-	}
-	if ip == nil {
-		return nil, fmt.Errorf("node: ENR missing IP address")
-	}
-
-	// Extract UDP port
-	udpPort := record.UDP()
-	if udpPort == 0 {
-		return nil, fmt.Errorf("node: ENR missing UDP port")
-	}
-
-	// Create UDP address
-	addr := &net.UDPAddr{
-		IP:   ip,
-		Port: int(udpPort),
+	addr, err := udpEndpoint(record)
+	if err != nil {
+		return nil, err
 	}
 
 	// Extract optional TCP port
@@ -142,6 +126,27 @@ func New(record *enr.Record) (*Node, error) {
 		tcpPort: tcpPort,
 		stats:   nodeStats,
 	}, nil
+}
+
+// udpEndpoint extracts the discovery endpoint from a record, keeping the port
+// paired with its address family: ip goes with udp, ip6 with udp6 (falling
+// back to udp, which dual-stack records share across both families).
+func udpEndpoint(record *enr.Record) (*net.UDPAddr, error) {
+	ip := record.IP()
+	port := record.UDP()
+	if ip == nil {
+		ip = record.IP6()
+		if p := record.UDP6(); p != 0 {
+			port = p
+		}
+	}
+	if ip == nil {
+		return nil, fmt.Errorf("node: ENR missing IP address")
+	}
+	if port == 0 {
+		return nil, fmt.Errorf("node: ENR missing UDP port")
+	}
+	return &net.UDPAddr{IP: ip, Port: int(port)}, nil
 }
 
 // ID returns the node's unique identifier.
@@ -282,16 +287,8 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 		n.record = newRecord
 
 		// Update network address if changed
-		ip := newRecord.IP()
-		if ip == nil {
-			ip = newRecord.IP6()
-		}
-		udpPort := newRecord.UDP()
-		if ip != nil && udpPort != 0 {
-			n.addr = &net.UDPAddr{
-				IP:   ip,
-				Port: int(udpPort),
-			}
+		if addr, err := udpEndpoint(newRecord); err == nil {
+			n.addr = addr
 		}
 
 		n.tcpPort = newRecord.TCP()

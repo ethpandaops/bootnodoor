@@ -9,7 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
-// EncodeRLP returns the RLP encoding of the record.
+// EncodeRLPBytes returns the RLP encoding of the record.
 //
 // The encoding format is: [signature, seq, k1, v1, k2, v2, ...]
 // where keys are sorted lexicographically.
@@ -18,7 +18,17 @@ import (
 // when the record is modified.
 //
 // Returns ErrRecordTooLarge if the encoded record exceeds 300 bytes.
-func (r *Record) EncodeRLP() ([]byte, error) {
+func (r *Record) EncodeRLPBytes() ([]byte, error) {
+	// A bootnode serves the same closest-node set to every requester, so the hot
+	// records are re-encoded concurrently; taking the write lock for a cache read
+	// serialises that on one mutex.
+	r.mu.RLock()
+	cached := r.raw
+	r.mu.RUnlock()
+	if len(cached) > 0 {
+		return cached, nil
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -38,6 +48,20 @@ func (r *Record) EncodeRLP() ([]byte, error) {
 	return encoded, nil
 }
 
+// EncodeRLP implements rlp.Encoder. Without it a nested Record encodes as an
+// empty list, since every field is unexported. Receiver must stay a pointer
+// (unlike go-ethereum's value receiver): Record holds a mutex.
+func (r *Record) EncodeRLP(w io.Writer) error {
+	encoded, err := r.EncodeRLPBytes()
+	if err != nil {
+		return err
+	}
+
+	_, err = w.Write(encoded)
+
+	return err
+}
+
 // DecodeRLPBytes decodes an RLP-encoded record from a byte slice.
 //
 // The input must be a valid RLP list containing:
@@ -54,6 +78,10 @@ func (r *Record) EncodeRLP() ([]byte, error) {
 //	    // Handle error
 //	}
 func (r *Record) DecodeRLPBytes(data []byte) error {
+	if len(data) > MaxRecordSize {
+		return ErrRecordTooLarge
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -139,7 +167,7 @@ func (r *Record) DecodeRLP(s *rlp.Stream) error {
 //
 // Example output: "enr:-IS4QHCYrYZ..."
 func (r *Record) EncodeBase64() (string, error) {
-	encoded, err := r.EncodeRLP()
+	encoded, err := r.EncodeRLPBytes()
 	if err != nil {
 		return "", err
 	}

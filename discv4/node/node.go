@@ -55,6 +55,14 @@ type Node struct {
 	bondExpiration     time.Time
 	consecutiveTimeout uint32 // Bond-specific consecutive timeout counter
 
+	// bondedIPs maps a proven remote IP to when its bond expires. Keyed per IP
+	// because a bond proves reachability at one address only: addr is rewritten
+	// from whatever source last sent us a packet, so serving requests on the
+	// strength of a bond earned elsewhere lets a spoofed source reflect our
+	// replies at a third party. Ports are excluded so a NAT remap does not
+	// silently drop a peer mid-bond.
+	bondedIPs map[string]time.Time
+
 	// Statistics (shared with generic node wrapper)
 	stats *stats.SharedStats
 
@@ -192,6 +200,24 @@ func (n *Node) SetENR(record *enr.Record) {
 	n.mu.Unlock()
 }
 
+// UpdateENR installs the record only if it is newer than the current one, so
+// a replayed response cannot roll the node back to an older record.
+func (n *Node) UpdateENR(record *enr.Record) bool {
+	if record == nil {
+		return false
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.enr != nil && record.Seq() <= n.enr.Seq() {
+		return false
+	}
+	n.enr = record
+
+	return true
+}
+
 // statsRef returns the current shared stats pointer for use outside the lock.
 func (n *Node) statsRef() *stats.SharedStats {
 	n.mu.RLock()
@@ -252,6 +278,21 @@ func (n *Node) IsBonded() bool {
 	return true
 }
 
+// IsBondedFrom reports whether this node proved reachability at addr's IP and
+// that proof is still valid. Inbound request handlers must use this rather than
+// IsBonded, so a bond earned at one address cannot serve replies to another.
+func (n *Node) IsBondedFrom(addr *net.UDPAddr) bool {
+	if addr == nil || addr.IP == nil {
+		return false
+	}
+
+	n.bondMu.RLock()
+	defer n.bondMu.RUnlock()
+
+	expiry, ok := n.bondedIPs[addr.IP.String()]
+	return ok && time.Now().Before(expiry)
+}
+
 // MarkPingSent records that we sent a PING to this node.
 func (n *Node) MarkPingSent() {
 	now := time.Now()
@@ -287,8 +328,11 @@ func (n *Node) MarkPongSent() {
 
 // MarkPongReceived records that we received a PONG from this node.
 //
-// This establishes or renews the bond.
-func (n *Node) MarkPongReceived(bondDuration time.Duration) {
+// This establishes or renews the bond. provenAddr is the address the answered
+// PING was sent to, not the PONG's source: the source is attacker-chosen on a
+// spoofed packet, so binding the bond to it would prove nothing. Pass nil only
+// where no endpoint was proven.
+func (n *Node) MarkPongReceived(bondDuration time.Duration, provenAddr *net.UDPAddr) {
 	now := time.Now()
 
 	n.bondMu.Lock()
@@ -296,6 +340,17 @@ func (n *Node) MarkPongReceived(bondDuration time.Duration) {
 	n.bondStatus = BondStatusBonded
 	n.bondExpiration = now.Add(bondDuration)
 	n.consecutiveTimeout = 0
+	if provenAddr != nil && provenAddr.IP != nil {
+		if n.bondedIPs == nil {
+			n.bondedIPs = make(map[string]time.Time)
+		}
+		for ip, expiry := range n.bondedIPs {
+			if now.After(expiry) {
+				delete(n.bondedIPs, ip)
+			}
+		}
+		n.bondedIPs[provenAddr.IP.String()] = now.Add(bondDuration)
+	}
 	n.bondMu.Unlock()
 
 	n.statsRef().ResetFailureCount()

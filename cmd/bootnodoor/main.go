@@ -59,9 +59,10 @@ var (
 	clEnrPort  int
 
 	// ENR configuration
-	enrIP   string
-	enrIP6  string
-	enrPort int
+	enrIP             string
+	enrIP6            string
+	enrPort           int
+	enableIPDiscovery bool
 
 	// Logging
 	logLevel string
@@ -73,6 +74,9 @@ var (
 	// Layer selection
 	enableEL bool
 	enableCL bool
+
+	// Rendezvous mode
+	serveAll bool
 
 	// WebUI flags
 	enableWebUI bool
@@ -136,6 +140,7 @@ func init() {
 	rootCmd.Flags().StringVar(&enrIP, "enr-ip", "", "IPv4 address to advertise in ENR (auto-detected if not specified)")
 	rootCmd.Flags().StringVar(&enrIP6, "enr-ip6", "", "IPv6 address to advertise in ENR (optional)")
 	rootCmd.Flags().IntVar(&enrPort, "enr-port", 0, "UDP port to advertise in ENR (0 = use bind-port)")
+	rootCmd.Flags().BoolVar(&enableIPDiscovery, "enable-ip-discovery", true, "Learn the external address from peer PONG reports (never overrides --enr-ip/--enr-ip6)")
 
 	// Logging
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
@@ -147,6 +152,9 @@ func init() {
 	// Layer selection
 	rootCmd.Flags().BoolVar(&enableEL, "enable-el", true, "Enable Execution Layer support (discv4 + discv5)")
 	rootCmd.Flags().BoolVar(&enableCL, "enable-cl", true, "Enable Consensus Layer support (discv5)")
+
+	// Rendezvous mode
+	rootCmd.Flags().BoolVar(&serveAll, "serve-all", false, "Disable EL/CL classification and fork-ID filtering: pool and serve every discovered node to everyone (plain discv5 rendezvous)")
 
 	// WebUI
 	rootCmd.Flags().BoolVar(&enableWebUI, "web-ui", false, "Enable web UI")
@@ -515,9 +523,11 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.ENRIP6 = enrIPv6
 	config.ENRIPProvided = enrIP != ""
 	config.ENRIP6Provided = enrIP6 != ""
+	config.EnableIPDiscovery = enableIPDiscovery
 	config.ENRPort = enrUDPPort
 	config.EnableDiscv4 = enableDiscv4
 	config.EnableDiscv5 = enableDiscv5
+	config.ServeAll = serveAll
 	config.MaxActiveNodes = maxActiveNodes
 	config.MaxNodesPerIP = maxNodesPerIP
 	config.Logger = logger

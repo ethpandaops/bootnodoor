@@ -43,7 +43,7 @@ func TestRecordEncoding(t *testing.T) {
 		t.Fatalf("Failed to sign record: %v", err)
 	}
 
-	encoded, err := original.EncodeRLP()
+	encoded, err := original.EncodeRLPBytes()
 	if err != nil {
 		t.Fatalf("Failed to encode record: %v", err)
 	}
@@ -269,6 +269,6 @@ func BenchmarkRecordEncoding(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		record.EncodeRLP()
+		record.EncodeRLPBytes()
 	}
 }

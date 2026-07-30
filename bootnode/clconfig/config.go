@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -74,6 +75,29 @@ type forkDefinition struct {
 // This is the single source of truth for fork ordering in the codebase.
 func (c *Config) getForks() []forkDefinition {
 	return c.forks
+}
+
+// ForkEpochs returns every scheduled fork epoch in ascending order, including
+// BPO entries and excluding far-future placeholders.
+//
+// Distinct from GetAllForkDigestInfos, which deduplicates by digest: the eth2
+// next-fork tuple changes at a boundary even when the current digest does not,
+// so a caller scheduling work per boundary needs the raw epochs.
+func (c *Config) ForkEpochs() []uint64 {
+	forks := c.getForks()
+
+	epochs := make([]uint64, 0, len(forks))
+	for i := range forks {
+		epoch := forks[i].epoch
+		if epoch == math.MaxUint64 {
+			continue
+		}
+		if len(epochs) > 0 && epochs[len(epochs)-1] == epoch {
+			continue
+		}
+		epochs = append(epochs, epoch)
+	}
+	return epochs
 }
 
 // GetForkEpoch returns the epoch for a given fork name.
@@ -549,22 +573,19 @@ func (c *Config) currentEpochNow() (uint64, bool) {
 // genesis, each registered fork (including BPO pseudo-forks), and each blob
 // schedule boundary. Sorted ascending, deduplicated.
 func (c *Config) forkBoundaryEpochs() []uint64 {
-	seen := map[uint64]bool{0: true}
 	epochs := []uint64{0}
-	add := func(epoch uint64) {
-		if epoch != math.MaxUint64 && !seen[epoch] {
-			seen[epoch] = true
-			epochs = append(epochs, epoch)
+	for _, fork := range c.getForks() {
+		if fork.epoch != math.MaxUint64 {
+			epochs = append(epochs, fork.epoch)
 		}
 	}
-	for _, fork := range c.getForks() {
-		add(fork.epoch)
-	}
 	for _, entry := range c.BlobSchedule {
-		add(entry.Epoch)
+		if entry.Epoch != math.MaxUint64 {
+			epochs = append(epochs, entry.Epoch)
+		}
 	}
-	sort.Slice(epochs, func(i, j int) bool { return epochs[i] < epochs[j] })
-	return epochs
+	slices.Sort(epochs)
+	return slices.Compact(epochs)
 }
 
 // GetCurrentForkDigest returns the fork digest for the current epoch.
@@ -659,14 +680,13 @@ type ForkDigestInfo struct {
 // for same-epoch intermediate forks (never current on the wire) are
 // intentionally not included.
 func (c *Config) GetAllForkDigests() []ForkDigest {
-	var digests []ForkDigest
-	seen := make(map[ForkDigest]bool)
-	for _, epoch := range c.forkBoundaryEpochs() {
-		digest := c.GetForkDigestForEpoch(epoch)
-		if !seen[digest] {
-			seen[digest] = true
-			digests = append(digests, digest)
-		}
+	infos := c.GetAllForkDigestInfos()
+	if len(infos) == 0 {
+		return nil
+	}
+	digests := make([]ForkDigest, 0, len(infos))
+	for _, info := range infos {
+		digests = append(digests, info.Digest)
 	}
 	return digests
 }

@@ -260,13 +260,20 @@ func (t *FlatTable) Add(n *Node) bool {
 	if existing, exists := t.activeNodes[nodeID]; exists {
 		t.mu.Unlock()
 
-		// Update ENR if newer
-		newSeq := n.Record().Seq()
-		if newSeq > existing.Record().Seq() {
-			existing.UpdateENR(n.Record())
+		// Adopt protocols the entry lacks. A peer found over discv4 can be admitted
+		// as v5-only first if its handshake completes before the v4 admission lands;
+		// keeping only the newer ENR would drop the v4 pointer and persist the peer
+		// as v5-only.
+		//
+		// Only from a record at least as new as the entry's: senders use the adopted
+		// protocol node's own address, so taking one from an older record would point
+		// that protocol at an endpoint the peer has already moved off.
+		adopted, advanced := existing.AdoptProtocolsFrom(n)
 
-			// Queue ENR update (preserves stats)
-			existing.MarkDirty(DirtyENR)
+		if adopted || advanced {
+			if err := t.db.QueueUpdate(existing); err != nil {
+				t.logger.WithError(err).WithField("peerID", existing.PeerID()).Debug("failed to queue node update")
+			}
 
 			if t.nodeChangedCallback != nil {
 				t.nodeChangedCallback(existing)
@@ -321,17 +328,20 @@ func (t *FlatTable) Add(n *Node) bool {
 			"addr":        n.Addr(),
 			"currentSize": currentSize + 1,
 			"maxActive":   t.maxActiveNodes,
-		}).Infof("added alive node to active pool (over capacity)")
+		}).Debugf("added alive node to active pool (over capacity)")
 	} else {
 		t.logger.WithFields(logrus.Fields{
 			"peerID": n.PeerID(),
 			"addr":   n.Addr(),
-		}).Info("added node to active pool")
+		}).Debug("added node to active pool")
 	}
 
 	// Queue ENR update to DB and mark as active
 	n.MarkDirty(DirtyENR)
 	n.SetLastActive(time.Now())
+	if err := t.db.QueueUpdate(n); err != nil {
+		t.logger.WithError(err).WithField("peerID", n.PeerID()).Debug("failed to queue admitted node")
+	}
 
 	if t.nodeChangedCallback != nil {
 		t.nodeChangedCallback(n)
@@ -727,16 +737,31 @@ func (t *FlatTable) ActiveSize() int {
 }
 
 // GetStats returns statistics about the table.
+//
+// Active comes from memory and persisted from the database, so the two are
+// counted as sets rather than subtracted: an admission whose write has not
+// landed yet would otherwise report more active than total.
 func (t *FlatTable) GetStats() TableStats {
+	persisted := t.db.PersistedIDs()
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	activeCount := len(t.activeNodes)
-	totalCount := t.db.Count()
+
+	inactiveCount := 0
+	totalCount := activeCount
+	for _, id := range persisted {
+		if _, active := t.activeNodes[id]; !active {
+			inactiveCount++
+			totalCount++
+		}
+	}
 
 	return TableStats{
 		TotalNodes:          totalCount,
 		ActiveNodes:         activeCount,
+		InactiveNodes:       inactiveCount,
 		AdmissionRejections: t.admissionRejections,
 		IPLimitRejections:   t.ipLimitRejections,
 		DeadNodesRemoved:    t.deadNodesRemoved,
