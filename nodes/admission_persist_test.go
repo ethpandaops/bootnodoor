@@ -365,3 +365,44 @@ func TestAdoptProtocolsFromSelfIsNoOp(t *testing.T) {
 		t.Error("self-merge resurrected a cleared protocol")
 	}
 }
+
+// A pointer installed from an early record must be replaceable, or the table
+// serves that endpoint long after the peer's record has advanced past it —
+// UpdateENR refreshes the v5 node but nothing refreshes v4's address.
+func TestAdoptReplacesPointerFromOlderRecord(t *testing.T) {
+	database := persistTestDB(t, filepath.Join(t.TempDir(), "replace.db"))
+	defer database.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ndb := NewNodeDB(ctx, database, db.LayerEL, quietTableLogger())
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	base, _ := discv5node.New(signedRecordAt(t, key, 1, net.IPv4(10, 5, 0, 1)))
+	entry := NewFromV5(base, ndb)
+
+	oldIP, newIP := net.IPv4(10, 5, 0, 2), net.IPv4(10, 5, 0, 3)
+
+	earlyV5, _ := discv5node.New(signedRecordAt(t, key, 5, oldIP))
+	early := NewFromV5(earlyV5, ndb)
+	early.SetV4(v4node.New(earlyV5.PublicKey(), earlyV5.Addr()))
+	entry.AdoptProtocolsFrom(early)
+
+	if got := entry.V4().Addr().IP; !got.Equal(oldIP) {
+		t.Fatalf("precondition: v4 addr = %v, want %v", got, oldIP)
+	}
+
+	laterV5, _ := discv5node.New(signedRecordAt(t, key, 9, newIP))
+	later := NewFromV5(laterV5, ndb)
+	later.SetV4(v4node.New(laterV5.PublicKey(), laterV5.Addr()))
+	entry.AdoptProtocolsFrom(later)
+
+	if got := entry.V4().Addr().IP; !got.Equal(newIP) {
+		t.Errorf("v4 addr = %v, want %v: a pointer from an older record was never replaced", got, newIP)
+	}
+}

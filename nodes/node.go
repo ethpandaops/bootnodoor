@@ -50,6 +50,13 @@ type Node struct {
 	v4Node *node.Node
 	v5Node *discv5node.Node
 
+	// Record sequence each protocol pointer was taken from. Adoption fills an
+	// empty slot or replaces one sourced from an older record; without this a
+	// pointer installed early is never replaced, and its endpoint is served long
+	// after the peer's record has moved on.
+	v4Seq uint64
+	v5Seq uint64
+
 	// Network info
 	mu   sync.RWMutex
 	addr *net.UDPAddr
@@ -81,6 +88,9 @@ func NewFromV4(v4 *node.Node, nodedb *NodeDB) *Node {
 		v4Node:    v4,
 		addr:      v4.Addr(),
 		nodeStats: nodeStats,
+	}
+	if n.enr != nil {
+		n.v4Seq = n.enr.Seq()
 	}
 
 	// Set up callback on shared stats to trigger DB updates
@@ -114,6 +124,9 @@ func NewFromV5(v5 *discv5node.Node, nodedb *NodeDB) *Node {
 		v5Node:    v5,
 		addr:      v5.Addr(),
 		nodeStats: nodeStats,
+	}
+	if n.enr != nil {
+		n.v5Seq = n.enr.Seq()
 	}
 
 	// Set up callback on shared stats to trigger DB updates
@@ -196,6 +209,9 @@ func (n *Node) HasV5() bool {
 func (n *Node) SetV4(v4 *node.Node) {
 	n.mu.Lock()
 	n.v4Node = v4
+	if n.enr != nil {
+		n.v4Seq = n.enr.Seq()
+	}
 	n.mu.Unlock()
 
 	if v4 != nil && n.nodeStats != nil {
@@ -235,12 +251,15 @@ func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 		return false, false
 	}
 
-	if otherV4 != nil && n.v4Node == nil {
+	otherSeq := otherRecord.Seq()
+	if otherV4 != nil && (n.v4Node == nil || otherSeq > n.v4Seq) {
 		n.v4Node = otherV4
+		n.v4Seq = otherSeq
 		adopted = true
 	}
-	if otherV5 != nil && n.v5Node == nil {
+	if otherV5 != nil && (n.v5Node == nil || otherSeq > n.v5Seq) {
 		n.v5Node = otherV5
+		n.v5Seq = otherSeq
 		adopted = true
 	}
 
@@ -293,6 +312,7 @@ func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
 		return false
 	}
 	n.v5Node = v5
+	n.v5Seq = seq
 	stats := n.nodeStats
 	n.mu.Unlock()
 
@@ -308,6 +328,9 @@ func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
 func (n *Node) SetV5(v5 *discv5node.Node) {
 	n.mu.Lock()
 	n.v5Node = v5
+	if n.enr != nil {
+		n.v5Seq = n.enr.Seq()
+	}
 	n.mu.Unlock()
 
 	if v5 != nil && n.nodeStats != nil {
