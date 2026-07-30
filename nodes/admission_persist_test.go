@@ -246,49 +246,6 @@ func makeV4For(t *testing.T, v5 *discv5node.Node) *v4node.Node {
 	return v4node.New(v5.PublicKey(), v5.Addr())
 }
 
-// Senders use the adopted protocol node's own address, so a protocol pointer from
-// an older record would aim that protocol at an endpoint the peer has left.
-func TestAddDoesNotAdoptProtocolFromStaleRecord(t *testing.T) {
-	database := persistTestDB(t, filepath.Join(t.TempDir(), "stale.db"))
-	defer database.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	logger := quietTableLogger()
-	ndb := NewNodeDB(ctx, database, db.LayerEL, logger)
-	table := newPersistTable(t, ndb, logger)
-
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-
-	newer := signedRecordAt(t, key, 5, net.IPv4(10, 8, 0, 1))
-	older := signedRecordAt(t, key, 2, net.IPv4(10, 8, 0, 2))
-
-	newerV5, err := discv5node.New(newer)
-	if err != nil {
-		t.Fatalf("v5 from newer: %v", err)
-	}
-	existing := NewFromV5(newerV5, ndb)
-	if !table.Add(existing) {
-		t.Fatal("first admission rejected")
-	}
-
-	olderV5, err := discv5node.New(older)
-	if err != nil {
-		t.Fatalf("v5 from older: %v", err)
-	}
-	stale := NewFromV5(olderV5, ndb)
-	stale.SetV4(v4node.New(olderV5.PublicKey(), olderV5.Addr()))
-	table.Add(stale)
-
-	if table.Get(existing.ID()).HasV4() {
-		t.Error("adopted a v4 pointer from a record older than the entry's")
-	}
-}
-
 func signedRecordAt(t *testing.T, key *ecdsa.PrivateKey, seq uint64, ip net.IP) *enr.Record {
 	t.Helper()
 	rec := enr.New()
@@ -363,46 +320,5 @@ func TestAdoptProtocolsFromSelfIsNoOp(t *testing.T) {
 	n.SetV5(nil)
 	if _, _ = n.AdoptProtocolsFrom(n); n.HasV5() {
 		t.Error("self-merge resurrected a cleared protocol")
-	}
-}
-
-// A pointer installed from an early record must be replaceable, or the table
-// serves that endpoint long after the peer's record has advanced past it —
-// UpdateENR refreshes the v5 node but nothing refreshes v4's address.
-func TestAdoptReplacesPointerFromOlderRecord(t *testing.T) {
-	database := persistTestDB(t, filepath.Join(t.TempDir(), "replace.db"))
-	defer database.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ndb := NewNodeDB(ctx, database, db.LayerEL, quietTableLogger())
-
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-
-	base, _ := discv5node.New(signedRecordAt(t, key, 1, net.IPv4(10, 5, 0, 1)))
-	entry := NewFromV5(base, ndb)
-
-	oldIP, newIP := net.IPv4(10, 5, 0, 2), net.IPv4(10, 5, 0, 3)
-
-	earlyV5, _ := discv5node.New(signedRecordAt(t, key, 5, oldIP))
-	early := NewFromV5(earlyV5, ndb)
-	early.SetV4(v4node.New(earlyV5.PublicKey(), earlyV5.Addr()))
-	entry.AdoptProtocolsFrom(early)
-
-	if got := entry.V4().Addr().IP; !got.Equal(oldIP) {
-		t.Fatalf("precondition: v4 addr = %v, want %v", got, oldIP)
-	}
-
-	laterV5, _ := discv5node.New(signedRecordAt(t, key, 9, newIP))
-	later := NewFromV5(laterV5, ndb)
-	later.SetV4(v4node.New(laterV5.PublicKey(), laterV5.Addr()))
-	entry.AdoptProtocolsFrom(later)
-
-	if got := entry.V4().Addr().IP; !got.Equal(newIP) {
-		t.Errorf("v4 addr = %v, want %v: a pointer from an older record was never replaced", got, newIP)
 	}
 }

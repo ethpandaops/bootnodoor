@@ -50,13 +50,6 @@ type Node struct {
 	v4Node *node.Node
 	v5Node *discv5node.Node
 
-	// Record sequence each protocol pointer was taken from. Adoption fills an
-	// empty slot or replaces one sourced from an older record; without this a
-	// pointer installed early is never replaced, and its endpoint is served long
-	// after the peer's record has moved on.
-	v4Seq uint64
-	v5Seq uint64
-
 	// Network info
 	mu   sync.RWMutex
 	addr *net.UDPAddr
@@ -89,7 +82,6 @@ func NewFromV4(v4 *node.Node, nodedb *NodeDB) *Node {
 		addr:      v4.Addr(),
 		nodeStats: nodeStats,
 	}
-	n.v4Seq = v4RecordSeq(v4)
 
 	// Set up callback on shared stats to trigger DB updates
 	n.setupSharedStatsCallback()
@@ -123,7 +115,6 @@ func NewFromV5(v5 *discv5node.Node, nodedb *NodeDB) *Node {
 		addr:      v5.Addr(),
 		nodeStats: nodeStats,
 	}
-	n.v5Seq = v5RecordSeq(v5)
 
 	// Set up callback on shared stats to trigger DB updates
 	n.setupSharedStatsCallback()
@@ -161,18 +152,6 @@ func (n *Node) Addr() *net.UDPAddr {
 	return n.addr
 }
 
-// SetAddr updates the node's address.
-func (n *Node) SetAddr(addr *net.UDPAddr) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.addr = addr
-
-	// Update protocol-specific nodes
-	if n.v4Node != nil {
-		n.v4Node.SetAddr(addr)
-	}
-}
-
 // V4 returns the discv4 node if available.
 func (n *Node) V4() *node.Node {
 	n.mu.RLock()
@@ -205,7 +184,6 @@ func (n *Node) HasV5() bool {
 func (n *Node) SetV4(v4 *node.Node) {
 	n.mu.Lock()
 	n.v4Node = v4
-	n.v4Seq = protocolSeq(v4RecordSeq(v4), n.recordSeqLocked())
 	n.mu.Unlock()
 
 	if v4 != nil && n.nodeStats != nil {
@@ -217,14 +195,13 @@ func (n *Node) SetV4(v4 *node.Node) {
 	n.MarkDirty(DirtyProtocol)
 }
 
-// AdoptProtocolsFrom installs protocol pointers this node lacks, taken from a
-// wrapper for the same peer, and reports whether anything changed.
+// AdoptProtocolsFrom fills protocol slots this node has empty from a wrapper for
+// the same peer, advances the record if the other's is newer, and reports each.
 //
-// The freshness check and the install happen under one lock hold. Doing them
-// separately let a concurrent admission advance the record in between, so a
-// pointer built from an older record could still be installed — and because
-// adoption only ever fills an empty slot, that stale endpoint would then be
-// permanent.
+// It fills only: which endpoint a protocol should use is the discovery layer's
+// call, not the table's. discv4 moves an address solely on a matched PONG
+// (promoteAddr), and discv5 moves its own when its record advances. A table that
+// also ranked pointers would be arbitrating endpoints on weaker evidence.
 func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 	// Self-merge is a no-op, not a re-install: a caller re-admitting a table entry
 	// would otherwise snapshot its own pointer, race a concurrent clear, and
@@ -238,34 +215,30 @@ func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 		return false, false
 	}
 	otherV4, otherV5 := other.V4(), other.V5()
+	carrierSeq := otherRecord.Seq()
 
 	n.mu.Lock()
-	if n.enr != nil && otherRecord.Seq() < n.enr.Seq() {
+	if n.enr != nil && carrierSeq < n.recordSeqLocked() {
 		n.mu.Unlock()
 		return false, false
 	}
 
-	if otherV4Seq := protocolSeq(v4RecordSeq(otherV4), otherRecord.Seq()); otherV4 != nil && (n.v4Node == nil || otherV4Seq > n.v4Seq) {
+	if otherV4 != nil && n.v4Node == nil {
 		n.v4Node = otherV4
-		n.v4Seq = otherV4Seq
 		adopted = true
 	}
-	if otherV5Seq := protocolSeq(v5RecordSeq(otherV5), otherRecord.Seq()); otherV5 != nil && (n.v5Node == nil || otherV5Seq > n.v5Seq) {
+	if otherV5 != nil && n.v5Node == nil {
 		n.v5Node = otherV5
-		n.v5Seq = otherV5Seq
 		adopted = true
 	}
 
-	// Advance the record in the same hold. Leaving it to a separate UpdateENR let
-	// a newer admission complete its adoption, an older one install its pointer,
-	// and the newer one then advance the record — stranding the older endpoint,
-	// which UpdateENR does not refresh for v4.
-	if n.enr == nil || otherRecord.Seq() > n.enr.Seq() {
+	if n.enr == nil || carrierSeq > n.recordSeqLocked() {
 		n.enr = otherRecord
 		advanced = true
 	}
 
 	stats := n.nodeStats
+	current := n.enr
 	v4, v5 := n.v4Node, n.v5Node
 	n.mu.Unlock()
 
@@ -278,8 +251,12 @@ func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 			v5.SetStats(stats)
 		}
 	}
-	if advanced && v5 != nil {
-		v5.UpdateENR(otherRecord)
+	// Bring the v5 pointer up to the record the wrapper now holds, whether that is
+	// because the record advanced or because an older pointer just filled an empty
+	// slot. UpdateENR ignores anything not newer, and this stays outside n.mu so
+	// the two mutexes never nest.
+	if (adopted || advanced) && v5 != nil {
+		v5.UpdateENR(current)
 	}
 
 	if adopted {
@@ -291,6 +268,60 @@ func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 	return adopted, advanced
 }
 
+// ApplyProbeResult installs or clears both protocol pointers from a completed
+// probe, and reports whether anything changed.
+//
+// Gated on the record still being the one the probe measured: a result that
+// arrived after the peer published a new record describes endpoints it may have
+// left, so it must neither install nor clear. Both protocols are decided under one
+// lock hold so they see the same record.
+func (n *Node) ApplyProbeResult(probedSeq uint64, v4 *node.Node, v4OK bool, v5 *discv5node.Node, v5OK bool) bool {
+	n.mu.Lock()
+	if n.enr == nil || n.recordSeqLocked() != probedSeq {
+		n.mu.Unlock()
+		return false
+	}
+
+	changed := false
+	switch {
+	case v4OK && v4 != nil && n.v4Node == nil:
+		n.v4Node = v4
+		changed = true
+	case !v4OK && n.v4Node != nil:
+		n.v4Node = nil
+		changed = true
+	}
+
+	switch {
+	case v5OK && v5 != nil && n.v5Node == nil:
+		n.v5Node = v5
+		changed = true
+	case !v5OK && n.v5Node != nil:
+		n.v5Node = nil
+		changed = true
+	}
+
+	stats := n.nodeStats
+	installedV4, installedV5 := n.v4Node, n.v5Node
+	n.mu.Unlock()
+
+	if !changed {
+		return false
+	}
+
+	if stats != nil {
+		n.setupSharedStatsCallback()
+		if installedV4 != nil {
+			installedV4.SetStats(stats)
+		}
+		if installedV5 != nil {
+			installedV5.SetStats(stats)
+		}
+	}
+	n.MarkDirty(DirtyProtocol)
+	return true
+}
+
 // SetV5AtSeq installs a discv5 node only while the record it was probed from is
 // still current, so a result that arrived after the peer moved is discarded
 // rather than pinning traffic to the old endpoint.
@@ -298,14 +329,14 @@ func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
 	if v5 == nil {
 		return false
 	}
+	v5Seq := v5RecordSeq(v5)
 
 	n.mu.Lock()
-	if n.enr == nil || n.enr.Seq() != seq {
+	if n.enr == nil || n.enr.Seq() != seq || v5Seq != seq {
 		n.mu.Unlock()
 		return false
 	}
 	n.v5Node = v5
-	n.v5Seq = v5RecordSeq(v5)
 	stats := n.nodeStats
 	n.mu.Unlock()
 
@@ -321,7 +352,6 @@ func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
 func (n *Node) SetV5(v5 *discv5node.Node) {
 	n.mu.Lock()
 	n.v5Node = v5
-	n.v5Seq = v5RecordSeq(v5)
 	n.mu.Unlock()
 
 	if v5 != nil && n.nodeStats != nil {
@@ -543,7 +573,7 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 
 	// Update our ENR
 	n.mu.Lock()
-	if newRecord.Seq() <= n.enr.Seq() {
+	if n.enr != nil && newRecord.Seq() <= n.recordSeqLocked() {
 		n.mu.Unlock()
 		return false
 	}
@@ -676,44 +706,22 @@ func NewV4NodeFromRecord(record *enr.Record, addr *net.UDPAddr) (*node.Node, err
 	return node.FromENR(record, addr)
 }
 
-// v4RecordSeq and v5RecordSeq read the sequence of the record a protocol pointer
-// was built from. The label has to follow the pointer, not the wrapper that
-// carried it: stamping a pointer with its carrier's sequence marks an old
-// endpoint as current and blocks the admission that would replace it.
-func v4RecordSeq(v4 *node.Node) uint64 {
-	if v4 == nil {
+// recordSeq reads a record's sequence, treating a missing record as sequence 0.
+func recordSeq(rec *enr.Record) uint64 {
+	if rec == nil {
 		return 0
 	}
-	if rec := v4.ENR(); rec != nil {
-		return rec.Seq()
-	}
-	return 0
+	return rec.Seq()
 }
 
+// v5RecordSeq reads the sequence of the record a discv5 pointer was built from.
 func v5RecordSeq(v5 *discv5node.Node) uint64 {
 	if v5 == nil {
 		return 0
 	}
-	if rec := v5.Record(); rec != nil {
-		return rec.Seq()
-	}
-	return 0
-}
-
-// protocolSeq prefers the sequence of the record a pointer was built from, and
-// falls back to its carrier's. A discv4 node created from an enode has no record
-// of its own, so without the fallback every such pointer would be labelled 0 and
-// no later admission could ever replace it.
-func protocolSeq(pointerSeq, carrierSeq uint64) uint64 {
-	if pointerSeq != 0 {
-		return pointerSeq
-	}
-	return carrierSeq
+	return recordSeq(v5.Record())
 }
 
 func (n *Node) recordSeqLocked() uint64 {
-	if n.enr == nil {
-		return 0
-	}
-	return n.enr.Seq()
+	return recordSeq(n.enr)
 }
