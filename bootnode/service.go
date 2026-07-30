@@ -1585,7 +1585,7 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
 				"addr":   n.Addr().String(),
-			}).Info("Added discv4 node to EL table")
+			}).Debug("Added discv4 node to EL table")
 		}
 		return true
 	}

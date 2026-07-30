@@ -580,7 +580,7 @@ func (h *Handler) handleWHOAREYOUPacket(packet *Packet, from *net.UDPAddr, local
 				"nodeID": sess.RemoteID.String()[:16],
 				"addr":   from,
 				"age":    sess.Age(),
-			}).Info("handler: received unexpected WHOAREYOU with no pending request")
+			}).Debug("handler: received unexpected WHOAREYOU with no pending request")
 			return fmt.Errorf("no pending handshake or request for %s", from)
 		}
 
@@ -886,7 +886,7 @@ func (h *Handler) handleHandshakePacket(packet *Packet, from *net.UDPAddr, local
 	h.config.Logger.WithFields(logrus.Fields{
 		"sourceNodeID": sourceNodeID.String()[:16],
 		"from":         from,
-	}).Info("handler: session established successfully")
+	}).Debug("handler: session established successfully")
 
 	// Store node in session and call OnHandshakeComplete callback
 	if remoteNodeFromENR != nil {
