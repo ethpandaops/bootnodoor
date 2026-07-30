@@ -116,8 +116,9 @@ The core invariant. Per scheduled fork:
 A step per refresh tick means change detection is broken. No step means the refresh is
 not firing. Both are why `UpdateENR` is a no-op when nothing changed.
 
-A BPO changes the digest without changing the CL fork _name_ — `Fulu` stays while the
-digest moves. That is correct, not a missed transition.
+A BPO changes the digest without changing the underlying CL fork version. bootnodoor
+labels these blob-schedule variants as pseudo-forks (`BPO-1`, `BPO-2`, ...), so the UI
+name and digest both move even though the inherited Fulu fork version stays the same.
 
 ### Refresh lag
 
@@ -234,12 +235,36 @@ network_params:
   fulu_fork_epoch: 3
   bpo_1_epoch: 5
   bpo_1_max_blobs: 12
+  bpo_1_target_blobs: 8
+
+additional_services:
+  - bootnodoor
+  - spamoor
+
+spamoor_params:
+  spammers:
+    - name: BPO blob validation
+      scenario: blob-combined
+      config:
+        throughput: 30
+        sidecars: 3
+        max_pending: 60
+        max_wallets: 40
+        base_fee: 100
+        blob_fee: 100
 ```
 
 Mainnet preset, 32 slots per epoch, 12s slots — one epoch is 384s, so that schedule
 transitions at roughly T+6m, T+19m and T+32m and wants ~50 minutes. Include a BPO: it
 moves the digest through the blob schedule rather than a fork version, reaching code an
 ordinary fork does not.
+
+Do not call the BPO covered merely because the digest changed. Sample the beacon block's
+`body.blob_kzg_commitments` and the matching execution block's type-3 transactions and
+`blobGasUsed`. With three sidecars per transaction, a pre-BPO block should reach the
+Fulu limit of 9 blobs; after the example BPO it should exceed 9 and ideally reach 12
+(`blobGasUsed == 0x180000`). A fresh spammer account avoids nonce contamination when
+changing sidecar count during a run.
 
 Compute the wall-clocks before you start so log lines can be correlated:
 
@@ -260,6 +285,28 @@ Public devnets schedule their real fork far out (gloas at epoch 38 is ~4h at 12s
 Pull it forward to something like epoch 4 so the transition lands inside the run, and say
 so in the file — the deviation matters when reading results.
 
+## Profiling a live run
+
+bootnodoor supports Go pprof on the web UI listener. Start it with both `--web-ui` and
+`--pprof`; without `--pprof`, `/debug/pprof/` must return 404. The package has no
+extra-args hook, so profiling a Kurtosis run currently requires the standalone-container
+pattern used for `--serve-all`.
+
+```bash
+curl -fsS "http://127.0.0.1:38080/debug/pprof/profile?seconds=30" \
+  -o bootnodoor-cpu.pprof
+curl -fsS "http://127.0.0.1:38080/debug/pprof/heap" \
+  -o bootnodoor-heap.pprof
+curl -fsS "http://127.0.0.1:38080/debug/pprof/goroutine" \
+  -o bootnodoor-goroutine.pprof
+go install github.com/google/pprof@latest
+"$(go env GOPATH)/bin/pprof" -top bootnodoor-cpu.pprof
+```
+
+Capture across a transition when investigating a fork-correlated load increase. pprof is
+an administrative endpoint and shares `--web-host`; bind it to localhost or protect the
+listener when profiling outside an isolated enclave.
+
 ## Harness gotchas
 
 Every one of these cost real time.
@@ -275,6 +322,11 @@ silently write empty rows.
 will only have 0 available" means something else is consuming the box — a concurrent hive
 run will do it. Never run fork-timing tests on a loaded host: missed slots look exactly
 like bootnodoor bugs.
+
+**Schedule every fork explicitly.** Current ethereum-package defaults can put Fulu and
+BPO-1 at genesis even when a file specifies only `electra_fork_epoch: 0`. Set every fork
+needed by the test, including BPO target/max values, and verify the generated consensus
+config before interpreting a run.
 
 **Scrape hyphenated fork names.** `BPO-1` contains a hyphen; a `[A-Za-z0-9]+` character
 class silently skips it and matches the _next_ field, which is the digest. Symptom: the
@@ -297,8 +349,9 @@ derived key if you run the crawler alongside. See the [ENRScout guide][enrscout-
 
 ## Interpreting results
 
-- **A transition is not a fork name change.** A BPO moves the digest while the name holds.
-  Compare digests, not labels.
+- **A transition is not only a fork-version change.** A BPO inherits the active Fulu
+  version but changes the digest through its blob parameters; bootnodoor gives it a
+  `BPO-n` pseudo-fork label. Compare digests, not labels alone.
 - **Rejection counters are not fork health.** On a dual-layer network most records an EL
   lookup sees are consensus records; that is `rejected_layer`, not `rejected_fork`.
 - **A quiet counter can still be wrong.** `Invalid Packets` sitting at 84% of received
@@ -319,6 +372,62 @@ kurtosis enclave rm -f bootnodoor-devnet
 ## Current validation notes
 
 Dated and disposable. Update as fixes land; the procedure above should stay valid.
+
+### Full local validation on 2026-07-30
+
+The current sweep used bootnodoor `develop` at `8dafd1e`, ENRScout `main` at
+`0568233`, and a local ethereum-package integration based on the open
+[bootnodoor integration PR][ethereum-package-pr] plus layer-specific `/el-enr` wiring.
+The bootnodoor and both ENRScout images were built from those exact trees. Besu and Reth
+used current `main` images and Nethermind used current `master`; the remaining clients
+used the package's curated images.
+
+In the steady-state seven-pair matrix, all seven EL clients entered bootnodoor before
+ENRScout started, and ENRScout identified all seven organically. The CL layer was fully
+discovered and verified; six implementation names were fingerprinted, with Caplin still
+the naming gap. ENRScout was seeded only with bootnodoor's two identities. This supersedes
+the old 5/7 organic EL baseline: Nethermind `master` explicitly logged
+`Discv5 bootnodes accepted: 1`. Nimbus EL still logged `Skipping discovery bootstrap, no
+bootnodes provided` with both its old and proposed flag forms, but joined indirectly
+through the live mesh.
+
+The released-image comparison remained useful: it reached 5/7 EL organically, then
+direct outbound probes identified Nethermind and Nimbus as well. A separate `--serve-all`
+instance held 15 EL and 13 CL rows before and after restart; the SQLite database retained
+both layer rows under the `(nodeid, layer)` key, with zero failed or inactive rows.
+
+The scheduled run was Deneb at genesis, Electra at epoch 1, Fulu at epoch 3, and BPO-1
+at epoch 5. Sequence moved 2→3→4→5 exactly once per boundary. Observed refresh lag was
+effectively 0s for Electra, 2s for Fulu, and at most 6s at BPO-1. Tables stayed at 8/8
+active EL and 7/7 active CL. Electra and Fulu packet captures were flat at roughly
+4.1k–4.3k packets/minute across each boundary, with zero capture drops. Elevated traffic
+from Nethermind `master` was client-originated discovery traffic and bootnodoor replies,
+not the earlier bootnodoor-originated refresh storm. `Invalid Packets` rose slowly before
+Fulu but was flat at 216 across BPO-1; there was no boundary-correlated jump.
+
+**BPO blob semantics are now covered.** Sustained spamoor load produced three type-3
+transactions, 9 commitments, and `blobGasUsed=0x120000` before BPO-1. The first sampled
+post-BPO block (execution block 118, beacon slot 160) contained four type-3 transactions,
+12 matching commitments, and `blobGasUsed=0x180000`. Its execution hash matched the
+beacon payload hash. This proves the chain actually moved from the Fulu capacity of 9 to
+the configured BPO-1 capacity of 12; it was not only a digest transition.
+
+ENRScout's audit invariant held: `fork=current` plus `fork=stale` was always 14, and all
+14 nodes stayed verified. The headline view dipped from 14/0 to 0/14 current/stale at
+each boundary, then recovered. BPO-1 recovered to 11/3 in 37s, 13/1 in 97s, and 14/0 in
+188s. The longer tail exposed an ENRScout precedence defect: a later stale signed-ENR
+observation can overwrite authenticated RLPx Status fork evidence in
+`internal/nodeset/nodeset.go`, despite the nearby no-downgrade comment. Besu, Ethrex, and
+Reth continued advertising older signed ENRs while Status was current, causing rows to
+oscillate between `fork_source: status` and `fork_source: enr`. The companion ENRScout
+guide's “no ENRScout code defect” conclusion and blanket ~60s recovery expectation are
+therefore superseded.
+
+The same live run was profiled for 30s. CPU samples represented about 0.6% of one core,
+with the largest application cost in SQLite transaction commit/fsync; sampled live heap
+was about 1 MiB, and 25 goroutines showed normal UDP, database, HTTP, and maintenance
+loops with no leak signature. Profiling also found that pprof had been registered even
+when `--pprof` was false; the handler is now gated by the flag with a regression test.
 
 ### Runs on 2026-07-29 / 07-30
 
@@ -377,12 +486,10 @@ boundary-armed refresh landed.
 
 ### Not yet covered
 
-- **BPO blob semantics.** BPO-1/BPO-2 change `MAX_BLOBS_PER_BLOCK`, but both runs carried
-  no blob transactions, so only the digest change was exercised. Adding `spamoor` with blob
-  load would close this.
 - **Dead nodes are still served.** `PerformSweep` demotes only when the table is over
   capacity, and FINDNODE responses are not filtered on liveness.
 - **DB-restored v4 pointers are detached.** `buildNodeFromDB` reconstructs its own discv4
   node rather than the handler's, so proven-address promotion never reaches it.
 
 [enrscout-doc]: https://github.com/mysticryuujin/enrscout/blob/main/docs/testing-with-kurtosis.md
+[ethereum-package-pr]: https://github.com/ethpandaops/ethereum-package/pull/1461
