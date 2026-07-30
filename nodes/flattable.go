@@ -268,18 +268,8 @@ func (t *FlatTable) Add(n *Node) bool {
 		// Only from a record at least as new as the entry's: senders use the adopted
 		// protocol node's own address, so taking one from an older record would point
 		// that protocol at an endpoint the peer has already moved off.
-		changed := false
+		changed := existing.AdoptProtocolsFrom(n)
 		newSeq := n.Record().Seq()
-		if newSeq >= existing.Record().Seq() {
-			if v4 := n.V4(); v4 != nil && !existing.HasV4() {
-				existing.SetV4(v4)
-				changed = true
-			}
-			if v5 := n.V5(); v5 != nil && !existing.HasV5() {
-				existing.SetV5(v5)
-				changed = true
-			}
-		}
 
 		// Update ENR if newer
 		if newSeq > existing.Record().Seq() {

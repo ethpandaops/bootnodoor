@@ -207,6 +207,86 @@ func (n *Node) SetV4(v4 *node.Node) {
 	n.MarkDirty(DirtyProtocol)
 }
 
+// AdoptProtocolsFrom installs protocol pointers this node lacks, taken from a
+// wrapper for the same peer, and reports whether anything changed.
+//
+// The freshness check and the install happen under one lock hold. Doing them
+// separately let a concurrent admission advance the record in between, so a
+// pointer built from an older record could still be installed — and because
+// adoption only ever fills an empty slot, that stale endpoint would then be
+// permanent.
+func (n *Node) AdoptProtocolsFrom(other *Node) bool {
+	if other == nil {
+		return false
+	}
+
+	otherRecord := other.Record()
+	otherV4, otherV5 := other.V4(), other.V5()
+	if otherRecord == nil || (otherV4 == nil && otherV5 == nil) {
+		return false
+	}
+
+	n.mu.Lock()
+	if n.enr != nil && otherRecord.Seq() < n.enr.Seq() {
+		n.mu.Unlock()
+		return false
+	}
+
+	changed := false
+	if otherV4 != nil && n.v4Node == nil {
+		n.v4Node = otherV4
+		changed = true
+	}
+	if otherV5 != nil && n.v5Node == nil {
+		n.v5Node = otherV5
+		changed = true
+	}
+	stats := n.nodeStats
+	v4, v5 := n.v4Node, n.v5Node
+	n.mu.Unlock()
+
+	if !changed {
+		return false
+	}
+
+	if stats != nil {
+		n.setupSharedStatsCallback()
+		if otherV4 != nil && v4 != nil {
+			v4.SetStats(stats)
+		}
+		if otherV5 != nil && v5 != nil {
+			v5.SetStats(stats)
+		}
+	}
+	n.MarkDirty(DirtyProtocol)
+	return true
+}
+
+// SetV5AtSeq installs a discv5 node only while the record it was probed from is
+// still current, so a result that arrived after the peer moved is discarded
+// rather than pinning traffic to the old endpoint.
+func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
+	if v5 == nil {
+		return false
+	}
+
+	n.mu.Lock()
+	if n.enr == nil || n.enr.Seq() != seq {
+		n.mu.Unlock()
+		return false
+	}
+	n.v5Node = v5
+	stats := n.nodeStats
+	n.mu.Unlock()
+
+	if stats != nil {
+		n.setupSharedStatsCallback()
+		v5.SetStats(stats)
+	}
+	n.MarkDirty(DirtyProtocol)
+	return true
+}
+
 // SetV5 sets the discv5 node and marks protocol support dirty.
 func (n *Node) SetV5(v5 *discv5node.Node) {
 	n.mu.Lock()

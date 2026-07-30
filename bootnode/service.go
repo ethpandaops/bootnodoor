@@ -1494,6 +1494,7 @@ func (s *Service) probeV5Support(id [32]byte, n *nodes.Node) {
 	if record == nil {
 		return
 	}
+	probedSeq := record.Seq()
 	v5Node, err := nodes.NewV5NodeFromRecord(record)
 	if err != nil {
 		return
@@ -1516,13 +1517,17 @@ func (s *Service) probeV5Support(id [32]byte, n *nodes.Node) {
 
 	// Re-resolve: this is the first moment the result can be applied, and the
 	// entry may have been swept or replaced while the ping was outstanding.
+	// SetV5AtSeq then discards the result if the peer moved on from the record we
+	// probed, rather than pinning v5 traffic to the address we happened to test.
 	target := s.elTable.Get(id)
 	if target == nil {
 		return
 	}
 	n = target
 
-	n.SetV5(v5Node)
+	if !n.SetV5AtSeq(v5Node, probedSeq) {
+		return
+	}
 	s.config.Logger.WithFields(logrus.Fields{
 		"peerID": n.PeerID(),
 		"addr":   n.Addr(),

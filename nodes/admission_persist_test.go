@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -302,4 +303,41 @@ func signedRecordAt(t *testing.T, key *ecdsa.PrivateKey, seq uint64, ip net.IP) 
 		t.Fatalf("sign: %v", err)
 	}
 	return rec
+}
+
+// Adoption only ever fills an empty slot, so a pointer installed from a stale
+// record is permanent. The freshness check and the install must therefore happen
+// under one lock hold, or a concurrent advance can slip between them.
+func TestAdoptProtocolsFromIsAtomicUnderRace(t *testing.T) {
+	database := persistTestDB(t, filepath.Join(t.TempDir(), "race.db"))
+	defer database.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ndb := NewNodeDB(ctx, database, db.LayerEL, quietTableLogger())
+
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	for round := 0; round < 200; round++ {
+		base, _ := discv5node.New(signedRecordAt(t, key, 3, net.IPv4(10, 7, 0, 1)))
+		entry := NewFromV5(base, ndb)
+
+		staleV5, _ := discv5node.New(signedRecordAt(t, key, 1, net.IPv4(10, 7, 0, 2)))
+		stale := NewFromV5(staleV5, ndb)
+		stale.SetV4(v4node.New(staleV5.PublicKey(), staleV5.Addr()))
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); entry.AdoptProtocolsFrom(stale) }()
+		go func() { defer wg.Done(); entry.UpdateENR(signedRecordAt(t, key, 9, net.IPv4(10, 7, 0, 3))) }()
+		wg.Wait()
+
+		if v4 := entry.V4(); v4 != nil && v4.Addr().IP.Equal(net.IPv4(10, 7, 0, 2)) {
+			t.Fatalf("round %d: installed a v4 pointer from the stale record", round)
+		}
+	}
 }
