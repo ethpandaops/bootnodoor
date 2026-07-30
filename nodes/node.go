@@ -89,9 +89,7 @@ func NewFromV4(v4 *node.Node, nodedb *NodeDB) *Node {
 		addr:      v4.Addr(),
 		nodeStats: nodeStats,
 	}
-	if n.enr != nil {
-		n.v4Seq = n.enr.Seq()
-	}
+	n.v4Seq = v4RecordSeq(v4)
 
 	// Set up callback on shared stats to trigger DB updates
 	n.setupSharedStatsCallback()
@@ -125,9 +123,7 @@ func NewFromV5(v5 *discv5node.Node, nodedb *NodeDB) *Node {
 		addr:      v5.Addr(),
 		nodeStats: nodeStats,
 	}
-	if n.enr != nil {
-		n.v5Seq = n.enr.Seq()
-	}
+	n.v5Seq = v5RecordSeq(v5)
 
 	// Set up callback on shared stats to trigger DB updates
 	n.setupSharedStatsCallback()
@@ -209,9 +205,7 @@ func (n *Node) HasV5() bool {
 func (n *Node) SetV4(v4 *node.Node) {
 	n.mu.Lock()
 	n.v4Node = v4
-	if n.enr != nil {
-		n.v4Seq = n.enr.Seq()
-	}
+	n.v4Seq = protocolSeq(v4RecordSeq(v4), n.recordSeqLocked())
 	n.mu.Unlock()
 
 	if v4 != nil && n.nodeStats != nil {
@@ -251,15 +245,14 @@ func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 		return false, false
 	}
 
-	otherSeq := otherRecord.Seq()
-	if otherV4 != nil && (n.v4Node == nil || otherSeq > n.v4Seq) {
+	if otherV4Seq := protocolSeq(v4RecordSeq(otherV4), otherRecord.Seq()); otherV4 != nil && (n.v4Node == nil || otherV4Seq > n.v4Seq) {
 		n.v4Node = otherV4
-		n.v4Seq = otherSeq
+		n.v4Seq = otherV4Seq
 		adopted = true
 	}
-	if otherV5 != nil && (n.v5Node == nil || otherSeq > n.v5Seq) {
+	if otherV5Seq := protocolSeq(v5RecordSeq(otherV5), otherRecord.Seq()); otherV5 != nil && (n.v5Node == nil || otherV5Seq > n.v5Seq) {
 		n.v5Node = otherV5
-		n.v5Seq = otherSeq
+		n.v5Seq = otherV5Seq
 		adopted = true
 	}
 
@@ -312,7 +305,7 @@ func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
 		return false
 	}
 	n.v5Node = v5
-	n.v5Seq = seq
+	n.v5Seq = v5RecordSeq(v5)
 	stats := n.nodeStats
 	n.mu.Unlock()
 
@@ -328,9 +321,7 @@ func (n *Node) SetV5AtSeq(v5 *discv5node.Node, seq uint64) bool {
 func (n *Node) SetV5(v5 *discv5node.Node) {
 	n.mu.Lock()
 	n.v5Node = v5
-	if n.enr != nil {
-		n.v5Seq = n.enr.Seq()
-	}
+	n.v5Seq = v5RecordSeq(v5)
 	n.mu.Unlock()
 
 	if v5 != nil && n.nodeStats != nil {
@@ -683,4 +674,46 @@ func NewV5NodeFromRecord(record *enr.Record) (*discv5node.Node, error) {
 // This is a helper for protocol support checks.
 func NewV4NodeFromRecord(record *enr.Record, addr *net.UDPAddr) (*node.Node, error) {
 	return node.FromENR(record, addr)
+}
+
+// v4RecordSeq and v5RecordSeq read the sequence of the record a protocol pointer
+// was built from. The label has to follow the pointer, not the wrapper that
+// carried it: stamping a pointer with its carrier's sequence marks an old
+// endpoint as current and blocks the admission that would replace it.
+func v4RecordSeq(v4 *node.Node) uint64 {
+	if v4 == nil {
+		return 0
+	}
+	if rec := v4.ENR(); rec != nil {
+		return rec.Seq()
+	}
+	return 0
+}
+
+func v5RecordSeq(v5 *discv5node.Node) uint64 {
+	if v5 == nil {
+		return 0
+	}
+	if rec := v5.Record(); rec != nil {
+		return rec.Seq()
+	}
+	return 0
+}
+
+// protocolSeq prefers the sequence of the record a pointer was built from, and
+// falls back to its carrier's. A discv4 node created from an enode has no record
+// of its own, so without the fallback every such pointer would be labelled 0 and
+// no later admission could ever replace it.
+func protocolSeq(pointerSeq, carrierSeq uint64) uint64 {
+	if pointerSeq != 0 {
+		return pointerSeq
+	}
+	return carrierSeq
+}
+
+func (n *Node) recordSeqLocked() uint64 {
+	if n.enr == nil {
+		return 0
+	}
+	return n.enr.Seq()
 }
