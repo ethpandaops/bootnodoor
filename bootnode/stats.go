@@ -61,9 +61,12 @@ func (s *Service) GetStats() Stats {
 			out.Ping.PingTimeouts += p.PingTimeouts
 			out.Ping.PingsV5 += p.PingsV5
 			out.Ping.PingsV4 += p.PingsV4
-			if p.AverageRTT > 0 {
-				totalRTT += p.AverageRTT
-				rttSamples++
+			// Weight by the sample count behind each average: EL and CL rarely
+			// answer the same number of pings, and averaging the averages would
+			// let the quieter identity move the aggregate as much as the busier one.
+			if p.AverageRTT > 0 && p.PongsReceived > 0 {
+				totalRTT += p.AverageRTT * time.Duration(p.PongsReceived)
+				rttSamples += p.PongsReceived
 			}
 		}
 

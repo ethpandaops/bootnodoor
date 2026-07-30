@@ -68,6 +68,9 @@ type Service struct {
 	// ENR request tracking (prevents duplicate requests)
 	pendingENRRequestsV4 sync.Map // map[node.ID]time.Time
 
+	// v5ProbeSem bounds concurrent v5 capability probes
+	v5ProbeSem chan struct{}
+
 	// Lifecycle
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -106,9 +109,10 @@ func New(cfg *Config) (*Service, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Service{
-		config: cfg,
-		ctx:    ctx,
-		cancel: cancel,
+		config:     cfg,
+		ctx:        ctx,
+		cancel:     cancel,
+		v5ProbeSem: make(chan struct{}, maxConcurrentV5Probes),
 	}
 
 	// Resolve discovery identities (one shared, or separate EL/CL keys).
@@ -1383,11 +1387,17 @@ func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
 		}
 	}
 
-	if n.HasV4() && !n.HasV5() {
-		s.probeV5Support(n)
+	result := s.admitToTable(n, s.elTable, db.LayerEL)
+
+	// After admission, and off this goroutine: each probe waits a request timeout,
+	// so probing a 16-node NEIGHBORS response inline stalled the lookup and the
+	// whole maintenance loop for over a minute. Resolving the table entry rather
+	// than reusing n also means the result lands on the object the table kept.
+	if result == services.AdmissionAccepted && n.HasV4() && !n.HasV5() {
+		s.scheduleV5Probe(n.ID())
 	}
 
-	return s.admitToTable(n, s.elTable, db.LayerEL)
+	return result
 }
 
 // admitCLLookupNode decides admission of a lookup-discovered node to the CL
@@ -1429,6 +1439,32 @@ func (s *Service) admitToTable(n *nodes.Node, table *nodes.FlatTable, layer db.N
 
 // probeV5Support pings a v4-discovered node over discv5 and, on success,
 // attaches v5 support so lookups prefer the richer protocol.
+// maxConcurrentV5Probes bounds the probes in flight so a large NEIGHBORS response
+// cannot spawn one goroutine per node.
+const maxConcurrentV5Probes = 8
+
+// scheduleV5Probe runs a v5 probe for an admitted node without blocking the
+// caller. Dropping the probe when saturated is fine: the node stays v4-only and
+// the next lookup that rediscovers it tries again.
+func (s *Service) scheduleV5Probe(id [32]byte) {
+	select {
+	case s.v5ProbeSem <- struct{}{}:
+	default:
+		return
+	}
+
+	go func() {
+		defer func() { <-s.v5ProbeSem }()
+
+		if s.elTable == nil {
+			return
+		}
+		if n := s.elTable.Get(id); n != nil {
+			s.probeV5Support(n)
+		}
+	}()
+}
+
 func (s *Service) probeV5Support(n *nodes.Node) {
 	handler := s.getV5Handler()
 	if handler == nil {
@@ -1448,8 +1484,13 @@ func (s *Service) probeV5Support(n *nodes.Node) {
 	if err != nil {
 		return
 	}
-	resp := <-respChan
-	if resp.Error != nil {
+	var resp *v5protocol.Response
+	select {
+	case resp = <-respChan:
+	case <-s.ctx.Done():
+		return
+	}
+	if resp == nil || resp.Error != nil {
 		return
 	}
 

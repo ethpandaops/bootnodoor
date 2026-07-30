@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/ethpandaops/bootnodoor/db"
+	v4node "github.com/ethpandaops/bootnodoor/discv4/node"
+	discv5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/sirupsen/logrus"
 )
 
@@ -194,4 +196,48 @@ func TestClearDirtySnapshotKeepsUnobservedFlags(t *testing.T) {
 	if got := n.GetDirtyFlags(); got&DirtyLastActive == 0 {
 		t.Error("same-bit re-mark was cleared unwritten")
 	}
+}
+
+// A peer found over discv4 can be admitted as v5-only first, if its handshake
+// completes before the v4 admission lands. Add previously refreshed only a newer
+// ENR, so the v4 pointer was dropped and the peer persisted as v5-only.
+func TestAddMergesProtocolCapabilities(t *testing.T) {
+	database := persistTestDB(t, filepath.Join(t.TempDir(), "merge.db"))
+	defer database.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := quietTableLogger()
+	ndb := NewNodeDB(ctx, database, db.LayerEL, logger)
+	table := newPersistTable(t, ndb, logger)
+
+	v5 := makeV5At(t, net.IPv4(10, 9, 0, 1))
+	first := NewFromV5(v5, ndb)
+	if !table.Add(first) {
+		t.Fatal("v5-only node was not admitted")
+	}
+	if table.Get(first.ID()).HasV4() {
+		t.Fatal("precondition: entry should start v5-only")
+	}
+
+	// The same peer arriving over discv4, as the probe path produces it.
+	second := NewFromV5(v5, ndb)
+	second.SetV4(makeV4For(t, v5))
+	if !table.Add(second) {
+		t.Fatal("second admission was rejected")
+	}
+
+	entry := table.Get(first.ID())
+	if !entry.HasV4() {
+		t.Error("v4 capability was lost: the table entry is still v5-only")
+	}
+	if !entry.HasV5() {
+		t.Error("v5 capability was dropped by the merge")
+	}
+}
+
+func makeV4For(t *testing.T, v5 *discv5node.Node) *v4node.Node {
+	t.Helper()
+	return v4node.New(v5.PublicKey(), v5.Addr())
 }

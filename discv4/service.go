@@ -32,6 +32,7 @@ type Transport interface {
 	protocol.Transport
 	LocalAddr() *net.UDPAddr
 	AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
+	AddHandlerFor(protocol string, handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
 }
 
 // Service represents a discv4 service instance.
@@ -125,7 +126,7 @@ func New(config *Config, transport Transport) (*Service, error) {
 	}
 
 	// Register packet handler with transport
-	transport.AddHandler(s.packetHandler)
+	transport.AddHandlerFor("discv4", s.packetHandler)
 
 	return s, nil
 }

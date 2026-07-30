@@ -260,6 +260,20 @@ func (t *FlatTable) Add(n *Node) bool {
 	if existing, exists := t.activeNodes[nodeID]; exists {
 		t.mu.Unlock()
 
+		// Adopt protocols the entry lacks. A peer found over discv4 can be admitted
+		// as v5-only first if its handshake completes before the v4 admission lands;
+		// keeping only the newer ENR would drop the v4 pointer and persist the peer
+		// as v5-only.
+		changed := false
+		if v4 := n.V4(); v4 != nil && !existing.HasV4() {
+			existing.SetV4(v4)
+			changed = true
+		}
+		if v5 := n.V5(); v5 != nil && !existing.HasV5() {
+			existing.SetV5(v5)
+			changed = true
+		}
+
 		// Update ENR if newer
 		newSeq := n.Record().Seq()
 		if newSeq > existing.Record().Seq() {
@@ -267,8 +281,12 @@ func (t *FlatTable) Add(n *Node) bool {
 
 			// Queue ENR update (preserves stats)
 			existing.MarkDirty(DirtyENR)
+			changed = true
+		}
+
+		if changed {
 			if err := t.db.QueueUpdate(existing); err != nil {
-				t.logger.WithError(err).WithField("peerID", existing.PeerID()).Debug("failed to queue ENR update")
+				t.logger.WithError(err).WithField("peerID", existing.PeerID()).Debug("failed to queue node update")
 			}
 
 			if t.nodeChangedCallback != nil {

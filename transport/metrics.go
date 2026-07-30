@@ -122,6 +122,8 @@ func (m *Metrics) Reset() {
 	m.sendErrors.Store(0)
 	m.receiveErrors.Store(0)
 	m.rateLimited.Store(0)
+	m.packetsFellThrough.Store(0)
+	m.packetsUnhandled.Store(0)
 }
 
 // PacketsSent returns the number of packets sent.

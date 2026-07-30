@@ -54,6 +54,7 @@ type Transport interface {
 	protocol.Transport
 	LocalAddr() *net.UDPAddr
 	AddHandler(handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
+	AddHandlerFor(protocol string, handler func(data []byte, from *net.UDPAddr, localAddr *net.UDPAddr) bool)
 }
 
 // New creates a new discv5 service.
@@ -169,7 +170,7 @@ func New(cfg *Config, transport Transport) (*Service, error) {
 	protocolHandler.SetTransport(transport)
 
 	// Register packet handler with transport
-	transport.AddHandler(s.packetHandler)
+	transport.AddHandlerFor("discv5", s.packetHandler)
 
 	return s, nil
 }
