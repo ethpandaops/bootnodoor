@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/ethpandaops/bootnodoor/bootnode/clconfig"
 	"github.com/ethpandaops/bootnodoor/bootnode/elconfig"
 	"github.com/ethpandaops/bootnodoor/db"
+	v4node "github.com/ethpandaops/bootnodoor/discv4/node"
 	v5node "github.com/ethpandaops/bootnodoor/discv5/node"
 	"github.com/ethpandaops/bootnodoor/enr"
 	"github.com/ethpandaops/bootnodoor/nodes"
@@ -23,6 +25,20 @@ func quietLogger() *logrus.Logger {
 	l := logrus.New()
 	l.SetLevel(logrus.PanicLevel)
 	return l
+}
+
+func newTestDatabase(t *testing.T) *db.Database {
+	t.Helper()
+
+	database := db.NewDatabase(&db.SqliteDatabaseConfig{File: filepath.Join(t.TempDir(), "test.db"), MaxOpenConns: 5, MaxIdleConns: 2}, quietLogger())
+	if err := database.Init(); err != nil {
+		t.Fatalf("db init: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	if err := database.ApplyEmbeddedDbSchema(-2); err != nil {
+		t.Fatalf("db schema: %v", err)
+	}
+	return database
 }
 
 // storedENRWith builds a signed ENR carrying the given extra fields, simulating
@@ -130,14 +146,7 @@ func newTestService(t *testing.T, ids []*identity) *Service {
 	t.Helper()
 
 	logger := quietLogger()
-	database := db.NewDatabase(&db.SqliteDatabaseConfig{File: ":memory:", MaxOpenConns: 5, MaxIdleConns: 2}, logger)
-	if err := database.Init(); err != nil {
-		t.Fatalf("db init: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
-	if err := database.ApplyEmbeddedDbSchema(-2); err != nil {
-		t.Fatalf("db schema: %v", err)
-	}
+	database := newTestDatabase(t)
 
 	cfg := &Config{Logger: logger, Database: database}
 	for _, id := range ids {
@@ -439,11 +448,13 @@ func TestCreateLocalNode_ExplicitIPWins(t *testing.T) {
 	}
 }
 
-// An auto-detected (not explicitly configured) IP must not override the stored
-// address, so a learned/discovered external IP survives a restart.
-func TestCreateLocalNode_AutoDetectedIPPreservesStored(t *testing.T) {
+// A stored IP is IP-discovery consensus (or a prior config): behind 1:1 NAT the
+// auto-detected interface address is routable but not reachable, so it must not
+// regress the record at every restart.
+func TestCreateLocalNode_AutoDetectedRoutableIPPreservesStored(t *testing.T) {
 	key := mustKey(t)
-	stored := storedENRWith(t, key, nil) // advertises 1.2.3.4
+	stored := storedENRWith(t, key, nil)
+	storedSeq := stored.Seq()
 	cfg := &Config{Logger: quietLogger(), ENRIPProvided: false}
 
 	ln, err := createLocalNode(cfg, key, net.ParseIP("5.6.7.8"), nil, 9000, stored)
@@ -452,6 +463,48 @@ func TestCreateLocalNode_AutoDetectedIPPreservesStored(t *testing.T) {
 	}
 	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("1.2.3.4")) {
 		t.Errorf("ENR ip = %v, want preserved 1.2.3.4", ip)
+	}
+	if seq := ln.Record().Seq(); seq != storedSeq {
+		t.Errorf("ENR sequence = %d, want unchanged %d", seq, storedSeq)
+	}
+}
+
+func TestCreateLocalNode_AutoDetectedRoutableIPFillsEmptyStored(t *testing.T) {
+	key := mustKey(t)
+	stored, err := buildENR(key, nil, nil, 9000)
+	if err != nil {
+		t.Fatalf("buildENR: %v", err)
+	}
+	storedSeq := stored.Seq()
+	cfg := &Config{Logger: quietLogger(), ENRIPProvided: false}
+
+	ln, err := createLocalNode(cfg, key, net.ParseIP("5.6.7.8"), nil, 9000, stored)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("5.6.7.8")) {
+		t.Errorf("ENR ip = %v, want detected 5.6.7.8 seeded into the empty record", ip)
+	}
+	if seq := ln.Record().Seq(); seq != storedSeq+1 {
+		t.Errorf("ENR sequence = %d, want %d", seq, storedSeq+1)
+	}
+}
+
+func TestCreateLocalNode_AutoDetectedPrivateIPPreservesStored(t *testing.T) {
+	key := mustKey(t)
+	stored := storedENRWith(t, key, nil)
+	storedSeq := stored.Seq()
+	cfg := &Config{Logger: quietLogger(), ENRIPProvided: false}
+
+	ln, err := createLocalNode(cfg, key, net.ParseIP("10.0.0.5"), nil, 9000, stored)
+	if err != nil {
+		t.Fatalf("createLocalNode: %v", err)
+	}
+	if ip := ln.Record().IP(); ip == nil || !ip.Equal(net.ParseIP("1.2.3.4")) {
+		t.Errorf("ENR ip = %v, want preserved 1.2.3.4", ip)
+	}
+	if seq := ln.Record().Seq(); seq != storedSeq {
+		t.Errorf("ENR sequence = %d, want unchanged %d", seq, storedSeq)
 	}
 }
 
@@ -648,14 +701,7 @@ func newServeAllTestService(t *testing.T, serveAll bool) *Service {
 	t.Helper()
 
 	logger := quietLogger()
-	database := db.NewDatabase(&db.SqliteDatabaseConfig{File: ":memory:", MaxOpenConns: 5, MaxIdleConns: 2}, logger)
-	if err := database.Init(); err != nil {
-		t.Fatalf("db init: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
-	if err := database.ApplyEmbeddedDbSchema(-2); err != nil {
-		t.Fatalf("db schema: %v", err)
-	}
+	database := newTestDatabase(t)
 
 	cfg := &Config{
 		Logger:        logger,
@@ -751,6 +797,61 @@ func TestFilterNodesForRequesterDedupes(t *testing.T) {
 	}
 	if got[0].ID() != a.ID() || got[1].ID() != other.ID() {
 		t.Errorf("filterNodesForRequester did not keep first occurrences in order")
+	}
+}
+
+func TestOnNodeSeenV4UpdatesRestoredAddress(t *testing.T) {
+	s := newServeAllTestService(t, true)
+	record := storedENRWith(t, mustKey(t), nil)
+	oldAddr := &net.UDPAddr{IP: net.ParseIP("5.6.7.8"), Port: 9000}
+	oldNode, err := v4node.FromENR(record, oldAddr)
+	if err != nil {
+		t.Fatalf("old v4 node: %v", err)
+	}
+
+	stored := nodes.NewFromV4(oldNode, s.elNodeDB)
+	stored.SetLastSeen(time.Now())
+	if !s.elTable.Add(stored) {
+		t.Fatal("old node was not admitted")
+	}
+
+	waitForRows(t, s.config.Database, 1)
+
+	var localID [32]byte
+	restoredTable, err := s.createTable(localID, s.elNodeDB, "EL")
+	if err != nil {
+		t.Fatalf("create restored table: %v", err)
+	}
+	if err := restoredTable.LoadInitialNodesFromDB(); err != nil {
+		t.Fatalf("load restored table: %v", err)
+	}
+	s.elTable = restoredTable
+
+	newAddr := &net.UDPAddr{IP: net.ParseIP("9.9.9.9"), Port: 9100}
+	movedNode, err := v4node.FromENR(record, newAddr)
+	if err != nil {
+		t.Fatalf("moved v4 node: %v", err)
+	}
+	s.onNodeSeenV4(movedNode, time.Now())
+
+	got := s.onFindNodeV4(nil, movedNode.IDBytes(), &net.UDPAddr{IP: net.ParseIP("8.8.4.4"), Port: 30303})
+	if len(got) != 1 {
+		t.Fatalf("FINDNODE returned %d nodes, want 1", len(got))
+	}
+	if addr := got[0].Addr(); !addr.IP.Equal(newAddr.IP) || addr.Port != newAddr.Port {
+		t.Errorf("FINDNODE address = %v, want %v", addr, newAddr)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		reloaded, loadErr := s.elNodeDB.Load(movedNode.ID())
+		if loadErr == nil && reloaded.Addr().IP.Equal(newAddr.IP) && reloaded.Addr().Port == newAddr.Port {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("persisted address did not move to %v", newAddr)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

@@ -128,25 +128,14 @@ func New(record *enr.Record) (*Node, error) {
 	}, nil
 }
 
-// udpEndpoint extracts the discovery endpoint from a record, keeping the port
-// paired with its address family: ip goes with udp, ip6 with udp6 (falling
-// back to udp, which dual-stack records share across both families).
+// udpEndpoint extracts the discovery endpoint from a record; the address-family
+// pairing rule lives in enr.Record.UDPEndpoint.
 func udpEndpoint(record *enr.Record) (*net.UDPAddr, error) {
-	ip := record.IP()
-	port := record.UDP()
-	if ip == nil {
-		ip = record.IP6()
-		if p := record.UDP6(); p != 0 {
-			port = p
-		}
+	addr := record.UDPEndpoint()
+	if addr == nil {
+		return nil, fmt.Errorf("node: ENR missing UDP endpoint")
 	}
-	if ip == nil {
-		return nil, fmt.Errorf("node: ENR missing IP address")
-	}
-	if port == 0 {
-		return nil, fmt.Errorf("node: ENR missing UDP port")
-	}
-	return &net.UDPAddr{IP: ip, Port: int(port)}, nil
+	return addr, nil
 }
 
 // ID returns the node's unique identifier.

@@ -61,6 +61,9 @@ type Service struct {
 	elTable *nodes.FlatTable // May be nil if EL disabled
 	clTable *nodes.FlatTable // May be nil if CL disabled
 
+	configuredELBootnodes map[[32]byte]struct{}
+	configuredCLBootnodes map[[32]byte]struct{}
+
 	// Discovery services (ping is per-identity; see identity.pingService)
 	elLookupService *services.LookupService // EL lookup service (may be nil if EL disabled)
 	clLookupService *services.LookupService // CL lookup service (may be nil if CL disabled)
@@ -117,6 +120,7 @@ func New(cfg *Config) (*Service, error) {
 		cancel:     cancel,
 		v5ProbeSem: make(chan struct{}, maxConcurrentV5Probes),
 	}
+	s.indexConfiguredBootnodes()
 
 	// Resolve discovery identities (one shared, or separate EL/CL keys).
 	s.identities = resolveIdentities(cfg)
@@ -369,17 +373,31 @@ func (s *Service) initDiscv4(id *identity) error {
 
 // createTable creates a routing table for a layer.
 func (s *Service) createTable(localID [32]byte, nodeDB *nodes.NodeDB, layerName string) (*nodes.FlatTable, error) {
+	var admitPersistedNode func(*nodes.Node) bool
+	if !s.config.ServeAll && s.enrManager != nil {
+		switch layerName {
+		case "EL":
+			admitPersistedNode = func(n *nodes.Node) bool {
+				isEL, _ := s.classifyELNode(n.ID(), n.Record())
+				return isEL
+			}
+		case "CL":
+			admitPersistedNode = func(n *nodes.Node) bool {
+				return s.classifyCLNode(n.ID(), n.Record())
+			}
+		}
+	}
+
 	tableConfig := nodes.FlatTableConfig{
 		LocalID:             localID,
 		DB:                  nodeDB,
 		MaxActiveNodes:      s.config.MaxActiveNodes,
 		MaxNodesPerIP:       s.config.MaxNodesPerIP,
-		PingInterval:        s.config.PingInterval,
-		PingRate:            200,
 		MaxNodeAge:          s.config.MaxNodeAge,
 		MaxFailures:         s.config.MaxFailures,
 		SweepPercent:        10,
 		NodeChangedCallback: nil,
+		AdmitPersistedNode:  admitPersistedNode,
 		Logger:              s.config.Logger.WithField("layer", layerName),
 	}
 
@@ -389,6 +407,86 @@ func (s *Service) createTable(localID [32]byte, nodeDB *nodes.NodeDB, layerName 
 	}
 
 	return table, nil
+}
+
+func (s *Service) indexConfiguredBootnodes() {
+	s.configuredELBootnodes = make(map[[32]byte]struct{})
+	s.configuredCLBootnodes = make(map[[32]byte]struct{})
+
+	for _, raw := range s.config.ELBootnodes {
+		if id, ok := configuredBootnodeID(raw, true); ok {
+			s.configuredELBootnodes[id] = struct{}{}
+		}
+	}
+	for _, raw := range s.config.CLBootnodes {
+		if id, ok := configuredBootnodeID(raw, false); ok {
+			s.configuredCLBootnodes[id] = struct{}{}
+		}
+	}
+}
+
+func configuredBootnodeID(raw string, allowEnode bool) ([32]byte, bool) {
+	if record, err := enr.DecodeBase64(raw); err == nil {
+		if pubkey := record.PublicKey(); pubkey != nil {
+			return [32]byte(v5node.PubkeyToID(pubkey)), true
+		}
+	}
+	if allowEnode {
+		if parsed, err := enode.Parse(raw); err == nil {
+			var id [32]byte
+			copy(id[:], parsed.NodeID())
+			return id, true
+		}
+	}
+	return [32]byte{}, false
+}
+
+func (s *Service) isConfiguredBootnode(id [32]byte, layer db.NodeLayer) bool {
+	switch layer {
+	case db.LayerEL:
+		_, ok := s.configuredELBootnodes[id]
+		return ok
+	case db.LayerCL:
+		_, ok := s.configuredCLBootnodes[id]
+		return ok
+	default:
+		return false
+	}
+}
+
+// bypassesForkFilter reports whether a configured bootnode advertises no fork
+// field for the layer: the operator vouched for it, so a missing field is not
+// grounds for rejection (an advertised field is still validated).
+func (s *Service) bypassesForkFilter(id [32]byte, record *enr.Record, layer db.NodeLayer, field string) bool {
+	return s.isConfiguredBootnode(id, layer) && record != nil && !record.Has(field)
+}
+
+func (s *Service) classifyELNode(id [32]byte, record *enr.Record) (bool, elconfig.ForkID) {
+	if s.bypassesForkFilter(id, record, db.LayerEL, "eth") {
+		return true, elconfig.ForkID{}
+	}
+	return s.enrManager.ClassifyELNode(record)
+}
+
+func (s *Service) admitELNode(id [32]byte, record *enr.Record) (bool, elconfig.ForkID) {
+	if s.bypassesForkFilter(id, record, db.LayerEL, "eth") {
+		return true, elconfig.ForkID{}
+	}
+	return s.enrManager.AdmitELNode(record)
+}
+
+func (s *Service) classifyCLNode(id [32]byte, record *enr.Record) bool {
+	if s.bypassesForkFilter(id, record, db.LayerCL, "eth2") {
+		return true
+	}
+	return s.enrManager.ClassifyCLNode(record)
+}
+
+func (s *Service) admitCLNode(id [32]byte, record *enr.Record) bool {
+	if s.bypassesForkFilter(id, record, db.LayerCL, "eth2") {
+		return true
+	}
+	return s.enrManager.AdmitCLNode(record)
 }
 
 func (s *Service) elIdentity() *identity {
@@ -445,6 +543,21 @@ func (s *Service) clPing() *services.PingService {
 	return nil
 }
 
+// loadInitialNodes bootstraps the active pools from the databases.
+func (s *Service) loadInitialNodes() error {
+	if s.elTable != nil {
+		if err := s.elTable.LoadInitialNodesFromDB(); err != nil {
+			return fmt.Errorf("failed to load EL nodes: %w", err)
+		}
+	}
+	if s.clTable != nil {
+		if err := s.clTable.LoadInitialNodesFromDB(); err != nil {
+			return fmt.Errorf("failed to load CL nodes: %w", err)
+		}
+	}
+	return nil
+}
+
 // Start starts the bootnode service.
 func (s *Service) Start() error {
 	s.mu.Lock()
@@ -456,16 +569,8 @@ func (s *Service) Start() error {
 
 	s.startTime = time.Now()
 
-	// Load initial nodes from databases
-	if s.elTable != nil {
-		if err := s.elTable.LoadInitialNodesFromDB(); err != nil {
-			return fmt.Errorf("failed to load EL nodes: %w", err)
-		}
-	}
-	if s.clTable != nil {
-		if err := s.clTable.LoadInitialNodesFromDB(); err != nil {
-			return fmt.Errorf("failed to load CL nodes: %w", err)
-		}
+	if err := s.loadInitialNodes(); err != nil {
+		return err
 	}
 
 	// Start protocol services (one discv5 service per identity)
@@ -809,56 +914,25 @@ func (s *Service) performTableMaintenance() {
 
 // performAlivenessCheck checks node aliveness by pinging a sample of nodes.
 func (s *Service) performAlivenessCheck() {
-	// Ping a sample from each table
 	const sampleSize = 10 // Ping 10 nodes per table per check
 
-	// Ping EL nodes
-	if s.elTable != nil && s.elPing() != nil {
-		elNodes := s.elTable.GetActiveNodes()
-		if len(elNodes) > sampleSize {
-			// Shuffle and take sample
-			perm := make([]int, len(elNodes))
-			for i := range perm {
-				perm[i] = i
-			}
-			for i := range perm {
-				j := i + int(time.Now().UnixNano())%(len(perm)-i)
-				perm[i], perm[j] = perm[j], perm[i]
-			}
-			sample := make([]*nodes.Node, sampleSize)
-			for i := 0; i < sampleSize; i++ {
-				sample[i] = elNodes[perm[i]]
-			}
-			elNodes = sample
-		}
+	s.pingSample(s.elTable, s.elPing(), "EL", sampleSize)
+	s.pingSample(s.clTable, s.clPing(), "CL", sampleSize)
+}
 
-		s.config.Logger.WithField("count", len(elNodes)).WithField("layer", "EL").Debug("pinging nodes")
-		s.elPing().PingMultiple(elNodes)
+// pingSample prunes dead nodes, pings a random sample of the remainder, and
+// prunes again so nodes the pings just failed stop being served promptly.
+func (s *Service) pingSample(table *nodes.FlatTable, ping *services.PingService, layer string, sampleSize int) {
+	if table == nil || ping == nil {
+		return
 	}
 
-	// Ping CL nodes
-	if s.clTable != nil && s.clPing() != nil {
-		clNodes := s.clTable.GetActiveNodes()
-		if len(clNodes) > sampleSize {
-			// Shuffle and take sample
-			perm := make([]int, len(clNodes))
-			for i := range perm {
-				perm[i] = i
-			}
-			for i := range perm {
-				j := i + int(time.Now().UnixNano())%(len(perm)-i)
-				perm[i], perm[j] = perm[j], perm[i]
-			}
-			sample := make([]*nodes.Node, sampleSize)
-			for i := 0; i < sampleSize; i++ {
-				sample[i] = clNodes[perm[i]]
-			}
-			clNodes = sample
-		}
+	table.PruneDeadNodes()
+	sample := table.GetRandomActiveNodes(sampleSize)
 
-		s.config.Logger.WithField("count", len(clNodes)).WithField("layer", "CL").Debug("pinging nodes")
-		s.clPing().PingMultiple(clNodes)
-	}
+	s.config.Logger.WithField("count", len(sample)).WithField("layer", layer).Debug("pinging nodes")
+	ping.PingMultiple(sample)
+	table.PruneDeadNodes()
 }
 
 // performRandomWalk performs random walk for discovery.
@@ -910,6 +984,9 @@ func (s *Service) performProtocolSupportCheck() {
 
 			// Queue protocol support updates for all checked nodes (SetV4/SetV5 already marked them dirty)
 			for _, n := range elNodes {
+				// A refreshed ENR can move the node's addr; re-adding routes the
+				// move through the IP limiter.
+				s.elTable.Add(n)
 				if err := s.elNodeDB.QueueUpdate(n); err != nil {
 					s.config.Logger.WithError(err).WithField("nodeID", n.PeerID()).Debug("failed to queue node for protocol support update")
 				}
@@ -1016,10 +1093,9 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 		return
 	}
 
-	// Filter by fork ID before adding. Serve-all must not drop a configured seed:
-	// rejecting the only seed leaves the table empty, so discovery never starts.
+	// Validate an advertised fork ID. The configured layer supplies a missing one.
 	if !s.config.ServeAll && s.enrManager != nil {
-		isEL, forkID := s.enrManager.AdmitELNode(record)
+		isEL, forkID := s.admitELNode([32]byte(v5.ID()), record)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", v5.ID().Bytes()[:8]),
@@ -1030,7 +1106,7 @@ func (s *Service) connectELBootnodeENR(record *enr.Record) {
 	}
 
 	genericNode := nodes.NewFromV5(v5, s.elNodeDB)
-	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode, s.config.Logger.WithField("layer", "EL"))
+	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode, db.LayerEL, s.config.Logger.WithField("layer", "EL"))
 }
 
 // connectELBootnodeEnode connects to an EL bootnode via enode URL.
@@ -1069,9 +1145,9 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	// Set the ENR on the node
 	v4Node.SetENR(enrRecord)
 
-	// Filter by fork ID before adding
+	// Validate an advertised fork ID. The configured layer supplies a missing one.
 	if !s.config.ServeAll && s.enrManager != nil {
-		isEL, forkID := s.enrManager.AdmitELNode(enrRecord)
+		isEL, forkID := s.admitELNode([32]byte(nodeID), enrRecord)
 		if !isEL {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", nodeID[:8]),
@@ -1087,7 +1163,7 @@ func (s *Service) connectELBootnodeEnode(enodeURL *enode.Enode) {
 	// Track successful ENR exchange
 	genericNode.IncrementSuccess()
 
-	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode,
+	s.addBootnodeToTable(s.elTable, s.elNodeDB, genericNode, db.LayerEL,
 		s.config.Logger.WithField("layer", "EL").WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])))
 }
 
@@ -1111,25 +1187,25 @@ func (s *Service) connectCLBootnodes() {
 
 		nodeID := v5.ID()
 
-		// Filter by fork digest before adding
-		if !s.config.ServeAll && s.enrManager != nil && !s.enrManager.AdmitCLNode(record) {
+		// Validate an advertised fork digest. The configured layer supplies a missing one.
+		if !s.config.ServeAll && s.enrManager != nil && !s.admitCLNode([32]byte(nodeID), record) {
 			s.config.Logger.WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])).Warn("CL bootnode ENR has invalid fork digest, skipping")
 			continue
 		}
 
 		genericNode := nodes.NewFromV5(v5, s.clNodeDB)
-		s.addBootnodeToTable(s.clTable, s.clNodeDB, genericNode,
+		s.addBootnodeToTable(s.clTable, s.clNodeDB, genericNode, db.LayerCL,
 			s.config.Logger.WithField("layer", "CL").WithField("nodeID", fmt.Sprintf("%x", nodeID[:8])))
 	}
 }
 
 // addBootnodeToTable admits a configured bootnode to a routing table and
 // persists it.
-func (s *Service) addBootnodeToTable(table *nodes.FlatTable, nodeDB *nodes.NodeDB, n *nodes.Node, logger logrus.FieldLogger) {
+func (s *Service) addBootnodeToTable(table *nodes.FlatTable, nodeDB *nodes.NodeDB, n *nodes.Node, layer db.NodeLayer, logger logrus.FieldLogger) {
 	if table == nil {
 		return
 	}
-	if !table.Add(n) {
+	if s.admitToTable(n, table, layer) != services.AdmissionAccepted {
 		logger.Debug("bootnode not admitted to table, not persisting")
 		return
 	}
@@ -1186,24 +1262,28 @@ func (s *Service) onNodeSeen(n *v5node.Node, timestamp time.Time) {
 			isEL = s.elTable != nil
 			isCL = s.clTable != nil
 		} else {
-			isEL, _ = s.enrManager.ClassifyELNode(n.Record())
-			isCL = s.enrManager.ClassifyCLNode(n.Record())
+			isEL, _ = s.classifyELNode([32]byte(nodeID), n.Record())
+			isCL = s.classifyCLNode([32]byte(nodeID), n.Record())
 		}
 
 		if isEL && s.elTable != nil && s.elNodeDB != nil {
 			if genericNode := s.elTable.Get(nodeID); genericNode != nil {
-				genericNode.SetLastSeen(timestamp) // This marks it dirty
+				genericNode.MarkSeen(timestamp)
 				// Get falls back to the DB, so Add re-admits demoted nodes
 				s.elTable.Add(genericNode)
 				s.elNodeDB.QueueUpdate(genericNode)
 			}
+		} else if !isEL {
+			s.evictWrongChain(s.elTable, s.elNodeDB, [32]byte(nodeID), n.Record(), db.LayerEL)
 		}
 		if isCL && s.clTable != nil && s.clNodeDB != nil {
 			if genericNode := s.clTable.Get(nodeID); genericNode != nil {
-				genericNode.SetLastSeen(timestamp) // This marks it dirty
+				genericNode.MarkSeen(timestamp)
 				s.clTable.Add(genericNode)
 				s.clNodeDB.QueueUpdate(genericNode)
 			}
+		} else if !isCL {
+			s.evictWrongChain(s.clTable, s.clNodeDB, [32]byte(nodeID), n.Record(), db.LayerCL)
 		}
 	}
 }
@@ -1222,8 +1302,8 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 	// Serve-all skips this: every requester gets nodes from every served layer.
 	if !s.config.ServeAll && id.servesEL && id.servesCL && sourceNode != nil && s.enrManager != nil {
 		sourceRecord := sourceNode.Record()
-		serveEL, _ = s.enrManager.ClassifyELNode(sourceRecord)
-		serveCL = s.enrManager.ClassifyCLNode(sourceRecord)
+		serveEL, _ = s.classifyELNode([32]byte(sourceNode.ID()), sourceRecord)
+		serveCL = s.classifyCLNode([32]byte(sourceNode.ID()), sourceRecord)
 	}
 
 	if serveEL && s.elTable != nil {
@@ -1251,20 +1331,32 @@ func (s *Service) onFindNodeV5(id *identity, msg *v5protocol.FindNode, sourceNod
 // Callbacks for discv4
 
 func (s *Service) onNodeSeenV4(n *v4node.Node, timestamp time.Time) {
-	// Check if node is already in table
 	if s.elTable != nil && s.elNodeDB != nil {
-		// Look up the generic node from the table
 		if genericNode := s.elTable.Get(n.ID()); genericNode != nil {
-			genericNode.SetLastSeen(timestamp) // This marks it dirty
-			s.elNodeDB.QueueUpdate(genericNode)
-
-			// A known node still needs its record re-checked. PONG triggers an
-			// ENR refresh on the handler's node, but nothing propagates that to
-			// the table, so without this the table serves the peer's pre-fork
-			// record for the rest of its lifetime.
-			if rec := n.ENR(); rec != nil && rec.Seq() > genericNode.Record().Seq() {
-				s.checkAndAddNodeV4(n)
+			stored := genericNode.Record()
+			if rec := n.ENR(); rec != nil && (stored == nil || rec.Seq() > stored.Seq()) {
+				if !s.checkAndAddNodeV4(n) {
+					s.evictWrongChain(s.elTable, s.elNodeDB, n.ID(), rec, db.LayerEL)
+					return
+				}
+				genericNode = s.elTable.Get(n.ID())
+			} else {
+				// Get falls back to the DB, so this path can resurrect a peer
+				// the fork filter rejects; classify like the v5 path does.
+				if !s.config.ServeAll && s.enrManager != nil {
+					if isEL, _ := s.classifyELNode(n.ID(), stored); !isEL {
+						s.evictWrongChain(s.elTable, s.elNodeDB, n.ID(), stored, db.LayerEL)
+						return
+					}
+				}
+				genericNode.SetV4(n)
+				if !s.elTable.Add(genericNode) {
+					return
+				}
 			}
+
+			genericNode.MarkSeen(timestamp)
+			s.elNodeDB.QueueUpdate(genericNode)
 			return
 		}
 
@@ -1373,7 +1465,7 @@ func (s *Service) requestENRV4(n *v4node.Node) {
 // table.
 func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
 	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
-		isEL, forkID := s.enrManager.AdmitELNode(n.Record())
+		isEL, forkID := s.admitELNode(n.ID(), n.Record())
 		if !isEL {
 			// A record with no eth entry is a consensus node, not an
 			// execution node on the wrong fork.
@@ -1385,6 +1477,7 @@ func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
 				"peerID": n.PeerID(),
 				"eth":    forkID.String(),
 			}).Debug("EL lookup admission rejected: incompatible fork id")
+			s.evictWrongChain(s.elTable, s.elNodeDB, n.ID(), n.Record(), db.LayerEL)
 			s.markBadNode(n, db.LayerEL, "invalid_fork_id")
 			return services.AdmissionRejectedFilter
 		}
@@ -1407,13 +1500,14 @@ func (s *Service) admitELLookupNode(n *nodes.Node) services.AdmissionResult {
 // table.
 func (s *Service) admitCLLookupNode(n *nodes.Node) services.AdmissionResult {
 	if !s.config.ServeAll && n.Record() != nil && s.enrManager != nil {
-		if !s.enrManager.AdmitCLNode(n.Record()) {
+		if !s.admitCLNode(n.ID(), n.Record()) {
 			// No eth2 entry means an execution node, not a consensus
 			// node on the wrong digest; keep the two distinguishable.
 			if !n.Record().Has("eth2") {
 				s.markBadNode(n, db.LayerCL, "not_cl")
 				return services.AdmissionRejectedLayer
 			}
+			s.evictWrongChain(s.clTable, s.clNodeDB, n.ID(), n.Record(), db.LayerCL)
 			s.markBadNode(n, db.LayerCL, "invalid_fork_digest")
 			return services.AdmissionRejectedFilter
 		}
@@ -1422,8 +1516,57 @@ func (s *Service) admitCLLookupNode(n *nodes.Node) services.AdmissionResult {
 	return s.admitToTable(n, s.clTable, db.LayerCL)
 }
 
+// evictWrongChain removes an active peer whose record shows it left our chain
+// — the fork field is present and classification rejected it — and marks it
+// bad. Merely-behind peers never reach this: both filters accept them.
+//
+// The failing record is installed on the evicted node before it is persisted.
+// Startup load and sweep promotion classify the stored record and never read
+// bad_nodes, so persisting the old record would let the peer return.
+func (s *Service) evictWrongChain(table *nodes.FlatTable, ndb *nodes.NodeDB, nodeID [32]byte, record *enr.Record, layer db.NodeLayer) {
+	if s.config.ServeAll || s.enrManager == nil || table == nil || ndb == nil {
+		return
+	}
+	if record == nil || s.isConfiguredBootnode(nodeID, layer) {
+		return
+	}
+	// Re-derive the verdict here: callers reach this on any admission failure,
+	// and only a present-but-rejected fork field is wrong-chain evidence.
+	field, reason := "eth", "invalid_fork_id"
+	ok := false
+	if layer == db.LayerCL {
+		field, reason = "eth2", "invalid_fork_digest"
+		ok = s.classifyCLNode(nodeID, record)
+	} else {
+		ok, _ = s.classifyELNode(nodeID, record)
+	}
+	if ok || !record.Has(field) {
+		return
+	}
+
+	evicted := table.Remove(nodeID)
+	if evicted == nil {
+		return
+	}
+
+	evicted.UpdateENR(record)
+	evicted.SetLastActive(time.Now())
+	if err := ndb.QueueUpdate(evicted); err != nil {
+		s.config.Logger.WithError(err).WithField("peerID", evicted.PeerID()).Debug("failed to queue evicted node update")
+	}
+	s.markBadNode(evicted, layer, reason)
+
+	s.config.Logger.WithFields(logrus.Fields{
+		"nodeID": fmt.Sprintf("%x", nodeID[:8]),
+		"layer":  layer,
+	}).Info("evicted active peer on wrong-chain record")
+}
+
 // markBadNode records a rejected node so it is not retried on restart.
 func (s *Service) markBadNode(n *nodes.Node, layer db.NodeLayer, reason string) {
+	if s.isConfiguredBootnode(n.ID(), layer) {
+		return
+	}
 	if err := s.config.Database.StoreBadNode(n.IDBytes(), layer, reason); err != nil {
 		s.config.Logger.WithError(err).Debug("failed to store bad node")
 	}
@@ -1557,15 +1700,12 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 		return false
 	}
 
-	// A node already in the table still needs its record re-checked: Add()
-	// installs a newer ENR, which is how a peer's post-fork eth entry reaches
-	// the table. Returning early here left the pre-fork record in place and
-	// served it to every FINDNODE querier.
-	alreadyKnown := s.elTable.Get(n.ID()) != nil
+	existing := s.elTable.Get(n.ID())
+	alreadyKnown := existing != nil
 
 	// Filter the node using ENR manager (EL-only for discv4)
 	if !s.config.ServeAll && s.enrManager != nil {
-		filter, forkID := s.enrManager.AdmitELNode(n.ENR())
+		filter, forkID := s.admitELNode(n.ID(), n.ENR())
 		if !filter {
 			s.config.Logger.WithFields(logrus.Fields{
 				"nodeID": fmt.Sprintf("%x", n.IDBytes()[:8]),
@@ -1576,8 +1716,14 @@ func (s *Service) checkAndAddNodeV4(n *v4node.Node) bool {
 		}
 	}
 
-	// Create generic node from v4 node
-	genericNode := nodes.NewFromV4(n, s.elNodeDB)
+	var genericNode *nodes.Node
+	if existing != nil {
+		existing.SetV4(n)
+		existing.UpdateENR(n.ENR())
+		genericNode = existing
+	} else {
+		genericNode = nodes.NewFromV4(n, s.elNodeDB)
+	}
 
 	// Try to add to table
 	if s.elTable.Add(genericNode) {
@@ -1606,8 +1752,15 @@ func (s *Service) checkAndAddNode(n *v5node.Node) bool {
 		isEL = s.elTable != nil
 		isCL = s.clTable != nil
 	} else {
-		isEL, _ = s.enrManager.AdmitELNode(n.Record())
-		isCL = s.enrManager.AdmitCLNode(n.Record())
+		isEL, _ = s.admitELNode([32]byte(n.ID()), n.Record())
+		isCL = s.admitCLNode([32]byte(n.ID()), n.Record())
+	}
+
+	if !isEL {
+		s.evictWrongChain(s.elTable, s.elNodeDB, [32]byte(n.ID()), n.Record(), db.LayerEL)
+	}
+	if !isCL {
+		s.evictWrongChain(s.clTable, s.clNodeDB, [32]byte(n.ID()), n.Record(), db.LayerCL)
 	}
 
 	// Add to appropriate table(s)

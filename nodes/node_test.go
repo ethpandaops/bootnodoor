@@ -331,3 +331,156 @@ func TestApplyProbeResultAppliesBothDecisionsAtCurrentSeq(t *testing.T) {
 		t.Error("v5 unconfirmed by the probe was not cleared")
 	}
 }
+
+// TestUpdateENRRefreshesAddrFromAdvancedRecord verifies a v5-only node's addr
+// follows an advancing record, so the persisted endpoint cannot go stale.
+func TestUpdateENRRefreshesAddrFromAdvancedRecord(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	oldIP := net.IPv4(10, 21, 0, 1)
+	newIP := net.IPv4(10, 21, 0, 2)
+	v5, err := discv5node.New(signedRecordAt(t, key, 1, oldIP))
+	if err != nil {
+		t.Fatalf("new v5 node: %v", err)
+	}
+	n := NewFromV5(v5, nil)
+
+	if !n.UpdateENR(signedRecordAt(t, key, 2, newIP)) {
+		t.Fatal("newer record was rejected")
+	}
+	if got := n.Addr().IP; !got.Equal(newIP) {
+		t.Fatalf("addr = %v, want %v", got, newIP)
+	}
+
+	if n.UpdateENR(signedRecordAt(t, key, 1, oldIP)) {
+		t.Fatal("older record was accepted")
+	}
+	if got := n.Addr().IP; !got.Equal(newIP) {
+		t.Fatalf("addr moved on a stale record: %v", got)
+	}
+
+	noEndpoint := enr.New()
+	noEndpoint.SetSeq(3)
+	if err := noEndpoint.Sign(key); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if !n.UpdateENR(noEndpoint) {
+		t.Fatal("endpoint-less newer record was rejected")
+	}
+	if got := n.Addr().IP; !got.Equal(newIP) {
+		t.Fatalf("addr cleared by an endpoint-less record: %v", got)
+	}
+
+	ip6 := net.ParseIP("2001:db8::1")
+	sharedUDP := enr.New()
+	if err := sharedUDP.Set("ip6", ip6.To16()); err != nil {
+		t.Fatalf("set ip6: %v", err)
+	}
+	if err := sharedUDP.Set("udp", uint16(9100)); err != nil {
+		t.Fatalf("set udp: %v", err)
+	}
+	sharedUDP.SetSeq(4)
+	if err := sharedUDP.Sign(key); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if !n.UpdateENR(sharedUDP) {
+		t.Fatal("ip6 record was rejected")
+	}
+	if got := n.Addr(); !got.IP.Equal(ip6) || got.Port != 9100 {
+		t.Fatalf("addr = %v, want [%v]:9100 from the ip6+udp record", got, ip6)
+	}
+}
+
+// TestUpdateENRPreservesVerifiedV4Addr verifies an advancing record never moves
+// a discv4-verified endpoint: that moves only on a matched PONG.
+func TestUpdateENRPreservesVerifiedV4Addr(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	verified := &net.UDPAddr{IP: net.IPv4(10, 21, 1, 1), Port: 9000}
+	advertised := net.IPv4(10, 21, 1, 2)
+	n := NewFromV4(discv4node.New(&key.PublicKey, verified), nil)
+
+	if !n.UpdateENR(signedRecordAt(t, key, 2, advertised)) {
+		t.Fatal("newer record was rejected")
+	}
+	if got := n.Addr().IP; !got.Equal(verified.IP) {
+		t.Fatalf("verified v4 addr was replaced by the advertised one: %v", got)
+	}
+}
+
+// TestAdoptProtocolsFromRefreshesAddrOnAdvance verifies the record-advance path
+// through adoption applies the same addr rules as UpdateENR.
+func TestAdoptProtocolsFromRefreshesAddrOnAdvance(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	oldIP := net.IPv4(10, 22, 0, 1)
+	newIP := net.IPv4(10, 22, 0, 2)
+
+	v5Old, err := discv5node.New(signedRecordAt(t, key, 1, oldIP))
+	if err != nil {
+		t.Fatalf("new v5 node: %v", err)
+	}
+	entry := NewFromV5(v5Old, nil)
+	v5New, err := discv5node.New(signedRecordAt(t, key, 2, newIP))
+	if err != nil {
+		t.Fatalf("new v5 node: %v", err)
+	}
+	if _, advanced := entry.AdoptProtocolsFrom(NewFromV5(v5New, nil)); !advanced {
+		t.Fatal("newer carrier record did not advance")
+	}
+	if got := entry.Addr().IP; !got.Equal(newIP) {
+		t.Fatalf("addr = %v, want %v", got, newIP)
+	}
+
+	verified := &net.UDPAddr{IP: net.IPv4(10, 22, 1, 1), Port: 9000}
+	v4Entry := NewFromV4(discv4node.New(&key.PublicKey, verified), nil)
+	v5Carrier, err := discv5node.New(signedRecordAt(t, key, 3, newIP))
+	if err != nil {
+		t.Fatalf("new v5 node: %v", err)
+	}
+	if _, advanced := v4Entry.AdoptProtocolsFrom(NewFromV5(v5Carrier, nil)); !advanced {
+		t.Fatal("newer carrier record did not advance")
+	}
+	if got := v4Entry.Addr().IP; !got.Equal(verified.IP) {
+		t.Fatalf("verified v4 addr was replaced through adoption: %v", got)
+	}
+}
+
+// TestAdoptProtocolsFromRefreshesAddrOnCombinedV4AdoptAndAdvance verifies the
+// combined path: a v4 pointer adopted in the same call carries the other
+// wrapper's endpoint, not one this node verified, so it must not block the
+// addr refresh from the advancing record.
+func TestAdoptProtocolsFromRefreshesAddrOnCombinedV4AdoptAndAdvance(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	oldIP := net.IPv4(10, 23, 0, 1)
+	newIP := net.IPv4(10, 23, 0, 2)
+
+	v5Old, err := discv5node.New(signedRecordAt(t, key, 1, oldIP))
+	if err != nil {
+		t.Fatalf("new v5 node: %v", err)
+	}
+	entry := NewFromV5(v5Old, nil)
+
+	carrierRecord := signedRecordAt(t, key, 2, newIP)
+	carrier := NewFromV4(discv4node.New(&key.PublicKey, &net.UDPAddr{IP: newIP, Port: 9000}), nil)
+	if !carrier.UpdateENR(carrierRecord) {
+		t.Fatal("carrier record was not installed")
+	}
+
+	adopted, advanced := entry.AdoptProtocolsFrom(carrier)
+	if !adopted || !advanced {
+		t.Fatalf("adoption = (%v, %v), want (true, true)", adopted, advanced)
+	}
+	if got := entry.Addr().IP; !got.Equal(newIP) {
+		t.Fatalf("addr = %v, want %v from the advancing record", got, newIP)
+	}
+}

@@ -190,25 +190,17 @@ func (s *SharedStats) IsAlive(maxAge time.Duration, maxFailures int) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.lastSeen.IsZero() {
-		return false // Never seen
+	// Never-contacted nodes are judged by firstSeen instead, so a fresh node
+	// cannot be pruned before it ever gets the chance to earn a lastSeen.
+	ref := s.lastSeen
+	if ref.IsZero() {
+		ref = s.firstSeen
+	}
+	if ref.IsZero() {
+		return false
 	}
 
-	age := time.Since(s.lastSeen)
-	return age < maxAge && s.failureCount < maxFailures
-}
-
-// NeedsPing checks if the node needs a liveness check.
-// Returns true if never pinged or it's been longer than pingInterval.
-func (s *SharedStats) NeedsPing(pingInterval time.Duration) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if s.lastPing.IsZero() {
-		return true // Never pinged
-	}
-
-	return time.Since(s.lastPing) > pingInterval
+	return time.Since(ref) < maxAge && s.failureCount < maxFailures
 }
 
 // Snapshot returns a snapshot of all stats (for GetStats methods).

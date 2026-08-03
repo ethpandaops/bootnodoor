@@ -55,9 +55,11 @@ func (l *IPLimiter) CanAdd(n *Node) bool {
 	ip := n.Addr().IP.String()
 	nodeID := n.ID()
 
-	// Check if node already exists (updating is always allowed)
-	if _, exists := l.nodeToIP[nodeID]; exists {
-		return true
+	if existingIP, exists := l.nodeToIP[nodeID]; exists {
+		if existingIP == ip {
+			return true
+		}
+		return l.ipCounts[ip] < l.maxNodesPerIP
 	}
 
 	// Check IP limit
@@ -78,16 +80,21 @@ func (l *IPLimiter) Add(n *Node) bool {
 
 	// Check if node already exists
 	if existingIP, exists := l.nodeToIP[nodeID]; exists {
-		// If IP changed, update counts
-		if existingIP != ip {
-			l.ipCounts[existingIP]--
-			if l.ipCounts[existingIP] == 0 {
-				delete(l.ipCounts, existingIP)
-			}
-
-			l.ipCounts[ip]++
-			l.nodeToIP[nodeID] = ip
+		if existingIP == ip {
+			return true
 		}
+		if l.ipCounts[ip] >= l.maxNodesPerIP {
+			l.rejections++
+			return false
+		}
+
+		l.ipCounts[existingIP]--
+		if l.ipCounts[existingIP] == 0 {
+			delete(l.ipCounts, existingIP)
+		}
+
+		l.ipCounts[ip]++
+		l.nodeToIP[nodeID] = ip
 		return true
 	}
 

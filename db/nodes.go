@@ -1,7 +1,9 @@
 package db
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -71,32 +73,61 @@ func (d *Database) GetAllNodes() ([]*Node, error) {
 	return nodes, err
 }
 
-// GetRandomNodes retrieves N random nodes for a specific layer.
-func (d *Database) GetRandomNodes(layer NodeLayer, n int) ([]*Node, error) {
-	d.trackQuery()
-	nodes := []*Node{}
-	err := d.ReaderDb.Select(&nodes, `
-		SELECT nodeid, layer, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active,
-		       enr, has_v4, has_v5, success_count, failure_count, avg_rtt
-		FROM nodes
-		WHERE layer = $1
-		ORDER BY RANDOM()
-		LIMIT $2`, string(layer), n)
-	return nodes, err
+// selectAliveNodes is the shared base of the Visit* queries: the aliveness
+// predicate mirrors stats.IsAlive (never-contacted rows fall back to
+// first_seen), and filtering in SQL keeps stale rows from starving the
+// caller's early-stopping visitor.
+const selectAliveNodes = `
+	SELECT nodeid, layer, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active,
+	       enr, has_v4, has_v5, success_count, failure_count, avg_rtt
+	FROM nodes
+	WHERE layer = $1
+	  AND failure_count < $2
+	  AND COALESCE(last_seen, first_seen) > $3`
+
+// VisitRandomNodes visits alive nodes from a random point in node ID order.
+func (d *Database) VisitRandomNodes(layer NodeLayer, aliveAfter int64, maxFailures int, visit func(*Node) bool) error {
+	start := make([]byte, 32)
+	if _, err := rand.Read(start); err != nil {
+		return fmt.Errorf("generate node scan start: %w", err)
+	}
+
+	completed, err := d.visitNodes(selectAliveNodes+` AND nodeid >= $4 ORDER BY nodeid`,
+		visit, string(layer), maxFailures, aliveAfter, start)
+	if err != nil || !completed {
+		return err
+	}
+
+	_, err = d.visitNodes(selectAliveNodes+` AND nodeid < $4 ORDER BY nodeid`,
+		visit, string(layer), maxFailures, aliveAfter, start)
+	return err
 }
 
-// GetInactiveNodes retrieves N nodes ordered by oldest last_active time for a specific layer.
-func (d *Database) GetInactiveNodes(layer NodeLayer, n int) ([]*Node, error) {
+// VisitInactiveNodes visits alive nodes from the least recently active.
+func (d *Database) VisitInactiveNodes(layer NodeLayer, aliveAfter int64, maxFailures int, visit func(*Node) bool) error {
+	_, err := d.visitNodes(selectAliveNodes+` ORDER BY last_active ASC NULLS FIRST, nodeid`,
+		visit, string(layer), maxFailures, aliveAfter)
+	return err
+}
+
+func (d *Database) visitNodes(query string, visit func(*Node) bool, args ...interface{}) (bool, error) {
 	d.trackQuery()
-	nodes := []*Node{}
-	err := d.ReaderDb.Select(&nodes, `
-		SELECT nodeid, layer, ip, ipv6, port, seq, fork_digest, first_seen, last_seen, last_active,
-		       enr, has_v4, has_v5, success_count, failure_count, avg_rtt
-		FROM nodes
-		WHERE layer = $1
-		ORDER BY last_active ASC NULLS FIRST
-		LIMIT $2`, string(layer), n)
-	return nodes, err
+	rows, err := d.ReaderDb.Queryx(query, args...)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		node := &Node{}
+		if err := rows.StructScan(node); err != nil {
+			return false, err
+		}
+		if !visit(node) {
+			return false, nil
+		}
+	}
+	return true, rows.Err()
 }
 
 // CountNodes returns the total number of nodes for a specific layer.

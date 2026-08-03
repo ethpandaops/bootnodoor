@@ -19,14 +19,7 @@ func newCLTestService(t *testing.T) *Service {
 	t.Helper()
 
 	logger := quietLogger()
-	database := db.NewDatabase(&db.SqliteDatabaseConfig{File: ":memory:", MaxOpenConns: 5, MaxIdleConns: 2}, logger)
-	if err := database.Init(); err != nil {
-		t.Fatalf("db init: %v", err)
-	}
-	t.Cleanup(func() { database.Close() })
-	if err := database.ApplyEmbeddedDbSchema(-2); err != nil {
-		t.Fatalf("db schema: %v", err)
-	}
+	database := newTestDatabase(t)
 
 	cfg := &Config{
 		Logger:   logger,
