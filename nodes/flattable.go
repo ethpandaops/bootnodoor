@@ -16,9 +16,6 @@ const (
 	// DefaultMaxActiveNodes is the maximum number of nodes to keep in the active state
 	DefaultMaxActiveNodes = 500
 
-	// DefaultPingRate is the maximum number of pings per minute
-	DefaultPingRate = 400
-
 	// DefaultSweepPercent is the percentage of active nodes to rotate during sweep
 	DefaultSweepPercent = 10
 )
@@ -66,12 +63,6 @@ type FlatTable struct {
 	// maxNodesPerIP is the maximum nodes allowed per IP
 	maxNodesPerIP int
 
-	// pingInterval is how often to ping nodes
-	pingInterval time.Duration
-
-	// pingRate is maximum pings per minute
-	pingRate int
-
 	// maxNodeAge is the maximum time since last seen
 	maxNodeAge time.Duration
 
@@ -83,6 +74,9 @@ type FlatTable struct {
 
 	// nodeChangedCallback is called when nodes are added/updated
 	nodeChangedCallback NodeChangedCallback
+
+	// admitPersistedNode validates nodes before DB promotion
+	admitPersistedNode func(*Node) bool
 
 	// mu protects the active nodes map and stats
 	mu sync.RWMutex
@@ -115,12 +109,6 @@ type FlatTableConfig struct {
 	// MaxNodesPerIP is the maximum nodes allowed per IP address
 	MaxNodesPerIP int
 
-	// PingInterval is how often to ping nodes
-	PingInterval time.Duration
-
-	// PingRate is maximum pings per minute (default 400)
-	PingRate int
-
 	// MaxNodeAge is the maximum time since last seen
 	MaxNodeAge time.Duration
 
@@ -132,6 +120,9 @@ type FlatTableConfig struct {
 
 	// NodeChangedCallback is called when a node is added or updated
 	NodeChangedCallback NodeChangedCallback
+
+	// AdmitPersistedNode validates a node before loading it from the DB
+	AdmitPersistedNode func(*Node) bool
 
 	// Logger for debug messages
 	Logger logrus.FieldLogger
@@ -149,14 +140,6 @@ func NewFlatTable(cfg FlatTableConfig) (*FlatTable, error) {
 
 	if cfg.MaxNodesPerIP <= 0 {
 		cfg.MaxNodesPerIP = DefaultMaxNodesPerIP
-	}
-
-	if cfg.PingInterval <= 0 {
-		cfg.PingInterval = DefaultPingInterval
-	}
-
-	if cfg.PingRate <= 0 {
-		cfg.PingRate = DefaultPingRate
 	}
 
 	if cfg.MaxNodeAge <= 0 {
@@ -178,55 +161,79 @@ func NewFlatTable(cfg FlatTableConfig) (*FlatTable, error) {
 		maxActiveNodes:      cfg.MaxActiveNodes,
 		ipLimiter:           NewIPLimiter(cfg.MaxNodesPerIP),
 		maxNodesPerIP:       cfg.MaxNodesPerIP,
-		pingInterval:        cfg.PingInterval,
-		pingRate:            cfg.PingRate,
 		maxNodeAge:          cfg.MaxNodeAge,
 		maxFailures:         cfg.MaxFailures,
 		sweepPercent:        cfg.SweepPercent,
 		nodeChangedCallback: cfg.NodeChangedCallback,
+		admitPersistedNode:  cfg.AdmitPersistedNode,
 		logger:              cfg.Logger,
 	}
 
 	return t, nil
 }
 
-// LoadInitialNodesFromDB loads random nodes from DB into the active pool.
+// LoadInitialNodesFromDB loads eligible nodes from DB into the active pool.
 func (t *FlatTable) LoadInitialNodesFromDB() error {
-	// Load random nodes from DB to bootstrap the active pool
-	randomNodes := t.db.LoadRandomNodes(t.maxActiveNodes)
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	for _, n := range randomNodes {
-		// The transport may have admitted nodes before this bulk load runs, so
-		// stop at the soft cap instead of stacking a full load on top of them.
-		if len(t.activeNodes) >= t.maxActiveNodes {
-			break
-		}
-		// Add applies this check; a persisted record of ourselves would
-		// otherwise sit in the pool for the whole process lifetime and be
-		// dialed by every lookup round.
-		if n.ID() == t.localID {
-			continue
-		}
-		if _, exists := t.activeNodes[n.ID()]; exists {
-			continue
-		}
-
-		if t.ipLimiter.CanAdd(n) {
-			t.activeNodes[n.ID()] = n
-			t.ipLimiter.Add(n)
-
-			n.SetLastActive(time.Now())
-			if err := t.db.QueueUpdate(n); err != nil {
-				t.logger.WithError(err).Warn("failed to mark node as active")
-			}
-		}
+	_, err := t.loadPersistedNodes(t.maxActiveNodes, false, func(visit func(*Node) bool) error {
+		return t.db.VisitRandomNodes(t.maxNodeAge, t.maxFailures, visit)
+	})
+	if err != nil {
+		return err
 	}
 
-	t.logger.WithField("count", len(t.activeNodes)).Info("loaded random nodes into active pool")
+	t.mu.RLock()
+	count := len(t.activeNodes)
+	t.mu.RUnlock()
+	t.logger.WithField("count", count).Info("loaded nodes into active pool")
 	return nil
+}
+
+func (t *FlatTable) loadPersistedNodes(target int, countPromotions bool, scan func(func(*Node) bool) error) (int, error) {
+	loaded := 0
+	err := scan(func(n *Node) bool {
+		// The scan's SQL already applies the IsAlive criteria; only the
+		// identity and membership checks remain, and both are cheaper than
+		// the fork classification below.
+		if n.ID() == t.localID {
+			return true
+		}
+		t.mu.RLock()
+		_, exists := t.activeNodes[n.ID()]
+		t.mu.RUnlock()
+		if exists {
+			return true
+		}
+		if t.admitPersistedNode != nil && !t.admitPersistedNode(n) {
+			return true
+		}
+
+		t.mu.Lock()
+		if len(t.activeNodes) >= target {
+			t.mu.Unlock()
+			return false
+		}
+		if _, exists := t.activeNodes[n.ID()]; exists || !t.ipLimiter.Add(n) {
+			t.mu.Unlock()
+			return true
+		}
+		t.activeNodes[n.ID()] = n
+		if countPromotions {
+			t.nodesPromoted++
+		}
+		full := len(t.activeNodes) >= target
+		t.mu.Unlock()
+
+		n.SetLastActive(time.Now())
+		if err := t.db.QueueUpdate(n); err != nil {
+			t.logger.WithError(err).Warn("failed to mark node as active")
+		}
+		if t.nodeChangedCallback != nil {
+			t.nodeChangedCallback(n)
+		}
+		loaded++
+		return !full
+	})
+	return loaded, err
 }
 
 // Add adds a node to the active pool.
@@ -269,6 +276,13 @@ func (t *FlatTable) Add(n *Node) bool {
 		// protocol node's own address, so taking one from an older record would point
 		// that protocol at an endpoint the peer has already moved off.
 		adopted, advanced := existing.AdoptProtocolsFrom(n)
+
+		// One limiter pass against the entry's final addr covers both a SetV4
+		// move before this call and a record advance during adoption
+		// (IPLimiter.Add migrates the count to the new IP).
+		if !t.resyncIPOrEvict(existing) {
+			return false
+		}
 
 		if adopted || advanced {
 			if err := t.db.QueueUpdate(existing); err != nil {
@@ -350,6 +364,46 @@ func (t *FlatTable) Add(n *Node) bool {
 	return true
 }
 
+// Remove evicts a node from the active pool. It returns the removed node, or
+// nil when the node was not active. The caller persists the node.
+func (t *FlatTable) Remove(nodeID [32]byte) *Node {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	n, active := t.activeNodes[nodeID]
+	if !active {
+		return nil
+	}
+	delete(t.activeNodes, nodeID)
+	t.ipLimiter.Remove(nodeID)
+	t.nodesDemoted++
+	return n
+}
+
+// resyncIPOrEvict re-registers an active entry with the IP limiter under its
+// current addr and reports whether it stays in the pool. On rejection the
+// entry is evicted and queued for persistence.
+func (t *FlatTable) resyncIPOrEvict(existing *Node) bool {
+	nodeID := existing.ID()
+
+	t.mu.Lock()
+	if _, active := t.activeNodes[nodeID]; !active || t.ipLimiter.Add(existing) {
+		t.mu.Unlock()
+		return true
+	}
+	delete(t.activeNodes, nodeID)
+	t.ipLimiter.Remove(nodeID)
+	t.ipLimitRejections++
+	t.nodesDemoted++
+	t.mu.Unlock()
+
+	existing.SetLastActive(time.Now())
+	if err := t.db.QueueUpdate(existing); err != nil {
+		t.logger.WithError(err).WithField("peerID", existing.PeerID()).Debug("failed to queue rejected node update")
+	}
+	return false
+}
+
 // CanAddNodeByIP checks if we can add a node based on IP limits.
 // This checks against all nodes (active + inactive) in the DB.
 func (t *FlatTable) CanAddNodeByIP(n *Node) bool {
@@ -427,7 +481,13 @@ func (t *FlatTable) GetRandomActiveNodes(k int) []*Node {
 
 // FindClosestNodes finds the k closest active nodes to the target ID.
 func (t *FlatTable) FindClosestNodes(target [32]byte, k int) []*Node {
-	activeNodes := t.GetActiveNodes()
+	allActive := t.GetActiveNodes()
+	activeNodes := make([]*Node, 0, len(allActive))
+	for _, n := range allActive {
+		if n.IsAlive(t.maxNodeAge, t.maxFailures) {
+			activeNodes = append(activeNodes, n)
+		}
+	}
 
 	if len(activeNodes) == 0 {
 		return nil
@@ -457,61 +517,6 @@ func (t *FlatTable) FindClosestNodes(target [32]byte, k int) []*Node {
 	return result
 }
 
-// GetNodesNeedingPing returns active nodes that need a PING check.
-//
-// This implements distributed ping scheduling by limiting the number of nodes returned.
-func (t *FlatTable) GetNodesNeedingPing() []*Node {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	var deadNodes []*Node
-	var aliveNodes []*Node
-
-	// Separate nodes needing ping into dead and alive
-	for _, n := range t.activeNodes {
-		if n.NeedsPing(t.pingInterval) {
-			if n.IsAlive(t.maxNodeAge, t.maxFailures) {
-				aliveNodes = append(aliveNodes, n)
-			} else {
-				deadNodes = append(deadNodes, n)
-			}
-		}
-	}
-
-	// Shuffle both lists for randomness
-	rand.Shuffle(len(deadNodes), func(i, j int) {
-		deadNodes[i], deadNodes[j] = deadNodes[j], deadNodes[i]
-	})
-	rand.Shuffle(len(aliveNodes), func(i, j int) {
-		aliveNodes[i], aliveNodes[j] = aliveNodes[j], aliveNodes[i]
-	})
-
-	// Cap the number of pings based on ping rate
-	// pingRate is per minute, so divide by 2 if we're called every 30 seconds
-	maxPings := t.pingRate / 2
-
-	// Select nodes preferring dead nodes (60% dead, 40% alive)
-	var selected []*Node
-	deadSlots := (maxPings * 60) / 100
-
-	// Take dead nodes first (up to 60% of slots)
-	for i := 0; i < len(deadNodes) && len(selected) < deadSlots; i++ {
-		selected = append(selected, deadNodes[i])
-	}
-
-	// Take alive nodes (up to 40% of slots)
-	for i := 0; i < len(aliveNodes) && len(selected) < maxPings; i++ {
-		selected = append(selected, aliveNodes[i])
-	}
-
-	// If we didn't fill all slots with alive nodes, fill with remaining dead nodes
-	for i := deadSlots; i < len(deadNodes) && len(selected) < maxPings; i++ {
-		selected = append(selected, deadNodes[i])
-	}
-
-	return selected
-}
-
 // PerformSweep rotates nodes between active and inactive pools.
 //
 // This should be called periodically (e.g., every 10 minutes).
@@ -519,6 +524,8 @@ func (t *FlatTable) GetNodesNeedingPing() []*Node {
 // to allow newly discovered nodes to be tested before being demoted.
 // Loads inactive nodes from DB and tries to promote them to fill available slots.
 func (t *FlatTable) PerformSweep() {
+	t.PruneDeadNodes()
+
 	t.mu.Lock()
 	activeCount := len(t.activeNodes)
 	t.mu.Unlock()
@@ -600,49 +607,11 @@ func (t *FlatTable) PerformSweep() {
 
 	// Load inactive nodes from DB and try to promote them
 	if slotsAvailable > 0 {
-		// Request more than available slots to account for IP limits and filters
-		inactiveNodes := t.db.LoadInactiveNodes(slotsAvailable * 2)
-
-		promotedCount := 0
-		for _, n := range inactiveNodes {
-			// Skip if already active (shouldn't happen but be safe)
-			t.mu.RLock()
-			_, alreadyActive := t.activeNodes[n.ID()]
-			currentSize := len(t.activeNodes)
-			t.mu.RUnlock()
-
-			if alreadyActive {
-				continue
-			}
-
-			// Check if we have room
-			if currentSize >= t.maxActiveNodes+sweepCount {
-				break
-			}
-
-			// Check IP limits
-			if !t.ipLimiter.CanAdd(n) {
-				continue
-			}
-
-			// Promote to active
-			t.mu.Lock()
-			t.activeNodes[n.ID()] = n
-			t.ipLimiter.Add(n)
-			t.nodesPromoted++
-			t.mu.Unlock()
-
-			// Update last_active to mark as active
-			n.SetLastActive(time.Now())
-			if err := t.db.QueueUpdate(n); err != nil {
-				t.logger.WithError(err).Warn("failed to mark node as active")
-			}
-
-			promotedCount++
-
-			if t.nodeChangedCallback != nil {
-				t.nodeChangedCallback(n)
-			}
+		promotedCount, err := t.loadPersistedNodes(t.maxActiveNodes+sweepCount, true, func(visit func(*Node) bool) error {
+			return t.db.VisitInactiveNodes(t.maxNodeAge, t.maxFailures, visit)
+		})
+		if err != nil {
+			t.logger.WithError(err).Warn("failed to load inactive nodes")
 		}
 
 		if promotedCount > 0 || demotedCount > 0 {
@@ -655,6 +624,35 @@ func (t *FlatTable) PerformSweep() {
 			}).Info("active pool sweep completed")
 		}
 	}
+}
+
+// PruneDeadNodes removes dead nodes from the active pool.
+func (t *FlatTable) PruneDeadNodes() int {
+	now := time.Now()
+	var removed []*Node
+
+	t.mu.Lock()
+	for nodeID, n := range t.activeNodes {
+		if n.IsAlive(t.maxNodeAge, t.maxFailures) {
+			continue
+		}
+		delete(t.activeNodes, nodeID)
+		t.ipLimiter.Remove(nodeID)
+		removed = append(removed, n)
+	}
+	t.deadNodesRemoved += len(removed)
+	t.nodesDemoted += len(removed)
+	t.mu.Unlock()
+
+	for _, n := range removed {
+		n.SetLastActive(now)
+		n.MarkDirty(DirtyStats)
+		if err := t.db.QueueUpdate(n); err != nil {
+			t.logger.WithError(err).WithField("peerID", n.PeerID()).Debug("failed to queue dead node update")
+		}
+	}
+
+	return len(removed)
 }
 
 // performImmediateSweep performs an immediate sweep to reduce the active pool size.
@@ -799,10 +797,12 @@ func (t *FlatTable) GetNodesByDistance(targetID [32]byte, distances []uint, k in
 		return nil
 	}
 
-	// Collect all active nodes
+	// Collect all live active nodes
 	allNodes := make([]*Node, 0, len(t.activeNodes))
 	for _, n := range t.activeNodes {
-		allNodes = append(allNodes, n)
+		if n.IsAlive(t.maxNodeAge, t.maxFailures) {
+			allNodes = append(allNodes, n)
+		}
 	}
 
 	// Filter by distance if not requesting all (256)

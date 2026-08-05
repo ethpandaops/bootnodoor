@@ -4,9 +4,6 @@ import (
 	"time"
 )
 
-// DefaultPingInterval is how often we PING nodes to check liveness.
-const DefaultPingInterval = 30 * time.Second
-
 // DefaultMaxNodeAge is the maximum time since last seen before considering a node dead.
 const DefaultMaxNodeAge = 24 * time.Hour
 

@@ -262,6 +262,65 @@ func signedRecordAt(t *testing.T, key *ecdsa.PrivateKey, seq uint64, ip net.IP) 
 	return rec
 }
 
+func TestLoadUsesStoredEndpointOnlyForV4(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		hasV4      bool
+		wantStored bool
+	}{
+		{name: "v5 only", hasV4: false, wantStored: false},
+		{name: "v4 verified", hasV4: true, wantStored: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := persistTestDB(t, filepath.Join(t.TempDir(), "legacy-endpoint.db"))
+			defer database.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ndb := NewNodeDB(ctx, database, db.LayerEL, logrus.New())
+
+			key, err := crypto.GenerateKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			recordIP := net.IPv4(10, 30, 0, 2)
+			storedIP := net.IPv4(10, 30, 0, 1)
+			record := signedRecordAt(t, key, 2, recordIP)
+			encoded, err := record.EncodeRLPBytes()
+			if err != nil {
+				t.Fatal(err)
+			}
+			v5, err := discv5node.New(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = database.ReaderDb.Exec(`
+				INSERT INTO nodes (
+					nodeid, layer, ip, port, seq, first_seen, last_seen, enr,
+					has_v4, has_v5, success_count, failure_count, avg_rtt
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)`,
+				v5.ID().Bytes(), string(db.LayerEL), storedIP.To4(), 9100, 2,
+				time.Now().Unix(), time.Now().Unix(), encoded, test.hasV4, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			loaded, err := ndb.Load([32]byte(v5.ID()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantIP, wantPort := recordIP, 9000
+			if test.wantStored {
+				wantIP, wantPort = storedIP, 9100
+			}
+			if got := loaded.Addr(); !got.IP.Equal(wantIP) || got.Port != wantPort {
+				t.Fatalf("loaded address = %v, want %v:%d", got, wantIP, wantPort)
+			}
+		})
+	}
+}
+
 // Adoption only ever fills an empty slot, so a pointer installed from a stale
 // record is permanent. The freshness check and the install must therefore happen
 // under one lock hold, or a concurrent advance can slip between them.

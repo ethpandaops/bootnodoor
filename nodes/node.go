@@ -180,10 +180,18 @@ func (n *Node) HasV5() bool {
 	return n.v5Node != nil
 }
 
-// SetV4 sets the discv4 node and marks protocol support dirty.
+// SetV4 sets the discv4 node and its verified endpoint.
 func (n *Node) SetV4(v4 *node.Node) {
+	dirty := DirtyProtocol
 	n.mu.Lock()
 	n.v4Node = v4
+	if v4 != nil {
+		addr := v4.Addr()
+		if addr != nil && (n.addr == nil || !n.addr.IP.Equal(addr.IP) || n.addr.Port != addr.Port || n.addr.Zone != addr.Zone) {
+			n.addr = addr
+			dirty |= DirtyENR
+		}
+	}
 	n.mu.Unlock()
 
 	if v4 != nil && n.nodeStats != nil {
@@ -192,7 +200,7 @@ func (n *Node) SetV4(v4 *node.Node) {
 		// Pass shared stats to v4 node so it updates them
 		v4.SetStats(n.nodeStats)
 	}
-	n.MarkDirty(DirtyProtocol)
+	n.MarkDirty(dirty)
 }
 
 // AdoptProtocolsFrom fills protocol slots this node has empty from a wrapper for
@@ -202,6 +210,8 @@ func (n *Node) SetV4(v4 *node.Node) {
 // call, not the table's. discv4 moves an address solely on a matched PONG
 // (promoteAddr), and discv5 moves its own when its record advances. A table that
 // also ranked pointers would be arbitrating endpoints on weaker evidence.
+// The wrapper's own addr follows the same rules: it moves with an advancing
+// record only while no discv4-verified endpoint exists to protect.
 func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 	// Self-merge is a no-op, not a re-install: a caller re-admitting a table entry
 	// would otherwise snapshot its own pointer, race a concurrent clear, and
@@ -223,6 +233,11 @@ func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 		return false, false
 	}
 
+	// Snapshot before adoption: a v4 pointer adopted in this same call carries
+	// the other wrapper's endpoint, not one this node verified, so it must not
+	// block the addr refresh below.
+	hadV4 := n.v4Node != nil
+
 	if otherV4 != nil && n.v4Node == nil {
 		n.v4Node = otherV4
 		adopted = true
@@ -234,6 +249,11 @@ func (n *Node) AdoptProtocolsFrom(other *Node) (adopted, advanced bool) {
 
 	if n.enr == nil || carrierSeq > n.recordSeqLocked() {
 		n.enr = otherRecord
+		if !hadV4 {
+			if ep := otherRecord.UDPEndpoint(); ep != nil {
+				n.addr = ep
+			}
+		}
 		advanced = true
 	}
 
@@ -426,6 +446,16 @@ func (n *Node) SetLastSeen(t time.Time) {
 	n.nodeStats.SetLastSeen(t)
 }
 
+// MarkSeen records verified contact from the peer: it refreshes lastSeen and
+// ends the failure streak. The clear is guarded so an already-clean node is
+// not marked dirty for nothing.
+func (n *Node) MarkSeen(t time.Time) {
+	n.SetLastSeen(t)
+	if n.FailureCount() > 0 {
+		n.SetFailureCount(0)
+	}
+}
+
 // UpdateLastSeen updates the last seen timestamp to now.
 func (n *Node) UpdateLastSeen() {
 	n.SetLastSeen(time.Now())
@@ -578,6 +608,15 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 		return false
 	}
 	n.enr = newRecord
+	// A newer signed record supersedes an endpoint learned from the old one —
+	// but never a discv4-verified address, which moves only on a matched PONG
+	// (SetV4). Without this, updateNodeENRTx persists the stale addr next to
+	// the new record and buildNodeFromDB restores it after every restart.
+	if n.v4Node == nil {
+		if ep := newRecord.UDPEndpoint(); ep != nil {
+			n.addr = ep
+		}
+	}
 	v5 := n.v5Node
 	n.mu.Unlock()
 
@@ -587,12 +626,8 @@ func (n *Node) UpdateENR(newRecord *enr.Record) bool {
 		v5.UpdateENR(newRecord)
 	}
 
+	n.MarkDirty(DirtyENR)
 	return true
-}
-
-// NeedsPing checks if the node needs a liveness check.
-func (n *Node) NeedsPing(pingInterval time.Duration) bool {
-	return n.nodeStats.NeedsPing(pingInterval)
 }
 
 // IsAlive checks if the node is considered alive.

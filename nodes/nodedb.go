@@ -533,27 +533,40 @@ func (ndb *NodeDB) buildNodeFromDB(dbNode *db.Node) (*Node, error) {
 		return nil, fmt.Errorf("failed to decode ENR: %w", err)
 	}
 
-	// Create discv5 node from ENR record
-	v5Node, err := discv5node.New(enrRecord)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create node from ENR: %w", err)
-	}
-
-	// Extract public key
-	pubKey := v5Node.PublicKey()
+	pubKey := enrRecord.PublicKey()
 	if pubKey == nil {
 		return nil, fmt.Errorf("ENR has no public key")
 	}
 
-	// Build address
-	ip := enrRecord.IP()
-	if ip == nil {
-		return nil, fmt.Errorf("ENR has no IP")
+	// The v4 endpoint fallback below must run before any endpoint-dependent
+	// constructor: a v4 peer's record can omit ip/udp entirely, and rejecting
+	// it here would drop a row whose verified endpoint the columns still hold.
+	addr := enrRecord.UDPEndpoint()
+	if dbNode.HasV4 {
+		var ip net.IP
+		if len(dbNode.IP) > 0 {
+			ip = append(net.IP(nil), dbNode.IP...)
+		} else if len(dbNode.IPv6) > 0 {
+			ip = append(net.IP(nil), dbNode.IPv6...)
+		}
+		if ip != nil {
+			port := dbNode.Port
+			if port == 0 {
+				if ip.To4() != nil {
+					port = int(enrRecord.UDP())
+				} else if udp6 := enrRecord.UDP6(); udp6 != 0 {
+					port = int(udp6)
+				} else {
+					port = int(enrRecord.UDP())
+				}
+			}
+			if port != 0 {
+				addr = &net.UDPAddr{IP: ip, Port: port}
+			}
+		}
 	}
-	port := enrRecord.UDP()
-	addr := &net.UDPAddr{
-		IP:   ip,
-		Port: int(port),
+	if addr == nil {
+		return nil, fmt.Errorf("ENR has no IP")
 	}
 
 	// Create base node WITHOUT protocol-specific nodes initially
@@ -580,7 +593,12 @@ func (ndb *NodeDB) buildNodeFromDB(dbNode *db.Node) (*Node, error) {
 
 	// Only set v5 node if marked as having v5 support
 	if dbNode.HasV5 {
-		n.SetV5(v5Node)
+		v5Node, err := discv5node.New(enrRecord)
+		if err != nil {
+			ndb.logger.WithError(err).Debug("failed to create v5 node from DB record")
+		} else {
+			n.SetV5(v5Node)
+		}
 	}
 
 	// Only create v4 node if marked as having v4 support
@@ -625,24 +643,16 @@ func (ndb *NodeDB) LoadAll() ([]*Node, error) {
 	return nodes, nil
 }
 
-// LoadRandom loads a random sample of nodes (up to limit).
-func (ndb *NodeDB) LoadRandom(limit int) ([]*Node, error) {
-	dbNodes, err := ndb.db.GetRandomNodes(ndb.layer, limit)
-	if err != nil {
-		return nil, err
-	}
-
-	nodes := make([]*Node, 0, len(dbNodes))
-	for _, dbNode := range dbNodes {
+// VisitRandomNodes visits alive nodes until visit returns false.
+func (ndb *NodeDB) VisitRandomNodes(maxAge time.Duration, maxFailures int, visit func(*Node) bool) error {
+	return ndb.db.VisitRandomNodes(ndb.layer, time.Now().Add(-maxAge).Unix(), maxFailures, func(dbNode *db.Node) bool {
 		node, err := ndb.buildNodeFromDB(dbNode)
 		if err != nil {
 			ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", dbNode.NodeID[:8])).Warn("failed to build node from DB")
-			continue
+			return true
 		}
-		nodes = append(nodes, node)
-	}
-
-	return nodes, nil
+		return visit(node)
+	})
 }
 
 // Close stops the update queue processor and waits for pending updates.
@@ -719,29 +729,14 @@ func (ndb *NodeDB) Count() int {
 	return count
 }
 
-// LoadRandomNodes loads a random sample of nodes (alias for LoadRandom).
-func (ndb *NodeDB) LoadRandomNodes(limit int) []*Node {
-	nodes, _ := ndb.LoadRandom(limit)
-	return nodes
-}
-
-// LoadInactiveNodes loads inactive nodes (not seen recently).
-func (ndb *NodeDB) LoadInactiveNodes(limit int) []*Node {
-	dbNodes, err := ndb.db.GetInactiveNodes(ndb.layer, limit)
-	if err != nil {
-		ndb.logger.WithError(err).Warn("failed to load inactive nodes")
-		return nil
-	}
-
-	nodes := make([]*Node, 0, len(dbNodes))
-	for _, dbNode := range dbNodes {
+// VisitInactiveNodes visits alive nodes until visit returns false.
+func (ndb *NodeDB) VisitInactiveNodes(maxAge time.Duration, maxFailures int, visit func(*Node) bool) error {
+	return ndb.db.VisitInactiveNodes(ndb.layer, time.Now().Add(-maxAge).Unix(), maxFailures, func(dbNode *db.Node) bool {
 		node, err := ndb.buildNodeFromDB(dbNode)
 		if err != nil {
 			ndb.logger.WithError(err).WithField("nodeID", fmt.Sprintf("%x", dbNode.NodeID[:8])).Warn("failed to build node from DB")
-			continue
+			return true
 		}
-		nodes = append(nodes, node)
-	}
-
-	return nodes
+		return visit(node)
+	})
 }

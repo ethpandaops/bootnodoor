@@ -51,17 +51,21 @@ func createLocalNode(cfg *Config, key *ecdsa.PrivateKey, enrIP, enrIP6 net.IP, e
 
 // reconcileStoredENR applies authoritative config to a reused stored ENR:
 // explicitly-configured advertised IPs override the stored value and the port is
-// always config-authoritative, so a changed --enr-ip/--enr-ip6/port takes effect
-// on restart. An auto-detected IP is left untouched so an address learned via IP
-// discovery survives. Reports whether the record changed.
+// always config-authoritative. A routable auto-detected IPv4 address only seeds
+// a record with no IP yet: a stored IP is IP-discovery consensus (or a prior
+// config) and must survive restart behind 1:1 NAT, where the interface address
+// is routable but not the reachable one.
 func reconcileStoredENR(cfg *Config, rec *enr.Record, enrIP, enrIP6 net.IP, enrPort uint16) bool {
 	changed := false
 
-	if cfg.ENRIPProvided && enrIP != nil {
+	if enrIP != nil && cfg.ENRIPProvided {
 		if cur := rec.IP(); cur == nil || !cur.Equal(enrIP) {
 			rec.Set("ip", enrIP.To4())
 			changed = true
 		}
+	} else if enrIP != nil && rec.IP() == nil && v5node.IsRoutableAddress(enrIP) {
+		rec.Set("ip", enrIP.To4())
+		changed = true
 	}
 	if cfg.ENRIP6Provided && enrIP6 != nil {
 		if cur := rec.IP6(); cur == nil || !cur.Equal(enrIP6) {

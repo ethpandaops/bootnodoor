@@ -310,6 +310,26 @@ func (r *Record) UDP6() uint16 {
 	return 0
 }
 
+// UDPEndpoint returns the discovery endpoint the record advertises, keeping
+// the port paired with its address family: ip goes with udp, ip6 with udp6
+// (falling back to udp, which dual-stack records share across both families).
+//
+// Returns nil when the record carries no IP or no usable port.
+func (r *Record) UDPEndpoint() *net.UDPAddr {
+	ip := r.IP()
+	port := r.UDP()
+	if ip == nil {
+		ip = r.IP6()
+		if p := r.UDP6(); p != 0 {
+			port = p
+		}
+	}
+	if ip == nil || port == 0 {
+		return nil
+	}
+	return &net.UDPAddr{IP: ip, Port: int(port)}
+}
+
 // TCP returns the TCP port from the record.
 //
 // Returns 0 if no "tcp" key is present or if the value is not a valid port.

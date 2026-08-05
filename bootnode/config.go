@@ -47,8 +47,8 @@ type Config struct {
 
 	// ENRIPProvided/ENRIP6Provided record whether the advertised IP was explicitly
 	// configured (vs auto-detected). An explicit address is authoritative and
-	// overrides a stored ENR on restart; an auto-detected one does not, so a
-	// learned/discovered address survives.
+	// overrides a stored ENR. A routable auto-detected IPv4 address provides the
+	// startup candidate, and peer consensus can correct it while running.
 	ENRIPProvided  bool
 	ENRIP6Provided bool
 
