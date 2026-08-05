@@ -1340,10 +1340,13 @@ func (s *Service) onNodeSeenV4(n *v4node.Node, timestamp time.Time) {
 					return
 				}
 				genericNode = s.elTable.Get(n.ID())
+				if genericNode == nil {
+					return
+				}
 			} else {
 				// Get falls back to the DB, so this path can resurrect a peer
 				// the fork filter rejects; classify like the v5 path does.
-				if !s.config.ServeAll && s.enrManager != nil {
+				if !s.config.ServeAll && s.enrManager != nil && stored != nil {
 					if isEL, _ := s.classifyELNode(n.ID(), stored); !isEL {
 						s.evictWrongChain(s.elTable, s.elNodeDB, n.ID(), stored, db.LayerEL)
 						return
