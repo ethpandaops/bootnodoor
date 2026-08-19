@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethpandaops/bootnodoor/bootnode"
 	"github.com/ethpandaops/bootnodoor/webui/handlers"
+	"github.com/ethpandaops/bootnodoor/webui/ipnames"
 	"github.com/ethpandaops/bootnodoor/webui/server"
 	"github.com/ethpandaops/bootnodoor/webui/types"
 	"github.com/gorilla/mux"
@@ -35,8 +36,18 @@ func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, bo
 		logrus.Fatalf("error initializing frontend: %v", err)
 	}
 
+	// Optional IP -> name mapping for the node tables
+	var ipNameResolver *ipnames.Resolver
+	if config.IPNamesFile != "" {
+		ipNameResolver, err = ipnames.NewResolver(config.IPNamesFile, logger)
+		if err != nil {
+			logrus.Fatalf("error loading IP names file: %v", err)
+		}
+		logger.WithField("file", config.IPNamesFile).Info("loaded IP names mapping")
+	}
+
 	// register frontend routes
-	frontendHandler := handlers.NewFrontendHandler(bootnodeService)
+	frontendHandler := handlers.NewFrontendHandler(bootnodeService, ipNameResolver)
 	router.HandleFunc("/", frontendHandler.Overview).Methods("GET")
 	router.HandleFunc("/el-nodes", frontendHandler.ELNodes).Methods("GET")
 	router.HandleFunc("/cl-nodes", frontendHandler.CLNodes).Methods("GET")
