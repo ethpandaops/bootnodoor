@@ -1,10 +1,18 @@
 // Package ipnames maps peer IP addresses to human-readable names for the
-// web UI, based on a YAML file provided by the operator.
+// web UI, based on a mapping file provided by the operator.
 //
-// The file is a flat map of IP addresses or CIDR ranges to names:
+// Two file formats are supported, auto-detected:
+//
+// A flat YAML map of IP addresses or CIDR ranges to names:
 //
 //	"170.64.167.121": do-syd-bootnode-1
 //	"10.0.0.0/24": internal-lab
+//
+// Or an Ansible INI inventory, where the inventory hostname becomes the
+// display name for its ansible_host IP:
+//
+//	[bootnodes]
+//	do-syd-bootnode-1 ansible_host=170.64.167.121
 //
 // Exact IP entries win over CIDR ranges; among matching CIDR ranges the
 // longest prefix wins. The file is re-read when its modification time
@@ -16,6 +24,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,16 +74,37 @@ func NewResolver(path string, logger logrus.FieldLogger) (*Resolver, error) {
 	return r, nil
 }
 
-// load parses the file and swaps in the new mapping.
+// load parses the file (YAML map or Ansible INI inventory, auto-detected)
+// and swaps in the new mapping.
 func (r *Resolver) load() error {
 	data, err := os.ReadFile(r.path)
 	if err != nil {
 		return fmt.Errorf("failed to read IP names file: %w", err)
 	}
 
+	exact, cidrs, yamlErr := parseYAMLMapping(data)
+	if yamlErr != nil {
+		var iniErr error
+		exact, iniErr = parseIniInventory(data)
+		if iniErr != nil {
+			return fmt.Errorf("IP names file is neither a YAML IP->name map (%v) nor an Ansible INI inventory (%v)", yamlErr, iniErr)
+		}
+		cidrs = nil
+	}
+
+	r.mu.Lock()
+	r.exact = exact
+	r.cidrs = cidrs
+	r.mu.Unlock()
+	return nil
+}
+
+// parseYAMLMapping parses the native format: a flat YAML map of IP or CIDR
+// to display name.
+func parseYAMLMapping(data []byte) (map[string]string, []cidrName, error) {
 	var raw map[string]string
 	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return fmt.Errorf("failed to parse IP names file: %w", err)
+		return nil, nil, fmt.Errorf("failed to parse as YAML map: %w", err)
 	}
 
 	exact := make(map[string]string, len(raw))
@@ -87,19 +117,61 @@ func (r *Resolver) load() error {
 		}
 		ip := net.ParseIP(key)
 		if ip == nil {
-			return fmt.Errorf("invalid IP or CIDR in IP names file: %q", key)
+			return nil, nil, fmt.Errorf("invalid IP or CIDR: %q", key)
 		}
 		// Normalize so lookups by net.IP.String() always hit.
 		exact[ip.String()] = name
 	}
 	// Longest prefix first, so the first CIDR match is the most specific one.
 	sort.Slice(cidrs, func(i, j int) bool { return cidrs[i].ones > cidrs[j].ones })
+	return exact, cidrs, nil
+}
 
-	r.mu.Lock()
-	r.exact = exact
-	r.cidrs = cidrs
-	r.mu.Unlock()
-	return nil
+// parseIniInventory extracts hostname -> ansible_host pairs from an Ansible
+// INI inventory and returns them inverted (IP -> hostname). Hosts without an
+// ansible_host that parses as an IP are skipped (e.g. DNS names, which the
+// bootnode cannot match against the addresses it sees). [group:vars] and
+// [group:children] sections are ignored. At least one usable entry is
+// required, so an arbitrary text file is rejected instead of silently
+// producing an empty mapping.
+func parseIniInventory(data []byte) (map[string]string, error) {
+	exact := make(map[string]string)
+	inHostSection := true // hosts may appear before any [section]
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section := line[1 : len(line)-1]
+			// Only plain group sections list hosts.
+			inHostSection = !strings.Contains(section, ":")
+			continue
+		}
+		if !inHostSection {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		name := fields[0]
+		for _, kv := range fields[1:] {
+			val, ok := strings.CutPrefix(kv, "ansible_host=")
+			if !ok {
+				continue
+			}
+			val = strings.Trim(val, `"'`)
+			if ip := net.ParseIP(val); ip != nil {
+				exact[ip.String()] = name
+			}
+			break
+		}
+	}
+
+	if len(exact) == 0 {
+		return nil, fmt.Errorf("no hosts with an ansible_host=<ip> entry found")
+	}
+	return exact, nil
 }
 
 // maybeReload re-reads the file if its modification time changed. Checks

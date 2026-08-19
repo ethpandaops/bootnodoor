@@ -50,6 +50,56 @@ func TestLookup(t *testing.T) {
 	}
 }
 
+func TestLookupIniInventory(t *testing.T) {
+	path := writeMapping(t, `
+# production bootnodes
+[bootnodes]
+do-syd-bootnode-1 ansible_host=170.64.167.121 ansible_user=root
+do-nyc-bootnode-2 ansible_host="198.211.116.249"
+
+[monitoring]
+grafana-1 ansible_host=10.9.9.9
+
+; hosts without an IP ansible_host are skipped
+[dns-only]
+web-1 ansible_host=web1.example.com
+bare-hostname
+
+[bootnodes:vars]
+ansible_port=22
+
+[all:children]
+bootnodes
+monitoring
+`)
+	r, err := NewResolver(path, logrus.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		ip   string
+		want string
+	}{
+		{"170.64.167.121", "do-syd-bootnode-1"},
+		{"198.211.116.249", "do-nyc-bootnode-2"}, // quoted ansible_host
+		{"10.9.9.9", "grafana-1"},
+		{"8.8.8.8", ""}, // unmapped
+	}
+	for _, tt := range tests {
+		if got := r.Lookup(tt.ip); got != tt.want {
+			t.Errorf("Lookup(%q) = %q, want %q", tt.ip, got, tt.want)
+		}
+	}
+}
+
+func TestIniInventoryWithoutUsableHosts(t *testing.T) {
+	path := writeMapping(t, "just some random text\nthat is neither format\n")
+	if _, err := NewResolver(path, logrus.New()); err == nil {
+		t.Fatal("expected error for unrecognized file content")
+	}
+}
+
 func TestInvalidEntry(t *testing.T) {
 	path := writeMapping(t, `"not-an-ip": some-name`)
 	if _, err := NewResolver(path, logrus.New()); err == nil {

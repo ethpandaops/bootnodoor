@@ -162,7 +162,7 @@ func init() {
 	rootCmd.Flags().StringVar(&webUIHost, "web-host", "0.0.0.0", "Web UI host")
 	rootCmd.Flags().IntVar(&webUIPort, "web-port", 8080, "Web UI port")
 	rootCmd.Flags().StringVar(&webUISite, "web-sitename", "bootnodoor", "Web UI site name")
-	rootCmd.Flags().StringVar(&webUIIPNames, "ip-names", "", "Path to YAML file mapping IPs/CIDRs to display names shown in the web UI (reloaded on change)")
+	rootCmd.Flags().StringVar(&webUIIPNames, "ip-names", "", "Path to IP->name mapping shown in the web UI: YAML map of IPs/CIDRs to names, or an Ansible INI inventory (reloaded on change)")
 	rootCmd.Flags().BoolVar(&webUIPprof, "pprof", false, "Enable pprof endpoints")
 
 	// Devnet shim mode

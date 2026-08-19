@@ -238,12 +238,21 @@ the web UI via `/enr?layer=el` and `/enr?layer=cl`.
 - `--web-host <ip>`: Web UI host (default: `0.0.0.0`)
 - `--web-port <port>`: Web UI port (default: `8080`)
 - `--web-sitename <name>`: Web UI site name (default: `bootnodoor`)
-- `--ip-names <file>`: Path to a YAML file mapping IP addresses or CIDR ranges to display names. Named nodes show the name in place of the IP in the node tables (the real IP stays available as a tooltip). Exact IPs win over CIDR ranges; among CIDRs the longest prefix wins. The file is re-read when it changes, so edits apply without a restart:
+- `--ip-names <file>`: Path to a file mapping IP addresses to display names. Named nodes show the name in place of the IP in the node tables (the real IP stays available as a tooltip). The file is re-read when it changes, so edits apply without a restart. Two formats are supported, auto-detected:
+
+  A YAML map of IPs or CIDR ranges to names (exact IPs win over CIDR ranges; among CIDRs the longest prefix wins):
 
   ```yaml
   # ip-names.yaml
   "170.64.167.121": do-syd-bootnode-1
   "10.0.0.0/24": internal-lab
+  ```
+
+  Or an Ansible INI inventory — point the flag at your existing `inventory.ini` and each host's inventory name is used for its `ansible_host` IP (hosts whose `ansible_host` is a DNS name are skipped):
+
+  ```ini
+  [bootnodes]
+  do-syd-bootnode-1 ansible_host=170.64.167.121
   ```
 - `--pprof`: Enable pprof performance profiling endpoints
 
