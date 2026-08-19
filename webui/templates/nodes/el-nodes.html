@@ -16,20 +16,20 @@
     <!-- Summary Card -->
     <div class="card mt-3">
       <div class="card-body py-2">
-        <div class="row align-items-center">
-          <div class="col-auto">
+        <div class="row align-items-center node-summary">
+          <div class="col-auto node-filter" data-filter="all" role="button" title="Show all nodes">
             <strong>Total Nodes:</strong>
             <span class="badge rounded-pill text-bg-primary fs-6 ms-1" data-bind="text: nodesData().TotalNodes">{{ .TotalNodes }}</span>
           </div>
-          <div class="col-auto">
+          <div class="col-auto node-filter" data-filter="all" role="button" title="Show all nodes">
             <strong>Active Pool:</strong>
             <span class="badge rounded-pill text-bg-info fs-6 ms-1" data-bind="text: nodesData().ActiveNodes">{{ .ActiveNodes }}</span>
           </div>
-          <div class="col-auto">
+          <div class="col-auto node-filter" data-filter="alive" role="button" title="Show only alive nodes">
             <strong>Alive:</strong>
             <span class="badge rounded-pill text-bg-success fs-6 ms-1" data-bind="text: nodesData().AliveNodes">{{ .AliveNodes }}</span>
           </div>
-          <div class="col-auto">
+          <div class="col-auto node-filter" data-filter="dead" role="button" title="Show only dead nodes">
             <strong>Dead:</strong>
             <span class="badge rounded-pill text-bg-secondary fs-6 ms-1" data-bind="text: nodesData().DeadNodes">{{ .DeadNodes }}</span>
           </div>
@@ -62,23 +62,23 @@
           <table class="table table-sm table-hover mb-0">
             <thead class="sticky-top">
               <tr>
-                <th style="min-width: 300px;">Peer ID</th>
-                <th style="min-width: 160px;">IP:Port</th>
-                <th style="width: 100px;">Fork</th>
-                <th style="width: 80px;">Protocol</th>
-                <th style="width: 70px;">ENR Seq</th>
+                <th style="min-width: 300px;" data-sort="peerid" data-sort-type="text">Peer ID</th>
+                <th style="min-width: 160px;" data-sort="ip" data-sort-type="ip">IP:Port</th>
+                <th style="width: 100px;" data-sort="fork" data-sort-type="text">Fork</th>
+                <th style="width: 80px;" data-sort="protocol" data-sort-type="text">Protocol</th>
+                <th style="width: 70px;" data-sort="enrseq" data-sort-type="num">ENR Seq</th>
                 <th style="width: 50px;">ENR</th>
-                <th style="width: 100px;">First Seen</th>
-                <th style="width: 100px;">Last Seen</th>
-                <th style="width: 70px;">Success</th>
-                <th style="width: 70px;">Failures</th>
-                <th style="width: 80px;">Avg RTT</th>
-                <th style="width: 70px;">Score</th>
-                <th style="width: 70px;">Alive</th>
+                <th style="width: 100px;" data-sort="first" data-sort-type="time">First Seen</th>
+                <th style="width: 100px;" data-sort="last" data-sort-type="time">Last Seen</th>
+                <th style="width: 70px;" data-sort="success" data-sort-type="num">Success</th>
+                <th style="width: 70px;" data-sort="failures" data-sort-type="num">Failures</th>
+                <th style="width: 80px;" data-sort="rtt" data-sort-type="num">Avg RTT</th>
+                <th style="width: 70px;" data-sort="score" data-sort-type="num">Score</th>
+                <th style="width: 70px;" data-sort="alive" data-sort-type="alive">Alive</th>
               </tr>
             </thead>
             <tbody class="template-tbody">
-              {{ html "<!-- ko foreach: nodesData().Nodes -->" }}
+              {{ html "<!-- ko foreach: visibleNodes -->" }}
               <tr class="template-row">
                 <td class="node-id-cell">
                   <code class="peer-id-code" data-bind="text: PeerID"></code>
@@ -227,6 +227,7 @@
 
 {{ define "js" }}
 <script src="/js/knockout.min.js"></script>
+<script src="/js/nodetable.js"></script>
 <script>
   /* Format time difference */
   function formatTimeDiff(timestamp) {
@@ -334,6 +335,12 @@
       })
     });
 
+    /* Rows to render: current filter + sort applied (NodeTable.transform
+       registers the sort/filter observables as dependencies) */
+    self.visibleNodes = ko.computed(function() {
+      return NodeTable.transform(self.nodesData().Nodes);
+    });
+
     /* Load data from AJAX */
     self.loadData = function(data) {
       self.nodesData({
@@ -429,6 +436,7 @@
     });
 
     ko.applyBindings(viewModel, pageContainer);
+    NodeTable.markBound();
   }
 
   /* Initialize page */
@@ -442,6 +450,13 @@
 
     /* Initialize tooltips */
     initializeTooltips();
+
+    /* Column sorting + alive/dead filtering */
+    NodeTable.init({
+      table: document.querySelector('#nodes-container table'),
+      filterBar: document.querySelector('#nodes-container .node-summary'),
+      afterUpdate: initializeTooltips
+    });
 
     /* Handle clipboard copy for all elements with data-clipboard-text */
     document.addEventListener('click', function(e) {
