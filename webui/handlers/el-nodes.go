@@ -16,6 +16,7 @@ import (
 type ELNodeData struct {
 	PeerID          string
 	IP              string
+	Name            string // Operator-configured display name for the IP (may be empty)
 	Port            int
 	Enode           string
 	ENR             string
@@ -103,6 +104,7 @@ func (fh *FrontendHandler) ELNodes(w http.ResponseWriter, r *http.Request) {
 
 	for _, node := range activeNodes {
 		nd := convertNodeToELData(node, currentForkDigest, forkScoringInfo)
+		nd.Name = fh.ipName(nd.IP)
 		nodeData = append(nodeData, nd)
 
 		if nd.IsAlive {
@@ -192,6 +194,7 @@ func (fh *FrontendHandler) ELNodesJSON(w http.ResponseWriter, r *http.Request) {
 
 	for _, node := range activeNodes {
 		nd := convertNodeToELData(node, currentForkDigest, forkScoringInfo)
+		nd.Name = fh.ipName(nd.IP)
 		nodeData = append(nodeData, nd)
 
 		if nd.IsAlive {

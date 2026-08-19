@@ -64,7 +64,7 @@ func testService(t *testing.T, bindPort uint16) *bootnode.Service {
 // the panel reflects the running service.
 func TestOverviewReportsLiveStats(t *testing.T) {
 	svc := testService(t, 42424)
-	fh := NewFrontendHandler(svc)
+	fh := NewFrontendHandler(svc, nil)
 
 	rr := httptest.NewRecorder()
 	fh.Overview(rr, httptest.NewRequest(http.MethodGet, "/?ajax=1", nil))

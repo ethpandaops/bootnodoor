@@ -82,9 +82,10 @@ var (
 	enableWebUI bool
 	webUIHost   string
 	webUIPort   int
-	webUISite   string
-	webUIPprof  bool
-	webUIDebug  bool
+	webUISite    string
+	webUIPprof   bool
+	webUIDebug   bool
+	webUIIPNames string
 
 	// Devnet shim mode
 	devnetShim string
@@ -161,6 +162,7 @@ func init() {
 	rootCmd.Flags().StringVar(&webUIHost, "web-host", "0.0.0.0", "Web UI host")
 	rootCmd.Flags().IntVar(&webUIPort, "web-port", 8080, "Web UI port")
 	rootCmd.Flags().StringVar(&webUISite, "web-sitename", "bootnodoor", "Web UI site name")
+	rootCmd.Flags().StringVar(&webUIIPNames, "ip-names", "", "Path to IP->name mapping shown in the web UI: YAML map of IPs/CIDRs to names, or an Ansible INI inventory (reloaded on change)")
 	rootCmd.Flags().BoolVar(&webUIPprof, "pprof", false, "Enable pprof endpoints")
 
 	// Devnet shim mode
@@ -596,12 +598,13 @@ func startWebUI(service *bootnode.Service) {
 	logger.WithField("host", webUIHost).WithField("port", webUIPort).Info("starting web ui")
 
 	config := &types.FrontendConfig{
-		Host:     webUIHost,
-		Port:     webUIPort,
-		SiteName: webUISite,
-		Debug:    webUIDebug,
-		Pprof:    webUIPprof,
-		Minify:   true,
+		Host:        webUIHost,
+		Port:        webUIPort,
+		SiteName:    webUISite,
+		Debug:       webUIDebug,
+		Pprof:       webUIPprof,
+		Minify:      true,
+		IPNamesFile: webUIIPNames,
 	}
 
 	webui.StartHttpServer(config, logger, service)
