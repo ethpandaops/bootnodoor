@@ -588,7 +588,9 @@ func deriveEnodeFromENR(record interface {
 	// Convert public key to uncompressed format (65 bytes: 0x04 + X + Y)
 	pubKeyBytes := make([]byte, 65)
 	pubKeyBytes[0] = 0x04
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	pubKey.X.FillBytes(pubKeyBytes[1:33])
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	pubKey.Y.FillBytes(pubKeyBytes[33:65])
 
 	// For enode, we only use X and Y coordinates (skip the 0x04 prefix)
