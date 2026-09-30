@@ -347,6 +347,7 @@ func (s *Service) initDiscv4(id *identity) error {
 	discv4Config := discv4.DefaultConfig()
 	discv4Config.PrivateKey = id.key
 	discv4Config.LocalENR = id.localNode.Record()
+	discv4Config.MaxNodes = s.config.Discv4MaxNodes
 
 	// Set callbacks
 	discv4Config.OnFindnode = func(from *v4node.Node, target []byte, requester *net.UDPAddr) []*v4node.Node {
@@ -1352,6 +1353,9 @@ func (s *Service) onNodeSeenV4(n *v4node.Node, timestamp time.Time) {
 						return
 					}
 				}
+				// A node the handler recreated after evicting it arrives without a
+				// record; without the stored one, PONG-driven ENR refresh skips it.
+				n.UpdateENR(stored)
 				genericNode.SetV4(n)
 				if !s.elTable.Add(genericNode) {
 					return

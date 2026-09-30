@@ -70,6 +70,9 @@ type Node struct {
 	packetMu         sync.RWMutex
 	totalPacketsRecv uint64
 	totalPacketsSent uint64
+	// lastRecv is local, unlike LastSeen: the routing table swaps the shared
+	// stats for stored ones, which can carry an old last-seen time.
+	lastRecv time.Time
 }
 
 // BondStatus represents the bonding state of a node.
@@ -416,6 +419,20 @@ func (n *Node) IncrementPacketsSent() {
 	n.packetMu.Lock()
 	defer n.packetMu.Unlock()
 	n.totalPacketsSent++
+}
+
+// MarkPacketReceived records that an authenticated packet arrived from this node.
+func (n *Node) MarkPacketReceived() {
+	n.packetMu.Lock()
+	defer n.packetMu.Unlock()
+	n.lastRecv = time.Now()
+}
+
+// LastPacketReceived returns when an authenticated packet last arrived.
+func (n *Node) LastPacketReceived() time.Time {
+	n.packetMu.RLock()
+	defer n.packetMu.RUnlock()
+	return n.lastRecv
 }
 
 // TotalPacketsReceived returns the total packets received from this node.

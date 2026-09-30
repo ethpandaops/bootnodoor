@@ -106,6 +106,7 @@ func New(config *Config, transport Transport) (*Service, error) {
 		BondExpiration:   config.BondExpiration,
 		RequestTimeout:   config.RequestTimeout,
 		ExpirationWindow: config.ExpirationWindow,
+		MaxNodes:         config.MaxNodes,
 		OnPing:           config.OnPing,
 		OnFindnode:       config.OnFindnode,
 		OnENRRequest:     config.OnENRRequest,

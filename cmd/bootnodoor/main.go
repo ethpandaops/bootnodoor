@@ -70,6 +70,7 @@ var (
 	// Routing table
 	maxActiveNodes int
 	maxNodesPerIP  int
+	discv4MaxNodes int
 
 	// Layer selection
 	enableEL bool
@@ -149,6 +150,7 @@ func init() {
 	// Routing table
 	rootCmd.Flags().IntVar(&maxActiveNodes, "max-active-nodes", 500, "Maximum number of active nodes per table")
 	rootCmd.Flags().IntVar(&maxNodesPerIP, "max-nodes-per-ip", 10, "Maximum number of nodes per IP address")
+	rootCmd.Flags().IntVar(&discv4MaxNodes, "discv4-max-nodes", 50000, "Maximum number of nodes discv4 tracks for bonding")
 
 	// Layer selection
 	rootCmd.Flags().BoolVar(&enableEL, "enable-el", true, "Enable Execution Layer support (discv4 + discv5)")
@@ -532,6 +534,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 	config.ServeAll = serveAll
 	config.MaxActiveNodes = maxActiveNodes
 	config.MaxNodesPerIP = maxNodesPerIP
+	config.Discv4MaxNodes = discv4MaxNodes
 	config.Logger = logger
 
 	// Set EL config if provided
