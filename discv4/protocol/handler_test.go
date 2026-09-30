@@ -17,7 +17,7 @@ func testAddr() *net.UDPAddr {
 
 // makeNodeID returns a fresh, valid secp256k1 public key and its node ID,
 // standing in for a distinct peer (or a fabricated NEIGHBORS record).
-func makeNodeID(t *testing.T) (*ecdsa.PublicKey, node.ID) {
+func makeNodeID(t testing.TB) (*ecdsa.PublicKey, node.ID) {
 	t.Helper()
 	key, err := crypto.GenerateKey()
 	if err != nil {
