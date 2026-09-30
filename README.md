@@ -224,6 +224,10 @@ the web UI via `/enr?layer=el` and `/enr?layer=cl`.
 - `--max-nodes-per-ip <count>`: Maximum nodes to track per IP address (default: `10`)
   - Prevents single IPs from dominating the routing table
 
+- `--discv4-max-nodes <count>`: Maximum nodes discv4 tracks for bonding (default: `50000`)
+  - When the limit is reached, a new node replaces an unbonded node first. If none is left, it replaces the bonded node that has been idle longest, but only after 5 minutes without a packet. Active peers are never replaced.
+  - A flood that keeps every entry active can still block new nodes until entries go idle.
+
 #### Fork Filtering (CL Only)
 
 - `--grace-period <duration>`: Grace period for old CL fork digests (default: `60m`)

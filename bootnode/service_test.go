@@ -855,6 +855,29 @@ func TestOnNodeSeenV4UpdatesRestoredAddress(t *testing.T) {
 	}
 }
 
+// TestOnNodeSeenV4RestoresStoredRecord: the discv4 handler recreates an evicted
+// node without a record. Taking the stored one keeps PONG-driven ENR refresh,
+// which needs a known sequence, working for that peer.
+func TestOnNodeSeenV4RestoresStoredRecord(t *testing.T) {
+	s := newServeAllTestService(t, true)
+	record := storedENRWith(t, mustKey(t), nil)
+	addr := &net.UDPAddr{IP: net.ParseIP("5.6.7.8"), Port: 9000}
+	oldNode, err := v4node.FromENR(record, addr)
+	if err != nil {
+		t.Fatalf("old v4 node: %v", err)
+	}
+	if !s.elTable.Add(nodes.NewFromV4(oldNode, s.elNodeDB)) {
+		t.Fatal("old node was not admitted")
+	}
+
+	recreated := v4node.New(oldNode.PublicKey(), addr)
+	s.onNodeSeenV4(recreated, time.Now())
+
+	if got := recreated.ENR(); got == nil || got.Seq() != record.Seq() {
+		t.Fatalf("recreated node record = %v, want the stored record", got)
+	}
+}
+
 func mustV5Node(t *testing.T) *v5node.Node {
 	t.Helper()
 	n, err := v5node.New(storedENRWith(t, mustKey(t), nil))

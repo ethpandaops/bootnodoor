@@ -95,6 +95,9 @@ type Config struct {
 	// MaxNodesPerIP is the maximum nodes allowed per IP address (default: 10)
 	MaxNodesPerIP int
 
+	// Discv4MaxNodes caps the nodes discv4 tracks for bonding (0: 50000)
+	Discv4MaxNodes int
+
 	// PingInterval is how often to ping nodes (default: 30s)
 	PingInterval time.Duration
 
@@ -215,6 +218,10 @@ func (c *Config) Validate() error {
 
 	if c.MaxNodesPerIP <= 0 {
 		return fmt.Errorf("max nodes per IP must be positive")
+	}
+
+	if c.Discv4MaxNodes < 0 {
+		return fmt.Errorf("discv4 max nodes must not be negative")
 	}
 
 	return nil

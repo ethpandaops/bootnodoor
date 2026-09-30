@@ -29,6 +29,9 @@ type Config struct {
 	// Packets with expiration outside this window are rejected
 	ExpirationWindow time.Duration
 
+	// MaxNodes caps the nodes the handler tracks for bonding (default: 50000)
+	MaxNodes int
+
 	// Callbacks
 
 	// OnPing is called when a PING request is received
@@ -66,6 +69,10 @@ func (c *Config) Validate() error {
 
 	if c.ExpirationWindow < 0 {
 		return fmt.Errorf("expiration window must be positive")
+	}
+
+	if c.MaxNodes < 0 {
+		return fmt.Errorf("max nodes must not be negative")
 	}
 
 	return nil
