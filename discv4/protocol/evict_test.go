@@ -177,12 +177,13 @@ func TestFullBondedMapRejectsWithoutWalking(t *testing.T) {
 	}
 	h.nodesMu.RLock()
 	queued := len(h.evictable) - h.evictHead
+	walked := h.evictBondedHead
 	h.nodesMu.RUnlock()
 	if queued != 0 {
 		t.Fatalf("%d entries queued on a fully bonded map, want 0", queued)
 	}
-	if h.evictBondedHead != 0 {
-		t.Fatalf("bonded fallback walked %d active entries, want 0", h.evictBondedHead)
+	if walked != 0 {
+		t.Fatalf("bonded fallback walked %d active entries, want 0", walked)
 	}
 }
 
@@ -273,6 +274,7 @@ func TestBondedFloodEvictsOnlyIdlePeers(t *testing.T) {
 	h := NewHandler(ctx, HandlerConfig{MaxNodes: maxNodes, NodeTTL: 30 * time.Millisecond}, nil)
 	fillIdleBonded(t, h, idle)
 	active := makeKeys(t, maxNodes-idle)
+	flood := makeKeys(t, maxNodes*3)
 	for _, k := range active {
 		n := h.lookupOrCreateNode(k.id, k.pub, testAddr())
 		n.MarkPongReceived(time.Hour, testAddr())
@@ -280,7 +282,7 @@ func TestBondedFloodEvictsOnlyIdlePeers(t *testing.T) {
 	}
 	h.cleanup()
 
-	for _, k := range makeKeys(t, maxNodes*3) {
+	for _, k := range flood {
 		n := h.lookupOrCreateNode(k.id, k.pub, testAddr())
 		n.MarkPongReceived(time.Hour, testAddr())
 		n.MarkPacketReceived()

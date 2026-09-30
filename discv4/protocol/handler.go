@@ -898,6 +898,12 @@ func (h *Handler) sendPing(n *node.Node, destAddr *net.UDPAddr) (*PendingRequest
 		return nil, err
 	}
 
+	// Start the deadline once the packet is out, as the response timers do; a slow
+	// write would otherwise expire the request before an in-time PONG arrives.
+	h.requestsMu.Lock()
+	req.Timeout = time.Now().Add(h.config.RequestTimeout)
+	h.requestsMu.Unlock()
+
 	h.incrementPacketsSent()
 	n.IncrementPacketsSent()
 	n.MarkPingSent()

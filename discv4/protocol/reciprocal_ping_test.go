@@ -44,6 +44,18 @@ func pendingPings(h *Handler, id node.ID) []*PendingRequest {
 	return out
 }
 
+// waitTimersDone waits for every reciprocal-PING timer to have fired.
+func waitTimersDone(t *testing.T, h *Handler) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for h.reciprocalPings.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("outstanding reciprocal PINGs = %d, want 0", h.reciprocalPings.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func peerNode(t *testing.T) (*node.Node, *net.UDPAddr) {
 	t.Helper()
 	key, err := crypto.GenerateKey()
@@ -107,12 +119,9 @@ func TestReciprocalPingAnswered(t *testing.T) {
 		t.Fatal("PONG to the reciprocal PING did not bond the node")
 	}
 
-	time.Sleep(60 * time.Millisecond)
+	waitTimersDone(t, h)
 	if got := n.FailedPings(); got != 0 {
 		t.Fatalf("failed pings = %d after an answered PING, want 0", got)
-	}
-	if got := h.reciprocalPings.Load(); got != 0 {
-		t.Fatalf("outstanding reciprocal PINGs = %d, want 0", got)
 	}
 }
 
@@ -136,15 +145,12 @@ func TestReciprocalPingTimeout(t *testing.T) {
 		t.Fatal("cleanup removed a PING its timer owns")
 	}
 
-	time.Sleep(60 * time.Millisecond)
+	waitTimersDone(t, h)
 	if got := n.FailedPings(); got != 1 {
 		t.Fatalf("failed pings = %d, want 1", got)
 	}
 	if len(pendingPings(h, n.ID())) != 0 {
 		t.Fatal("timed-out PING still pending")
-	}
-	if got := h.reciprocalPings.Load(); got != 0 {
-		t.Fatalf("outstanding reciprocal PINGs = %d, want 0", got)
 	}
 }
 
@@ -158,9 +164,7 @@ func TestReciprocalPingSendError(t *testing.T) {
 	if len(pendingPings(h, n.ID())) != 0 {
 		t.Fatal("failed send left a pending PING")
 	}
-	if got := h.reciprocalPings.Load(); got != 0 {
-		t.Fatalf("outstanding reciprocal PINGs = %d, want 0", got)
-	}
+	waitTimersDone(t, h)
 }
 
 // TestReciprocalPingCap: at the cap the reciprocal PING is skipped, and the
@@ -251,8 +255,31 @@ func TestConcurrentInboundPingAndPing(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	time.Sleep(50 * time.Millisecond)
-	if got := h.reciprocalPings.Load(); got != 0 {
-		t.Fatalf("outstanding reciprocal PINGs = %d, want 0", got)
+	waitTimersDone(t, h)
+}
+
+type slowTransport struct{ delay time.Duration }
+
+func (s slowTransport) SendTo([]byte, *net.UDPAddr) error {
+	time.Sleep(s.delay)
+	return nil
+}
+func (s slowTransport) Send(b []byte, to *net.UDPAddr, _ *net.UDPAddr) error { return s.SendTo(b, to) }
+
+// TestSlowSendKeepsPingDeadline: the request deadline starts when the packet is
+// out, so a PONG right after a slow write still matches.
+func TestSlowSendKeepsPingDeadline(t *testing.T) {
+	h, cancel := reciprocalHandler(t, slowTransport{delay: 60 * time.Millisecond}, 30*time.Millisecond)
+	defer cancel()
+	n, addr := peerNode(t)
+
+	h.sendReciprocalPing(n, addr)
+	reqs := pendingPings(h, n.ID())
+	if len(reqs) != 1 {
+		t.Fatalf("pending PINGs = %d, want 1", len(reqs))
 	}
+	if got := h.consumePendingPing(reqs[0].RequestHash, n.ID(), addr); got != reqs[0] {
+		t.Fatal("PONG right after a slow send did not match its PING")
+	}
+	waitTimersDone(t, h)
 }
