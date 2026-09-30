@@ -59,6 +59,8 @@ do-nyc-bootnode-2 ansible_host="198.211.116.249"
 
 [monitoring]
 grafana-1 ansible_host=10.9.9.9
+prometheus-1 ansible_host=10.9.9.10 # inline comment
+retired-1 # ansible_host=10.9.9.11
 
 ; hosts without an IP ansible_host are skipped
 [dns-only]
@@ -84,7 +86,9 @@ monitoring
 		{"170.64.167.121", "do-syd-bootnode-1"},
 		{"198.211.116.249", "do-nyc-bootnode-2"}, // quoted ansible_host
 		{"10.9.9.9", "grafana-1"},
-		{"8.8.8.8", ""}, // unmapped
+		{"10.9.9.10", "prometheus-1"},
+		{"10.9.9.11", ""}, // commented out
+		{"8.8.8.8", ""},   // unmapped
 	}
 	for _, tt := range tests {
 		if got := r.Lookup(tt.ip); got != tt.want {

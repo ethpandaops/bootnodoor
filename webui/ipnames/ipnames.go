@@ -156,6 +156,10 @@ func parseIniInventory(data []byte) (map[string]string, error) {
 		fields := strings.Fields(line)
 		name := fields[0]
 		for _, kv := range fields[1:] {
+			// Ansible drops the rest of a host line from a "#" token on.
+			if strings.HasPrefix(kv, "#") {
+				break
+			}
 			val, ok := strings.CutPrefix(kv, "ansible_host=")
 			if !ok {
 				continue

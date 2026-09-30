@@ -237,7 +237,7 @@ the web UI via `/enr?layer=el` and `/enr?layer=cl`.
 - `--web-host <ip>`: Web UI host (default: `0.0.0.0`)
 - `--web-port <port>`: Web UI port (default: `8080`)
 - `--web-sitename <name>`: Web UI site name (default: `bootnodoor`)
-- `--ip-names <file>`: Path to a file mapping IP addresses to display names. Named nodes show the name in place of the IP in the node tables (the real IP stays available as a tooltip). The file is re-read when it changes, so edits apply without a restart. Two formats are supported, auto-detected:
+- `--ip-names <file>`: Path to a file mapping IP addresses to display names. Named nodes show the name in place of the IP in the node tables (the real IP stays available as a tooltip). Edits apply without a restart: a nodes page request checks the file's modification time, at most once every 30 seconds. A copy that keeps the old modification time (`cp -p`, `rsync -t`) is not detected. Two formats are supported, auto-detected:
 
   A YAML map of IPs or CIDR ranges to names (exact IPs win over CIDR ranges; among CIDRs the longest prefix wins):
 
