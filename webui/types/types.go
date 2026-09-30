@@ -9,4 +9,5 @@ type FrontendConfig struct {
 	Minify           bool
 	DisableTxMetrics bool
 	DisableAuditLogs bool
+	IPNamesFile      string
 }

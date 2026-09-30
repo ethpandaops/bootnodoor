@@ -31,7 +31,8 @@ window.NodeTable = (function () {
   /* How to read each sortable column from a NodeViewModel */
   var getters = {
     peerid:   function (n) { return String(n.PeerID).toLowerCase(); },
-    ip:       function (n) { return ipSortKey(n.IP + ':' + n.Port); },
+    /* sorts by the displayed value: configured name if set, else the IP */
+    ip:       function (n) { return ipSortKey((n.Name || n.IP) + ':' + n.Port); },
     fork:     function (n) { return String(n.ForkDigest || '').toLowerCase(); },
     protocol: function (n) { return String(n.ProtocolSupport || '').toLowerCase(); },
     enrseq:   function (n) { return Number(n.ENRSeq) || 0; },

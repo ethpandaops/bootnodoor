@@ -84,7 +84,12 @@
                   <i class="fa fa-copy text-muted ms-1" role="button" data-bs-toggle="tooltip" title="Copy Peer ID" data-bind="attr: { 'data-clipboard-text': PeerID }"></i>
                 </td>
                 <td>
-                  <code><span data-bind="text: IP"></span>:<span data-bind="text: Port"></span></code>
+                  {{ html "<!-- ko if: Name -->" }}
+                    <code data-bs-toggle="tooltip" data-bind="text: Name + ':' + Port, attr: { title: IP + ':' + Port }"></code>
+                  {{ html "<!-- /ko -->" }}
+                  {{ html "<!-- ko ifnot: Name -->" }}
+                    <code><span data-bind="text: IP"></span>:<span data-bind="text: Port"></span></code>
+                  {{ html "<!-- /ko -->" }}
                 </td>
                 <td>
                   {{ html "<!-- ko if: HasForkData -->" }}
@@ -145,7 +150,11 @@
                   <i class="fa fa-copy text-muted ms-1" role="button" data-bs-toggle="tooltip" title="Copy Peer ID" data-clipboard-text="{{ $node.PeerID }}"></i>
                 </td>
                 <td>
-                  <code>{{ $node.IP }}:{{ $node.Port }}</code>
+                  {{ if $node.Name }}
+                    <code data-bs-toggle="tooltip" title="{{ $node.IP }}:{{ $node.Port }}">{{ $node.Name }}:{{ $node.Port }}</code>
+                  {{ else }}
+                    <code>{{ $node.IP }}:{{ $node.Port }}</code>
+                  {{ end }}
                 </td>
                 <td>
                   {{ if $node.HasForkData }}
@@ -261,6 +270,7 @@
     self.PeerID = data.PeerID;
     self.IP = data.IP;
     self.Port = data.Port;
+    self.Name = data.Name || '';
     self.FirstSeen = data.FirstSeen;
     self.LastSeen = data.LastSeen;
     self.SuccessCount = data.SuccessCount;
