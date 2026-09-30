@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -153,13 +154,17 @@ func parseIniInventory(data []byte) (map[string]string, error) {
 			continue
 		}
 
-		fields := strings.Fields(line)
+		fields := splitHostLine(line)
+		if len(fields) == 0 {
+			continue
+		}
 		name := fields[0]
 		for _, kv := range fields[1:] {
 			val, ok := strings.CutPrefix(kv, "ansible_host=")
 			if !ok {
 				continue
 			}
+			// Ansible evaluates the value as a literal, so "'ip'" is a plain string.
 			val = strings.Trim(val, `"'`)
 			if ip := net.ParseIP(val); ip != nil {
 				exact[ip.String()] = name
@@ -233,4 +238,56 @@ func (r *Resolver) Lookup(ipStr string) string {
 		}
 	}
 	return ""
+}
+
+// splitHostLine tokenizes an inventory host line the way Ansible does (Python
+// shlex, posix, comments=True): quotes group and are stripped, an unquoted "#"
+// ends the line even inside a token, and a backslash escapes the next character
+// outside quotes, or only a quote or backslash inside double quotes.
+func splitHostLine(line string) []string {
+	var (
+		fields  []string
+		cur     strings.Builder
+		inToken bool
+		quote   rune
+		escaped bool
+	)
+	for _, c := range line {
+		switch {
+		case escaped:
+			if quote == '"' && c != '"' && c != '\\' {
+				cur.WriteRune('\\')
+			}
+			cur.WriteRune(c)
+			escaped = false
+		case c == '\\' && quote != '\'':
+			escaped, inToken = true, true
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			} else {
+				cur.WriteRune(c)
+			}
+		case c == '"' || c == '\'':
+			quote, inToken = c, true
+		case c == '#':
+			if inToken {
+				fields = append(fields, cur.String())
+			}
+			return fields
+		case unicode.IsSpace(c):
+			if inToken {
+				fields = append(fields, cur.String())
+				cur.Reset()
+				inToken = false
+			}
+		default:
+			cur.WriteRune(c)
+			inToken = true
+		}
+	}
+	if inToken {
+		fields = append(fields, cur.String())
+	}
+	return fields
 }
