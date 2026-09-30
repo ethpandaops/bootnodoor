@@ -4,6 +4,7 @@ import (
 	"embed"
 	"fmt"
 	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/ethpandaops/bootnodoor/bootnode"
@@ -92,6 +93,9 @@ func StartHttpServer(config *types.FrontendConfig, logger logrus.FieldLogger, bo
 
 func registerPprofHandler(router *mux.Router, enabled bool) {
 	if enabled {
+		// Both profiles are empty unless sampling is on; a lock stall needs them.
+		runtime.SetMutexProfileFraction(100)
+		runtime.SetBlockProfileRate(int(time.Millisecond))
 		router.PathPrefix("/debug/pprof/").Handler(http.DefaultServeMux)
 	}
 }

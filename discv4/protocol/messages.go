@@ -209,7 +209,9 @@ func (p Pubkey) ID() []byte {
 // EncodePubkey encodes an ECDSA public key to the wire format.
 func EncodePubkey(key *ecdsa.PublicKey) Pubkey {
 	var p Pubkey
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	math.ReadBits(key.X, p[:len(p)/2])
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	math.ReadBits(key.Y, p[len(p)/2:])
 	return p
 }

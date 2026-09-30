@@ -69,6 +69,7 @@ func verifyIDSignature(pubKey *ecdsa.PublicKey, signature, challenge, ephPubkey 
 // This matches go-ethereum's ecdh function which returns a 33-byte compressed point.
 func ecdh(privkey *ecdsa.PrivateKey, pubkey *ecdsa.PublicKey) []byte {
 	// Perform scalar multiplication: shared = pubkey * privkey.D
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	secX, secY := pubkey.ScalarMult(pubkey.X, pubkey.Y, privkey.D.Bytes())
 	if secX == nil {
 		return nil

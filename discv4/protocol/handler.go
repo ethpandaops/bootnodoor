@@ -67,6 +67,12 @@ type Handler struct {
 	nodesMu sync.RWMutex
 	nodes   map[node.ID]*node.Node
 
+	// Eviction candidates, guarded by nodesMu, so a full map never walks every
+	// entry under the write lock per unknown sender. Entries may be stale.
+	evictable     []node.ID
+	evictHead     int
+	evictAppended uint64
+
 	// In-flight PONG-driven ENR refreshes, keyed by node ID. The refresh cannot
 	// update the cached sequence before its own PING is answered, so without this
 	// every PONG on the way re-triggers it.
@@ -1176,22 +1182,42 @@ func (h *Handler) lookupOrCreateNode(id node.ID, pubkey *ecdsa.PublicKey, addr *
 	// can never lead to a bond). Bonded entries are real, endpoint-proven peers and
 	// are never evicted here; if every entry is bonded (genuine load, not a flood) we
 	// leave the map as-is and return the node without retaining it.
-	if len(h.nodes) >= h.config.MaxNodes {
-		evicted := false
-		for eid, en := range h.nodes {
-			if !en.IsBonded() {
-				delete(h.nodes, eid)
-				evicted = true
-				break
-			}
-		}
-		if !evicted {
-			return n
-		}
+	if len(h.nodes) >= h.config.MaxNodes && !h.popEvictable() {
+		return n
 	}
 
 	h.nodes[id] = n
+	h.pushEvictable(id)
 	return n
+}
+
+// Caller holds nodesMu for writing.
+func (h *Handler) pushEvictable(id node.ID) {
+	h.evictable = append(h.evictable, id)
+	h.evictAppended++
+}
+
+// Caller holds nodesMu for writing.
+func (h *Handler) popEvictable() bool {
+	defer h.compactEvictable()
+	for h.evictHead < len(h.evictable) {
+		id := h.evictable[h.evictHead]
+		h.evictHead++
+		if n, ok := h.nodes[id]; ok && !n.IsBonded() {
+			delete(h.nodes, id)
+			return true
+		}
+	}
+	return false
+}
+
+// Reclaims popped slots so steady pops and pushes do not grow the backing array.
+func (h *Handler) compactEvictable() {
+	if h.evictHead == 0 || h.evictHead < len(h.evictable)/2 {
+		return
+	}
+	h.evictable = append(h.evictable[:0], h.evictable[h.evictHead:]...)
+	h.evictHead = 0
 }
 
 // promoteAddr installs a proven endpoint as n's canonical address. Only
@@ -1465,22 +1491,11 @@ func (h *Handler) cleanup() {
 	// Evict stale, unbonded nodes so the map stays bounded. Bonded nodes are
 	// kept until their bond expires, after which IsBonded reports false and they
 	// become eligible here. Scanning under the read lock keeps a full-map sweep
-	// from stalling every inbound packet in getOrCreateNode.
-	stale := h.staleNodes(now)
-	if len(stale) == 0 {
+	// from stalling every inbound packet in lookupOrCreateNode.
+	evicted := h.applyNodeScan(now, h.scanNodes(now))
+	if len(evicted) == 0 {
 		return
 	}
-
-	h.nodesMu.Lock()
-	evicted := make([]node.ID, 0, len(stale))
-	for _, id := range stale {
-		// Re-check: a node may have been seen again since the scan.
-		if n, ok := h.nodes[id]; ok && !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
-			delete(h.nodes, id)
-			evicted = append(evicted, id)
-		}
-	}
-	h.nodesMu.Unlock()
 
 	h.enrRefreshMu.Lock()
 	for _, id := range evicted {
@@ -1489,18 +1504,66 @@ func (h *Handler) cleanup() {
 	h.enrRefreshMu.Unlock()
 }
 
-// staleNodes returns the IDs of unbonded nodes past their TTL.
-func (h *Handler) staleNodes(now time.Time) []node.ID {
-	h.nodesMu.RLock()
-	defer h.nodesMu.RUnlock()
+type nodeScan struct {
+	appendedAt uint64
+	stale      []node.ID
+	candidates []node.ID
+}
 
-	var stale []node.ID
+// scanNodes collects the unbonded nodes, least recently seen first, and those
+// past their TTL.
+func (h *Handler) scanNodes(now time.Time) nodeScan {
+	type candidate struct {
+		id       node.ID
+		lastSeen time.Time
+	}
+
+	h.nodesMu.RLock()
+	scan := nodeScan{appendedAt: h.evictAppended}
+	candidates := make([]candidate, 0, len(h.nodes))
 	for id, n := range h.nodes {
-		if !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
-			stale = append(stale, id)
+		if n.IsBonded() {
+			continue
+		}
+		lastSeen := n.LastSeen()
+		candidates = append(candidates, candidate{id, lastSeen})
+		if now.Sub(lastSeen) > h.config.NodeTTL {
+			scan.stale = append(scan.stale, id)
 		}
 	}
-	return stale
+	h.nodesMu.RUnlock()
+
+	slices.SortFunc(candidates, func(a, b candidate) int { return a.lastSeen.Compare(b.lastSeen) })
+	scan.candidates = make([]node.ID, len(candidates))
+	for i, c := range candidates {
+		scan.candidates[i] = c.id
+	}
+	return scan
+}
+
+// applyNodeScan replaces the eviction queue and evicts stale nodes. It runs on
+// every pass, not only when something is stale: a bond expires without touching
+// the map, so a node with a fresh LastSeen only becomes a candidate here.
+func (h *Handler) applyNodeScan(now time.Time, scan nodeScan) []node.ID {
+	h.nodesMu.Lock()
+	defer h.nodesMu.Unlock()
+
+	// Nodes inserted after the scan began are missing from it; they are the
+	// queue's tail, so carry over the part not yet popped.
+	sinceScan := int(h.evictAppended - scan.appendedAt)
+	tail := h.evictable[max(h.evictHead, len(h.evictable)-sinceScan):]
+	h.evictable = append(scan.candidates, tail...)
+	h.evictHead = 0
+
+	evicted := make([]node.ID, 0, len(scan.stale))
+	for _, id := range scan.stale {
+		// Re-check: a node may have been seen again since the scan.
+		if n, ok := h.nodes[id]; ok && !n.IsBonded() && now.Sub(n.LastSeen()) > h.config.NodeTTL {
+			delete(h.nodes, id)
+			evicted = append(evicted, id)
+		}
+	}
+	return evicted
 }
 
 // Statistics

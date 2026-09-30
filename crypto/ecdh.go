@@ -44,6 +44,7 @@ func ECDH(privKey *ecdsa.PrivateKey, pubKey *ecdsa.PublicKey) ([]byte, error) {
 
 	// Convert to secp256k1 types for scalar multiplication
 	var scalar secp256k1.ModNScalar
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	scalar.SetByteSlice(privKey.D.Bytes())
 
 	pubBytes := crypto.CompressPubkey(pubKey)
@@ -81,7 +82,9 @@ func ValidatePublicKey(pubKey *ecdsa.PublicKey) error {
 	// CompressPubkey on invalid points. Format: 0x04 || X (32 bytes) || Y (32 bytes)
 	uncompressed := make([]byte, 65)
 	uncompressed[0] = 0x04
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	pubKey.X.FillBytes(uncompressed[1:33])
+	//lint:ignore SA1019 stdlib replacement does not support secp256k1
 	pubKey.Y.FillBytes(uncompressed[33:65])
 
 	// ParsePubKey performs on-curve and infinity checks.

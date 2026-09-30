@@ -143,14 +143,13 @@ go build -o bootnodoor ./cmd/bootnodoor
 **For Execution Layer:**
 - `--el-config <path>`: Path to EL chain config file (JSON)
   - Contains fork schedule and network parameters
-  - Example: Mainnet, Sepolia, Holesky configs
+  - Example: Mainnet, Sepolia, Hoodi configs
 
 - `--el-genesis-hash <hex>`: Genesis block hash (0x-prefixed hex)
   - Used to compute fork IDs
   - Example: `0xd4e56740...` for Ethereum mainnet
 
-- `--el-genesis-time <unix>`: Genesis block timestamp (Unix time)
-  - Example: `1438269988` for Ethereum mainnet
+- The genesis block timestamp is read from the `timestamp` field of `--el-config`, as hex or decimal.
 
 **For Consensus Layer:**
 - `--cl-config <path>`: Path to CL beacon config file (YAML)

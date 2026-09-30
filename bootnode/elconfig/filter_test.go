@@ -48,6 +48,37 @@ func mainnetConfig() *ChainConfig {
 	}}
 }
 
+// sepoliaGenesisHash and sepoliaConfig mirror go-ethereum v1.17.7's
+// params.SepoliaChainConfig. Sepolia's genesis block timestamp is 1633267481.
+var sepoliaGenesisHash = mustHash32("25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9")
+
+const sepoliaGenesisTime = 1633267481
+
+func sepoliaConfig() *ChainConfig {
+	return &ChainConfig{rawConfig: map[string]interface{}{
+		"homesteadBlock":          0,
+		"eip150Block":             0,
+		"eip155Block":             0,
+		"eip158Block":             0,
+		"byzantiumBlock":          0,
+		"constantinopleBlock":     0,
+		"petersburgBlock":         0,
+		"istanbulBlock":           0,
+		"muirGlacierBlock":        0,
+		"berlinBlock":             0,
+		"londonBlock":             0,
+		"terminalTotalDifficulty": 17000000000000000,
+		"mergeNetsplitBlock":      1735371,
+		"shanghaiTime":            1677557088,
+		"cancunTime":              1706655072,
+		"pragueTime":              1741159776,
+		"osakaTime":               1760427360,
+		"bpo1Time":                1761017184,
+		"bpo2Time":                1761607008,
+		"amsterdamTime":           1791294816,
+	}}
+}
+
 // devnetConfig models a kurtosis-style devnet: every fork active at genesis.
 func devnetConfig(genesisTime uint64) *ChainConfig {
 	return &ChainConfig{rawConfig: map[string]interface{}{
@@ -112,6 +143,34 @@ func TestComputeForkIDNextSelection(t *testing.T) {
 	}
 	for _, c := range cases {
 		got := ComputeForkID(mainnetGenesisHash, byBlock, byTime, c.head, c.time)
+		if got.Hash != sum32(c.wantHash) || got.Next != c.wantNext {
+			t.Errorf("ComputeForkID(head=%d, time=%d) = %v, want {%#x %d}", c.head, c.time, got, c.wantHash, c.wantNext)
+		}
+	}
+}
+
+// TestComputeForkIDSepolia pins go-ethereum v1.17.7's Sepolia TestCreation
+// vectors through the Amsterdam fork.
+func TestComputeForkIDSepolia(t *testing.T) {
+	byBlock, byTime := GatherForks(sepoliaConfig(), sepoliaGenesisTime)
+	cases := []struct {
+		head, time uint64
+		wantHash   uint32
+		wantNext   uint64
+	}{
+		{0, 0, 0xfe3366e7, 1735371},
+		{1735371, 0, 0xb96cbd13, 1677557088},
+		{1735372, 1677557088, 0xf7f9bc08, 1706655072},
+		{1735372, 1706655072, 0x88cf81d9, 1741159776},
+		{1735372, 1741159776, 0xed88b5fd, 1760427360},
+		{1735372, 1760427360, 0xe2ae4999, 1761017184},
+		{1735372, 1761017184, 0x56078a1e, 1761607008},
+		{1735372, 1791294815, 0x268956b6, 1791294816},
+		{1735372, 1791294816, 0x6c1d9423, 0},
+		{1735372, 2000000000, 0x6c1d9423, 0},
+	}
+	for _, c := range cases {
+		got := ComputeForkID(sepoliaGenesisHash, byBlock, byTime, c.head, c.time)
 		if got.Hash != sum32(c.wantHash) || got.Next != c.wantNext {
 			t.Errorf("ComputeForkID(head=%d, time=%d) = %v, want {%#x %d}", c.head, c.time, got, c.wantHash, c.wantNext)
 		}
