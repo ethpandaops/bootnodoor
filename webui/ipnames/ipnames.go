@@ -164,6 +164,8 @@ func parseIniInventory(data []byte) (map[string]string, error) {
 			if !ok {
 				continue
 			}
+			// Ansible evaluates the value as a literal, so "'ip'" is a plain string.
+			val = strings.Trim(val, `"'`)
 			if ip := net.ParseIP(val); ip != nil {
 				exact[ip.String()] = name
 			}
@@ -238,18 +240,28 @@ func (r *Resolver) Lookup(ipStr string) string {
 	return ""
 }
 
-// splitHostLine tokenizes an inventory host line the way Ansible does (shlex,
-// posix, comments=True): quotes group and are stripped, and an unquoted "#"
-// ends the line even inside a token.
+// splitHostLine tokenizes an inventory host line the way Ansible does (Python
+// shlex, posix, comments=True): quotes group and are stripped, an unquoted "#"
+// ends the line even inside a token, and a backslash escapes the next character
+// outside quotes, or only a quote or backslash inside double quotes.
 func splitHostLine(line string) []string {
 	var (
 		fields  []string
 		cur     strings.Builder
 		inToken bool
 		quote   rune
+		escaped bool
 	)
 	for _, c := range line {
 		switch {
+		case escaped:
+			if quote == '"' && c != '"' && c != '\\' {
+				cur.WriteRune('\\')
+			}
+			cur.WriteRune(c)
+			escaped = false
+		case c == '\\' && quote != '\'':
+			escaped, inToken = true, true
 		case quote != 0:
 			if c == quote {
 				quote = 0
