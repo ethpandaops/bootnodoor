@@ -1520,7 +1520,7 @@ func (h *Handler) scanNodes(now time.Time) nodeScan {
 
 	h.nodesMu.RLock()
 	scan := nodeScan{appendedAt: h.evictAppended}
-	var candidates []candidate
+	candidates := make([]candidate, 0, len(h.nodes))
 	for id, n := range h.nodes {
 		if n.IsBonded() {
 			continue

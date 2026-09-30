@@ -94,14 +94,16 @@ func TestExpiredBondBecomesCandidate(t *testing.T) {
 	for i, k := range keys {
 		bond := time.Hour
 		if i == 0 {
-			bond = 20 * time.Millisecond
+			bond = time.Millisecond
 		}
 		h.lookupOrCreateNode(k.id, k.pub, testAddr()).MarkPongReceived(bond, testAddr())
 	}
 	h.cleanup()
 
-	time.Sleep(40 * time.Millisecond)
 	expiring := h.GetNode(keys[0].id)
+	for expiring.IsBonded() {
+		time.Sleep(time.Millisecond)
+	}
 	expiring.UpdateLastSeen()
 
 	pub, id := makeNodeID(t)
@@ -172,5 +174,38 @@ func TestFullBondedMapRejectsWithoutWalking(t *testing.T) {
 	h.nodesMu.RUnlock()
 	if queued != 0 {
 		t.Fatalf("%d entries queued on a fully bonded map, want 0", queued)
+	}
+}
+
+// TestEvictableBoundedUnderReinsertChurn: IDs re-inserted between a scan and
+// its publish are queued twice, but each publish replaces the queue, so the
+// duplicates never outlive one pass. The queue stays within MaxNodes plus the
+// inserts of a single scan gap.
+func TestEvictableBoundedUnderReinsertChurn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const maxNodes = 2
+	h := NewHandler(ctx, HandlerConfig{MaxNodes: maxNodes, NodeTTL: time.Hour}, nil)
+	keys := makeKeys(t, 3)
+	for _, k := range keys[:maxNodes] {
+		h.lookupOrCreateNode(k.id, k.pub, testAddr())
+	}
+
+	const insertsPerGap = 5
+	for pass := 0; pass < 100; pass++ {
+		scan := h.scanNodes(time.Now())
+		for i := 0; i < insertsPerGap; i++ {
+			k := keys[(pass+i)%len(keys)]
+			h.lookupOrCreateNode(k.id, k.pub, testAddr())
+		}
+		h.applyNodeScan(time.Now(), scan)
+
+		h.nodesMu.RLock()
+		queued := len(h.evictable) - h.evictHead
+		h.nodesMu.RUnlock()
+		if queued > maxNodes+insertsPerGap {
+			t.Fatalf("pass %d: %d entries queued, want at most %d", pass, queued, maxNodes+insertsPerGap)
+		}
 	}
 }
