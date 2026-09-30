@@ -79,9 +79,9 @@ var (
 	serveAll bool
 
 	// WebUI flags
-	enableWebUI bool
-	webUIHost   string
-	webUIPort   int
+	enableWebUI  bool
+	webUIHost    string
+	webUIPort    int
 	webUISite    string
 	webUIPprof   bool
 	webUIDebug   bool
