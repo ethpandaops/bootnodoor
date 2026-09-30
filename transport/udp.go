@@ -31,6 +31,12 @@ const (
 
 	// DefaultWriteBuffer is the default size for the UDP write buffer
 	DefaultWriteBuffer = 2 * 1024 * 1024 // 2 MB
+
+	// DefaultMaxConcurrentDispatch bounds how many packets are handed to
+	// handlers at the same time. Handlers do real work per packet (signature
+	// checks, map lookups), so without a limit a burst of inbound packets
+	// spawns one goroutine each with no ceiling.
+	DefaultMaxConcurrentDispatch = 1024
 )
 
 // PacketHandler is called when a packet is received.
@@ -67,6 +73,9 @@ type UDPTransport struct {
 
 	// rateLimiter controls per-IP packet rates
 	rateLimiter *RateLimiter
+
+	// dispatchSem bounds how many dispatchPacket goroutines can run at once.
+	dispatchSem chan struct{}
 
 	// metrics tracks transport statistics
 	metrics *Metrics
@@ -105,6 +114,12 @@ type Config struct {
 	// WriteBuffer size in bytes (0 = use default)
 	// Ignored if Conn is provided.
 	WriteBuffer int
+
+	// MaxConcurrentDispatch caps how many packets can be handed to handlers at
+	// once (<= 0 = DefaultMaxConcurrentDispatch). Packets received beyond this
+	// limit are dropped rather than queued, so a flood cannot grow goroutine
+	// count or memory without bound.
+	MaxConcurrentDispatch int
 }
 
 // NewUDPTransport creates a new UDP transport.
@@ -189,11 +204,17 @@ func NewUDPTransport(cfg *Config) (*UDPTransport, error) {
 		rateLimiter = NewRateLimiter(cfg.RateLimitPerIP)
 	}
 
+	maxConcurrentDispatch := cfg.MaxConcurrentDispatch
+	if maxConcurrentDispatch <= 0 {
+		maxConcurrentDispatch = DefaultMaxConcurrentDispatch
+	}
+
 	t := &UDPTransport{
 		conn:        conn,
 		handlers:    make([]PacketHandler, 0),
 		logger:      logger,
 		rateLimiter: rateLimiter,
+		dispatchSem: make(chan struct{}, maxConcurrentDispatch),
 		metrics:     NewMetrics(),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -515,12 +536,27 @@ func (t *UDPTransport) receiveLoop() {
 		// Record received bytes
 		t.metrics.RecordReceived(uint64(n))
 
-		// Make a copy of the data for the handler
-		dataCopy := make([]byte, n)
-		copy(dataCopy, buffer[:n])
+		// Call handlers, but bound how many run at once. A full pool means
+		// handlers are not draining fast enough; drop the packet instead of
+		// growing goroutine count without limit.
+		//
+		// The drop path is what runs under a flood, so it stays allocation-free:
+		// the buffer copy happens only after a dispatch slot is acquired, and
+		// drops are surfaced through the metrics counter instead of a per-packet
+		// log line.
+		select {
+		case t.dispatchSem <- struct{}{}:
+			// Copy the data for the handler; the receive buffer is reused.
+			dataCopy := make([]byte, n)
+			copy(dataCopy, buffer[:n])
 
-		// Call handlers (non-blocking)
-		go t.dispatchPacket(dataCopy, from, localAddr)
+			go func() {
+				defer func() { <-t.dispatchSem }()
+				t.dispatchPacket(dataCopy, from, localAddr)
+			}()
+		default:
+			t.metrics.IncrementDropped()
+		}
 	}
 }
 
