@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+
+	"github.com/ethereum/go-ethereum/common/math"
 )
 
 // Genesis represents an Execution Layer genesis specification.
 // This is a minimal version focused on extracting metadata needed for bootnode operation.
 type Genesis struct {
 	Config    *ChainConfig           `json:"config"`
-	Timestamp uint64                 `json:"timestamp,string"`
+	Timestamp math.HexOrDecimal64    `json:"timestamp"`
 	Alloc     map[string]interface{} `json:"alloc,omitempty"`
 }
 
@@ -71,7 +73,7 @@ func ParseGenesis(data []byte) (*Genesis, error) {
 
 // GetTimestamp returns the genesis timestamp.
 func (g *Genesis) GetTimestamp() uint64 {
-	return g.Timestamp
+	return uint64(g.Timestamp)
 }
 
 // GetChainConfig returns the chain configuration.

@@ -2,6 +2,7 @@ package clconfig
 
 import (
 	"bytes"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -138,5 +139,70 @@ func TestEncodeETH2FieldEpochIsLittleEndian(t *testing.T) {
 	// FAR_FUTURE_EPOCH is palindromic, so it must round-trip either way.
 	if got := EncodeETH2Field(digest, version, ^uint64(0)); !bytes.Equal(got[8:16], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
 		t.Fatalf("far-future epoch bytes = % x", got[8:16])
+	}
+}
+
+// TestSepoliaForkDigests pins Sepolia's digests from eth-clients/sepolia
+// config.yaml through Gloas, computed independently from the Fulu
+// compute_fork_digest spec. Gloas keeps the BPO2 blob mask.
+func TestSepoliaForkDigests(t *testing.T) {
+	yaml := `
+CONFIG_NAME: sepolia
+MIN_GENESIS_TIME: 1655647200
+GENESIS_DELAY: 86400
+GENESIS_FORK_VERSION: 0x90000069
+SECONDS_PER_SLOT: 12
+ALTAIR_FORK_VERSION: 0x90000070
+ALTAIR_FORK_EPOCH: 50
+BELLATRIX_FORK_VERSION: 0x90000071
+BELLATRIX_FORK_EPOCH: 100
+CAPELLA_FORK_VERSION: 0x90000072
+CAPELLA_FORK_EPOCH: 56832
+DENEB_FORK_VERSION: 0x90000073
+DENEB_FORK_EPOCH: 132608
+ELECTRA_FORK_VERSION: 0x90000074
+ELECTRA_FORK_EPOCH: 222464
+FULU_FORK_VERSION: 0x90000075
+FULU_FORK_EPOCH: 272640
+GLOAS_FORK_VERSION: 0x90000076
+GLOAS_FORK_EPOCH: 353024
+MAX_BLOBS_PER_BLOCK_ELECTRA: 9
+BLOB_SCHEDULE:
+  - EPOCH: 274176
+    MAX_BLOBS_PER_BLOCK: 15
+  - EPOCH: 275712
+    MAX_BLOBS_PER_BLOCK: 21
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.SetGenesisValidatorsRoot("0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078"); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		epoch uint64
+		want  string
+	}{
+		{222464, "14045b5a"}, // Electra
+		{272640, "7e0d3447"}, // Fulu
+		{274176, "fd32b622"}, // BPO1
+		{275712, "74d01459"}, // BPO2
+		{353023, "74d01459"},
+		{353024, "669e6c11"}, // Gloas
+	}
+	for _, c := range cases {
+		got := cfg.GetForkDigestForEpoch(c.epoch)
+		if hex.EncodeToString(got[:]) != c.want {
+			t.Errorf("digest at epoch %d = %x, want %s", c.epoch, got[:], c.want)
+		}
+	}
+	if got := cfg.GetForkNameAtEpoch(353024); got != "Gloas" {
+		t.Errorf("fork at 353024 = %q, want Gloas", got)
 	}
 }
