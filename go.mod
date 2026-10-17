@@ -4,28 +4,27 @@ go 1.26.7
 
 require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
-	github.com/ethereum/go-ethereum v1.17.7
+	github.com/ethereum/go-ethereum v1.17.8
 	github.com/glebarez/go-sqlite v1.23.0
 	github.com/gorilla/mux v1.8.1
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/mr-tron/base58 v1.3.0
 	github.com/multiformats/go-multihash v0.2.3
-	github.com/pk910/dynamic-ssz v1.3.3
+	github.com/pk910/dynamic-ssz v1.4.0
 	github.com/pressly/goose/v3 v3.28.0
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/sirupsen/logrus v1.10.2
 	github.com/spf13/cobra v1.10.2
 	github.com/tdewolff/minify v2.3.6+incompatible
 	github.com/urfave/negroni v1.0.0
-	golang.org/x/crypto v0.57.0
-	golang.org/x/net v0.59.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/net v0.60.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/casbin/govaluate v1.10.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/golang/snappy v1.0.1-0.20260716114414-9ae09f520e93 // indirect
@@ -39,9 +38,9 @@ require (
 	github.com/multiformats/go-varint v0.0.6 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/pk910/hashtree-bindings v0.2.2 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.70.1 // indirect
+	github.com/pk910/hashtree-bindings v0.2.6 // indirect
+	github.com/prometheus/client_model v0.6.3 // indirect
+	github.com/prometheus/common v0.72.0 // indirect
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sethvargo/go-retry v0.4.0 // indirect
@@ -52,7 +51,7 @@ require (
 	github.com/tdewolff/test v1.0.11 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
