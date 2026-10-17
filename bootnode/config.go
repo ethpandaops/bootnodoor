@@ -73,7 +73,7 @@ type Config struct {
 	// ELGenesisHash is the EL genesis block hash (required if ELConfig is set)
 	ELGenesisHash [32]byte
 
-	// ELGenesisTime is the EL genesis block timestamp (required if ELConfig is set)
+	// ELGenesisTime is the EL genesis block timestamp (0 for mainnet)
 	ELGenesisTime uint64
 
 	// ELBootnodes is the list of initial EL bootnodes (ENR or enode format)
@@ -196,9 +196,6 @@ func (c *Config) Validate() error {
 	if c.ELConfig != nil {
 		if c.ELGenesisHash == [32]byte{} {
 			return fmt.Errorf("ELGenesisHash is required when ELConfig is set")
-		}
-		if c.ELGenesisTime == 0 {
-			return fmt.Errorf("ELGenesisTime is required when ELConfig is set")
 		}
 	}
 

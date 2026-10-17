@@ -46,6 +46,12 @@ func ParseGenesis(data []byte) (*Genesis, error) {
 		return nil, fmt.Errorf("failed to parse genesis JSON: %w", err)
 	}
 
+	// Zero is a valid timestamp (mainnet), so only the key's presence tells a
+	// missing timestamp apart.
+	if _, ok := rawGenesis["timestamp"]; !ok {
+		return nil, fmt.Errorf("genesis has no timestamp")
+	}
+
 	// Parse into struct
 	if err := json.Unmarshal(data, &genesis); err != nil {
 		return nil, fmt.Errorf("failed to parse genesis: %w", err)

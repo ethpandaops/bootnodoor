@@ -24,3 +24,16 @@ func TestParseGenesisTimestamp(t *testing.T) {
 		})
 	}
 }
+
+func TestParseGenesisMissingTimestamp(t *testing.T) {
+	if _, err := ParseGenesis([]byte(`{"config":{"chainId":1}}`)); err == nil {
+		t.Fatal("expected error for genesis without timestamp")
+	}
+	g, err := ParseGenesis([]byte(`{"config":{"chainId":1},"timestamp":"0x0"}`))
+	if err != nil {
+		t.Fatalf("zero timestamp: %v", err)
+	}
+	if got := g.GetTimestamp(); got != 0 {
+		t.Fatalf("GetTimestamp() = %d, want 0", got)
+	}
+}
