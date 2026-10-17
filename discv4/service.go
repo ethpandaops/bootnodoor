@@ -175,6 +175,9 @@ func (s *Service) Start() error {
 	if s.running {
 		return fmt.Errorf("service already running")
 	}
+	if s.ctx.Err() != nil {
+		return fmt.Errorf("service already stopped")
+	}
 
 	s.running = true
 
@@ -191,14 +194,14 @@ func (s *Service) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// New already started the handler's cleanup goroutine on this context.
+	s.cancel()
+
 	if !s.running {
 		return nil
 	}
 
 	logrus.Info("Stopping discv4 service")
-
-	// Cancel context
-	s.cancel()
 
 	// NOTE: Transport is NOT closed here - it's managed by the caller
 

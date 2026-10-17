@@ -886,3 +886,49 @@ func mustV5Node(t *testing.T) *v5node.Node {
 	}
 	return n
 }
+
+// New binds the UDP socket, so Stop must release it even when Start never
+// ran, or the port stays taken for the rest of the process.
+func TestStopReleasesUnstartedService(t *testing.T) {
+	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(probe.LocalAddr().(*net.UDPAddr).Port)
+	probe.Close()
+
+	newService := func() *Service {
+		t.Helper()
+		cfg := DefaultConfig()
+		cfg.PrivateKey = mustKey(t)
+		cfg.Database = newTestDatabase(t)
+		cfg.Logger = quietLogger()
+		cfg.BindIP = net.IPv4(127, 0, 0, 1)
+		cfg.BindPort = port
+		cfg.ENRIP = net.IPv4(127, 0, 0, 1)
+		cfg.ENRIPProvided = true
+		cfg.ELConfig = &elconfig.ChainConfig{}
+		cfg.ELGenesisHash = [32]byte{1}
+		cfg.ELGenesisTime = 1
+		svc, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return svc
+	}
+
+	svc := newService()
+	if err := svc.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := svc.Stop(); err == nil {
+		t.Error("second Stop should fail")
+	}
+	if err := svc.Start(); err == nil {
+		t.Error("Start after Stop should fail")
+	}
+
+	if err := newService().Stop(); err != nil {
+		t.Fatalf("Stop on the rebound service: %v", err)
+	}
+}

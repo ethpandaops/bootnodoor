@@ -83,6 +83,7 @@ type Service struct {
 	startTime time.Time
 	mu        sync.RWMutex
 	running   bool
+	stopped   bool
 }
 
 // New creates a new universal bootnode service.
@@ -567,6 +568,9 @@ func (s *Service) Start() error {
 	if s.running {
 		return fmt.Errorf("service already running")
 	}
+	if s.stopped {
+		return fmt.Errorf("service already stopped")
+	}
 
 	s.startTime = time.Now()
 
@@ -602,12 +606,15 @@ func (s *Service) Start() error {
 
 // Stop stops the bootnode service.
 func (s *Service) Stop() error {
+	// New already bound the transports and started the node DB workers, so a
+	// service that never started still needs the full cleanup.
 	s.mu.Lock()
-	if !s.running {
+	if s.stopped {
 		s.mu.Unlock()
-		return fmt.Errorf("service not running")
+		return fmt.Errorf("service already stopped")
 	}
 	s.running = false
+	s.stopped = true
 	s.mu.Unlock()
 
 	// Stop protocol services (one discv5 service per identity)

@@ -70,3 +70,27 @@ func TestMaxNodesReachesHandler(t *testing.T) {
 		t.Fatalf("known nodes = %d, want 2", got)
 	}
 }
+
+// New starts the handler's cleanup goroutine on the service context, so Stop
+// must cancel it even when Start never ran.
+func TestStopWithoutStartCancelsContext(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig()
+	cfg.PrivateKey = key
+	s, err := New(cfg, stubTransport{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if s.ctx.Err() == nil {
+		t.Fatal("Stop without Start left the service context alive")
+	}
+	if err := s.Start(); err == nil {
+		t.Fatal("Start after Stop should fail")
+	}
+}
