@@ -303,6 +303,15 @@ func TestValidate_SameKeyDifferentPortRejected(t *testing.T) {
 	}
 }
 
+func TestValidate_ZeroELGenesisTimeOK(t *testing.T) {
+	cfg := validatableConfig(t)
+	cfg.PrivateKey = mustKey(t)
+	cfg.ELGenesisTime = 0 // mainnet
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero EL genesis time should validate: %v", err)
+	}
+}
+
 func TestValidate_SharedKeyDefaultPortsOK(t *testing.T) {
 	cfg := validatableConfig(t)
 	cfg.PrivateKey = mustKey(t)

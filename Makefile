@@ -41,7 +41,7 @@ devnet:
 	.hack/devnet/run.sh
 
 devnet-run: devnet
-	go run cmd/bootnodoor/main.go \
+	go run ./cmd/bootnodoor \
 		--private-key $$(cat .hack/devnet/generated-bootnodoor-key.txt) \
 		--el-config .hack/devnet/generated-el-genesis.json \
 		--el-genesis-hash $$(cat .hack/devnet/generated-el-hash.txt) \

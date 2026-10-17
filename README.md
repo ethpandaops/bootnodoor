@@ -95,14 +95,10 @@ go build -o bootnodoor ./cmd/bootnodoor
 
 ```bash
 ./bootnodoor \
+  --network mainnet \
   --private-key "$(openssl rand -hex 32)" \
   --bind-port 30303 \
   --enr-ip $(curl -s ifconfig.me) \
-  --el-config ./config-mainnet-el.json \
-  --el-genesis-hash 0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3 \
-  --el-genesis-time 1438269988 \
-  --cl-config ./config-mainnet-cl.yaml \
-  --genesis-validators-root 0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95 \
   --nodedb ./data/mainnet.db \
   --web-ui
 ```
@@ -111,12 +107,11 @@ go build -o bootnodoor ./cmd/bootnodoor
 
 ```bash
 ./bootnodoor \
+  --network mainnet \
+  --enable-cl=false \
   --private-key "$(openssl rand -hex 32)" \
   --bind-port 30303 \
   --enr-ip $(curl -s ifconfig.me) \
-  --el-config ./config-mainnet-el.json \
-  --el-genesis-hash 0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3 \
-  --el-genesis-time 1438269988 \
   --el-bootnodes "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303" \
   --nodedb ./data/mainnet-el.db \
   --web-ui
@@ -126,11 +121,11 @@ go build -o bootnodoor ./cmd/bootnodoor
 
 ```bash
 ./bootnodoor \
+  --network mainnet \
+  --enable-el=false \
   --private-key "$(openssl rand -hex 32)" \
   --bind-port 9000 \
   --enr-ip $(curl -s ifconfig.me) \
-  --cl-config ./config-mainnet-cl.yaml \
-  --genesis-validators-root 0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95 \
   --cl-bootnodes "enr:-Ku4QImhMc1z8yCiNJ1TyUxdcfNucje3BGwEHzodEZUan8PherEo4sF7pPHPSIB1NNuSg5fZy7qFsjmUKs2ea1Whi0EBh2F0dG5ldHOIAAAAAAAAAACEZXRoMpD1pf1CAAAAAP__________gmlkgnY0gmlwhBLf22SJc2VjcDI1NmsxoQOVphkDqal4QzPMksc5wnpuC3gvSC8AfbFOnZY_On34wIN1ZHCCIyg" \
   --nodedb ./data/mainnet-cl.db \
   --web-ui
@@ -138,7 +133,22 @@ go build -o bootnodoor ./cmd/bootnodoor
 
 ### Configuration Parameters
 
-#### Required Parameters (At Least One Layer)
+#### Named Networks
+
+- `--network <name>`: Fetch the configs for `mainnet`, `sepolia` or `hoodi` from [eth-clients](https://github.com/eth-clients) at startup
+  - Fetches `metadata/genesis.json` (EL) and `metadata/config.yaml` (CL) from the `main` branch of `eth-clients/<name>`
+  - Sets the genesis hash, the genesis validators root and the CL genesis time for that network
+  - Fetches only the files for the enabled layers (`--enable-el`, `--enable-cl`)
+  - Caches each file in `network-<name>/` next to the `--nodedb` file, or in the user cache directory (for example `~/.cache/bootnodoor/`) when `--nodedb` is not set. Without a user cache directory (no `HOME`), set `--nodedb`. Keep the `--nodedb` file in a directory that only the bootnodoor user can write
+  - Replaces the cache only with a file that parses and matches the network. If the fetch fails, uses the cached copy and logs a warning
+  - Reads the configs only at startup. Restart the bootnode before a fork to get the new fork schedule
+
+Flags on the command line always win over `--network` values. A `--el-config` or
+`--cl-config` flag takes over its whole layer: `--network` then does not fetch that
+file or set its genesis values. For a custom network or a devnet, leave out `--network`
+and set the flags below.
+
+#### Required Parameters (At Least One Layer, Without `--network`)
 
 **For Execution Layer:**
 - `--el-config <path>`: Path to EL chain config file (JSON)
@@ -154,11 +164,14 @@ go build -o bootnodoor ./cmd/bootnodoor
 **For Consensus Layer:**
 - `--cl-config <path>`: Path to CL beacon config file (YAML)
   - Contains fork schedule, genesis config, and network parameters
-  - Example files: `config-mainnet.yaml`, `config-sepolia.yaml`
+  - For public networks, use `metadata/config.yaml` from the network's [eth-clients](https://github.com/eth-clients) repository
 
 - `--genesis-validators-root <hex>`: Genesis validators root (0x-prefixed hex)
   - Used to compute fork digests
-  - Unique per network (mainnet, sepolia, holesky, etc.)
+  - Unique per network (mainnet, sepolia, hoodi, etc.)
+
+- `--cl-genesis-time <unix>`: CL genesis time (default `0`: calculate `MIN_GENESIS_TIME + GENESIS_DELAY` from the config)
+  - Set it when the actual genesis time differs from the calculated value. On mainnet, the calculated value (1607428800) is 7 days late. `--network mainnet` sets the correct value (1606824023)
 
 **Common Required:**
 - `--private-key <hex>`: Node private key (64 hex characters, optional 0x prefix)
@@ -269,14 +282,10 @@ the web UI via `/enr?layer=el` and `/enr?layer=cl`.
 
 ```bash
 ./bootnodoor \
+  --network mainnet \
   --private-key "$(openssl rand -hex 32)" \
   --bind-port 30303 \
   --enr-ip $(curl -s ifconfig.me) \
-  --el-config ./configs/mainnet-el.json \
-  --el-genesis-hash 0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3 \
-  --el-genesis-time 1438269988 \
-  --cl-config ./configs/mainnet-cl.yaml \
-  --genesis-validators-root 0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95 \
   --nodedb ./data/mainnet.db \
   --web-ui \
   --web-port 8080
@@ -286,8 +295,8 @@ the web UI via `/enr?layer=el` and `/enr?layer=cl`.
 
 ```bash
 ./bootnodoor \
-  --cl-config ./configs/sepolia-cl.yaml \
-  --genesis-validators-root 0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078 \
+  --network sepolia \
+  --enable-el=false \
   --private-key "$(openssl rand -hex 32)" \
   --bind-port 9000 \
   --enr-ip $(curl -s ifconfig.me) \
@@ -295,26 +304,41 @@ the web UI via `/enr?layer=el` and `/enr?layer=cl`.
   --web-ui
 ```
 
-### Holesky Testnet EL Bootnode
+### Hoodi Testnet EL Bootnode
 
 ```bash
 ./bootnodoor \
-  --el-config ./configs/holesky-el.json \
-  --el-genesis-hash 0xb5f7f912443c940f21fd611f12828d75b534364ed9e95ca4e307729a4661bde4 \
-  --el-genesis-time 1695902100 \
+  --network hoodi \
+  --enable-cl=false \
   --private-key "$(openssl rand -hex 32)" \
   --bind-port 30303 \
   --enr-ip $(curl -s ifconfig.me) \
-  --nodedb ./data/holesky-el.db \
+  --nodedb ./data/hoodi-el.db \
   --web-ui
+```
+
+### Custom Network or Devnet
+
+Without `--network`, give the config files and genesis values for each layer:
+
+```bash
+./bootnodoor \
+  --el-config ./network-configs/genesis.json \
+  --el-genesis-hash 0x... \
+  --cl-config ./network-configs/config.yaml \
+  --genesis-validators-root 0x... \
+  --private-key "$(openssl rand -hex 32)" \
+  --bind-port 30303 \
+  --enr-ip $(curl -s ifconfig.me) \
+  --nodedb ./data/devnet.db
 ```
 
 ### Development Setup (No Persistence, Localhost)
 
 ```bash
 ./bootnodoor \
-  --cl-config ./configs/holesky-cl.yaml \
-  --genesis-validators-root 0x9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1 \
+  --network hoodi \
+  --enable-el=false \
   --private-key "1234567890123456789012345678901212345678901234567890123456789012" \
   --bind-addr 127.0.0.1 \
   --bind-port 9000 \
@@ -434,7 +458,7 @@ The bootnode automatically:
 Fork digests are computed from the CL beacon config (YAML):
 
 ```yaml
-# config-mainnet-cl.yaml
+# mainnet config.yaml (excerpt)
 CONFIG_NAME: "mainnet"
 
 # Fork schedule
@@ -489,7 +513,7 @@ The bootnode implements multiple layers of DoS protection:
 2. **Firewall**: Allow only UDP traffic on your configured port
 3. **Monitoring**: Enable web UI on localhost only or behind authentication/firewall
 4. **Database**: Backup node database periodically for faster restarts
-5. **Updates**: Keep bootnode updated for latest fork schedule changes
+5. **Updates**: Keep the fork schedule current. With `--network`, restart before each fork to fetch the new configs. Without it, update your config files and restart
 6. **IP Discovery**: Use `--enr-ip` to manually set public IP, or rely on automatic discovery
 
 ## Troubleshooting
@@ -504,7 +528,7 @@ The bootnode implements multiple layers of DoS protection:
 
 **For EL:**
 - Verify `--el-genesis-hash` matches your network
-- Check `--el-genesis-time` is correct
+- Check the `timestamp` field in the genesis file is correct
 - Ensure EL config has correct fork schedule
 - Verify discv4 is enabled if using enode bootnodes
 
@@ -536,7 +560,7 @@ The bootnode implements multiple layers of DoS protection:
 
 - Add more bootnodes (`--el-bootnodes` and/or `--cl-bootnodes`)
 - Check network connectivity to initial bootnodes
-- Verify protocol settings (--enable-discv4, --enable-discv5)
+- Verify layer settings (`--enable-el`, `--enable-cl`)
 - For CL: reduce grace period if too permissive: `--grace-period 30m`
 
 ## Development

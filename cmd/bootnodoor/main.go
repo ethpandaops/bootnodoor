@@ -35,6 +35,8 @@ var (
 	clPrivateKeyHex string
 	nodeDBPath      string
 
+	network string
+
 	// EL configuration
 	elConfigPath    string
 	elGenesisHash   string
@@ -113,7 +115,9 @@ func init() {
 	rootCmd.Flags().StringVar(&clPrivateKeyHex, "cl-private-key", "", "Private key for the CL identity (hex or file; falls back to --private-key)")
 
 	// Node database
-	rootCmd.Flags().StringVar(&nodeDBPath, "nodedb", "", "Path to node database directory (empty = in-memory)")
+	rootCmd.Flags().StringVar(&nodeDBPath, "nodedb", "", "Path to node database file (empty = in-memory)")
+
+	rootCmd.Flags().StringVar(&network, "network", "", "Named network (mainnet, sepolia, hoodi): fetch configs from eth-clients at startup")
 
 	// EL configuration
 	rootCmd.Flags().StringVar(&elConfigPath, "el-config", "", "Path to EL genesis file (JSON, optional)")
@@ -218,6 +222,12 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 			shimKey = elKey
 		} else {
 			shimKey = clKey
+		}
+	}
+
+	if network != "" {
+		if err := resolveNetwork(cmd, logger); err != nil {
+			return err
 		}
 	}
 
@@ -402,7 +412,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 
 	// Validate: at least one layer must be configured (only for normal mode)
 	if elConfigPath == "" && clConfigPath == "" {
-		return fmt.Errorf("at least one of --el-config or --cl-config must be provided")
+		return fmt.Errorf("at least one of --network, --el-config or --cl-config must be provided")
 	}
 
 	// Create SQLite database
