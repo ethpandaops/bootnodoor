@@ -60,6 +60,12 @@ func (d *Database) Init() error {
 	if d.config.MaxOpenConns < d.config.MaxIdleConns {
 		d.config.MaxIdleConns = d.config.MaxOpenConns
 	}
+	// Each :memory: connection is a separate empty database, so the pool must
+	// hold exactly one connection and never close it.
+	if d.config.File == ":memory:" {
+		d.config.MaxOpenConns = 1
+		d.config.MaxIdleConns = 1
+	}
 
 	d.logger.Infof("initializing sqlite connection to %v with %v/%v conn limit", d.config.File, d.config.MaxIdleConns, d.config.MaxOpenConns)
 	dbConn, err := sqlx.Open("sqlite", fmt.Sprintf("%s?_pragma=journal_mode(WAL)", d.config.File))
