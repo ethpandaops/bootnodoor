@@ -45,14 +45,22 @@ type Config struct {
 	MaxBlobsPerBlockElectra uint64              `yaml:"MAX_BLOBS_PER_BLOCK_ELECTRA"`
 	BlobSchedule            []BlobScheduleEntry `yaml:"BLOB_SCHEDULE"`
 
-	// Time parameters
+	// Time parameters. SECONDS_PER_SLOT is the legacy spelling; configs since
+	// Fulu carry SLOT_DURATION_MS instead, and per-fork changes arrive as
+	// SLOT_DURATION_MS_<FORK> keys collected into slotDurations.
 	SecondsPerSlot uint64 `yaml:"SECONDS_PER_SLOT"`
+	SlotDurationMs uint64 `yaml:"SLOT_DURATION_MS"`
 
 	// Parsed values (not in YAML)
 	customGenesisTime     uint64
 	customSlotsPerEpoch   uint64
 	genesisValidatorsRoot [32]byte
 	genesisForkVersion    [4]byte
+
+	// slotDurations is the slot duration schedule in ascending epoch order,
+	// always starting with the genesis segment. Empty when the config was
+	// built without LoadConfig; SlotDurations then derives the single segment.
+	slotDurations []SlotDurationEntry
 
 	// Fork data - dynamically parsed from YAML, stored in chronological order
 	forks []forkDefinition
@@ -167,6 +175,12 @@ func LoadConfig(path string) (*Config, error) {
 	// Extract fork data dynamically from the map
 	if err := cfg.extractForkData(rawConfig); err != nil {
 		return nil, fmt.Errorf("failed to extract fork data: %w", err)
+	}
+
+	// Slot durations refer to forks by name, so they are resolved after the
+	// fork list exists.
+	if err := cfg.extractSlotDurations(rawConfig); err != nil {
+		return nil, fmt.Errorf("failed to extract slot durations: %w", err)
 	}
 
 	// Parse hex values (GenesisValidatorsRoot is optional, set via SetGenesisValidatorsRoot)
@@ -557,16 +571,7 @@ func (c *Config) GetForkDigestForEpoch(epoch uint64) ForkDigest {
 // currentEpochNow computes the current epoch from genesis time and wall
 // clock. The second return is false when no genesis time is configured.
 func (c *Config) currentEpochNow() (uint64, bool) {
-	genesisTime := c.GetGenesisTime()
-	if genesisTime == 0 {
-		return 0, false
-	}
-	currentTime := uint64(time.Now().Unix())
-	secondsPerSlot := c.SecondsPerSlot
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
-	}
-	return uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, c.GetSlotsPerEpoch())), true
+	return c.EpochAtTime(time.Now())
 }
 
 // forkBoundaryEpochs returns every epoch at which the wire digest can change:
@@ -755,35 +760,6 @@ func hexToBytes4(s string) ([4]byte, error) {
 
 	copy(result[:], bytes)
 	return result, nil
-}
-
-// Epoch represents a beacon chain epoch.
-type Epoch uint64
-
-// GetCurrentEpoch computes the current epoch from a Unix timestamp.
-//
-// Parameters:
-//   - genesisTime: Unix timestamp of genesis
-//   - currentTime: Current Unix timestamp
-//   - secondsPerSlot: Seconds per slot (default 12)
-//   - slotsPerEpoch: Slots per epoch (default 32)
-func GetCurrentEpoch(genesisTime, currentTime uint64, secondsPerSlot, slotsPerEpoch uint64) Epoch {
-	if currentTime < genesisTime {
-		return 0
-	}
-
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
-	}
-	if slotsPerEpoch == 0 {
-		slotsPerEpoch = 32
-	}
-
-	elapsedTime := currentTime - genesisTime
-	currentSlot := elapsedTime / secondsPerSlot
-	currentEpoch := currentSlot / slotsPerEpoch
-
-	return Epoch(currentEpoch)
 }
 
 // ParseETH2Field extracts the fork digest from an eth2 ENR field.

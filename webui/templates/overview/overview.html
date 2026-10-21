@@ -559,6 +559,16 @@
                   <td class="text-end" data-stat="current-fork">{{ .CurrentFork }}</td>
                 </tr>
                 <tr>
+                  <td class="text-muted">Current Epoch</td>
+                  <td class="text-end" data-stat="current-epoch">{{ .CurrentEpoch }}</td>
+                </tr>
+                {{ if .SlotDuration }}
+                <tr>
+                  <td class="text-muted">Slot Duration</td>
+                  <td class="text-end" data-stat="slot-duration">{{ .SlotDuration }}</td>
+                </tr>
+                {{ end }}
+                <tr>
                   <td class="text-muted">Current Digest</td>
                   <td class="text-end">
                     <code style="font-size: 0.85em;">{{ .CurrentDigest }}</code>
@@ -901,6 +911,8 @@
 
         /* Fork info (if present) */
         if (data.CurrentFork) updateValue('[data-stat="current-fork"]', data.CurrentFork);
+        if (data.CurrentEpoch !== undefined) updateValue('[data-stat="current-epoch"]', data.CurrentEpoch);
+        if (data.SlotDuration) updateValue('[data-stat="slot-duration"]', data.SlotDuration);
         if (data.GracePeriod) updateValue('[data-stat="grace-period"]', data.GracePeriod);
 
         /* Fork filter stats (if present) */
