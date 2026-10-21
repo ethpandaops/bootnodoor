@@ -385,6 +385,7 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 			"configName":            clConfig.ConfigName,
 			"genesisValidatorsRoot": genesisValidatorsRoot,
 			"genesisTime":           clGenesisTime,
+			"slotDuration":          clConfig.SlotDurationSummary(),
 		}).Info("loaded CL config")
 
 		// Print CL forks with fork digests
@@ -392,12 +393,18 @@ func runBootnode(cmd *cobra.Command, args []string) error {
 		if len(forkDigestInfos) > 0 {
 			logger.Info("CL forks:")
 			for _, info := range forkDigestInfos {
-				logger.WithFields(logrus.Fields{
+				fields := logrus.Fields{
 					"fork":       info.Name,
 					"version":    fmt.Sprintf("0x%x", info.ForkVersion),
 					"epoch":      info.Epoch,
 					"forkDigest": info.Digest.String(),
-				}).Info("  - fork")
+				}
+				// Activation follows the slot duration schedule, so it is no
+				// longer epoch * fixed slot time once a duration change precedes it.
+				if at, ok := clConfig.EpochStartTime(info.Epoch); ok {
+					fields["activation"] = at.UTC().Format(time.RFC3339)
+				}
+				logger.WithFields(fields).Info("  - fork")
 			}
 		}
 	}
