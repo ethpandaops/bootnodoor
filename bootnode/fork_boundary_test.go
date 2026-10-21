@@ -125,3 +125,37 @@ func TestForkRefreshStopsPollingAfterSettleWindow(t *testing.T) {
 		t.Error("still polling long after the boundary settled")
 	}
 }
+
+func TestNextForkBoundaryFollowsHezeSlotDuration(t *testing.T) {
+	now := time.Now()
+	genesis := uint64(now.Add(-3000 * time.Second).Unix())
+
+	yaml := "PRESET_BASE: mainnet\n" +
+		"MIN_GENESIS_TIME: " + strconv.FormatUint(genesis, 10) + "\n" +
+		"GENESIS_DELAY: 0\n" +
+		"SECONDS_PER_SLOT: 12\n" +
+		"SLOT_DURATION_MS: 12000\n" +
+		"GENESIS_FORK_VERSION: 0x10000000\n" +
+		"FULU_FORK_VERSION: 0x70000000\nFULU_FORK_EPOCH: 0\n" +
+		"HEZE_FORK_VERSION: 0x90000000\nHEZE_FORK_EPOCH: 5\n" +
+		"SLOT_DURATION_MS_HEZE: 9000\n" +
+		"BLOB_SCHEDULE:\n  - EPOCH: 10\n    MAX_BLOBS_PER_BLOCK: 21\n"
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cl, err := clconfig.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	s := &Service{config: &Config{CLConfig: cl}}
+
+	next, ok := s.nextForkBoundary(now)
+	if !ok {
+		t.Fatal("no boundary found for the epoch-10 BPO")
+	}
+	if want := time.Unix(int64(genesis)+3360, 0); !next.Equal(want) {
+		t.Errorf("boundary = %v, want %v", next, want)
+	}
+}
