@@ -24,6 +24,10 @@ const slotDurationKeyPrefix = "SLOT_DURATION_MS_"
 // defaultSlotDurationMs applies when a config names no slot duration at all.
 const defaultSlotDurationMs = 12000
 
+// maxSlotDurationMs is the largest slot duration representable as a
+// time.Duration; anything above it is a broken config, not a slow chain.
+const maxSlotDurationMs = uint64(math.MaxInt64 / int64(time.Millisecond))
+
 // extractSlotDurations builds the schedule from the raw YAML map, mirroring
 // get_slot_durations in the spec: the genesis duration followed by every
 // SLOT_DURATION_MS_<FORK> whose fork is scheduled. Fork names are resolved the
@@ -46,6 +50,9 @@ func (c *Config) extractSlotDurations(rawConfig map[string]any) error {
 		if duration == 0 {
 			return fmt.Errorf("%s must be positive", key)
 		}
+		if duration > maxSlotDurationMs {
+			return fmt.Errorf("%s exceeds %dms", key, maxSlotDurationMs)
+		}
 		// An unscheduled fork changes nothing, as in the spec.
 		if *epoch == math.MaxUint64 {
 			continue
@@ -65,8 +72,13 @@ func (c *Config) extractSlotDurations(rawConfig map[string]any) error {
 		}
 	}
 
+	base := c.genesisSlotDurationMs()
+	if base > maxSlotDurationMs {
+		return fmt.Errorf("SLOT_DURATION_MS %d exceeds %dms", base, maxSlotDurationMs)
+	}
+
 	schedule := make([]SlotDurationEntry, 0, len(changes)+1)
-	schedule = append(schedule, SlotDurationEntry{Epoch: 0, DurationMs: c.genesisSlotDurationMs()})
+	schedule = append(schedule, SlotDurationEntry{Epoch: 0, DurationMs: base})
 	for _, change := range changes {
 		last := &schedule[len(schedule)-1]
 		switch {
@@ -108,14 +120,25 @@ func yamlUint64(value any) (uint64, bool) {
 }
 
 // genesisSlotDurationMs returns the slot duration in effect at genesis.
+// LoadConfig rejects values above maxSlotDurationMs; a struct built by hand
+// is not validated, so the time.Duration conversions saturate instead.
 func (c *Config) genesisSlotDurationMs() uint64 {
 	if c.SlotDurationMs != 0 {
 		return c.SlotDurationMs
 	}
-	if c.SecondsPerSlot != 0 && c.SecondsPerSlot <= math.MaxUint64/1000 {
+	if c.SecondsPerSlot != 0 && c.SecondsPerSlot <= maxSlotDurationMs/1000 {
 		return c.SecondsPerSlot * 1000
 	}
 	return defaultSlotDurationMs
+}
+
+// msToDuration converts milliseconds to a time.Duration, saturating at the
+// maximum rather than wrapping negative.
+func msToDuration(ms uint64) time.Duration {
+	if ms > maxSlotDurationMs {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // SlotDurations returns the slot duration schedule in ascending epoch order.
@@ -136,7 +159,7 @@ func (c *Config) SlotDuration(epoch uint64) time.Duration {
 			ms = entry.DurationMs
 		}
 	}
-	return time.Duration(ms) * time.Millisecond
+	return msToDuration(ms)
 }
 
 // SlotDurationSummary renders the schedule for logs and the overview page,
@@ -145,7 +168,7 @@ func (c *Config) SlotDurationSummary() string {
 	entries := c.SlotDurations()
 	parts := make([]string, 0, len(entries))
 	for i, entry := range entries {
-		d := time.Duration(entry.DurationMs) * time.Millisecond
+		d := msToDuration(entry.DurationMs)
 		if i == 0 {
 			parts = append(parts, d.String())
 			continue

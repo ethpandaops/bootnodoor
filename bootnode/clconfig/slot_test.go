@@ -178,6 +178,8 @@ func TestSlotDurationInvalidConfigs(t *testing.T) {
 		"unknown fork":          "SLOT_DURATION_MS: 12000\nSLOT_DURATION_MS_NOPE: 9000\n",
 		"zero duration":         "SLOT_DURATION_MS: 12000\nHEZE_FORK_EPOCH: 5\nSLOT_DURATION_MS_HEZE: 0\n",
 		"non-integer":           "SLOT_DURATION_MS: 12000\nHEZE_FORK_EPOCH: 5\nSLOT_DURATION_MS_HEZE: fast\n",
+		"base beyond duration":  "SLOT_DURATION_MS: 9223372036855\n",
+		"fork beyond duration":  "SLOT_DURATION_MS: 12000\nHEZE_FORK_EPOCH: 5\nSLOT_DURATION_MS_HEZE: 9223372036855\n",
 		"conflict at one epoch": "SLOT_DURATION_MS: 12000\nHEZE_FORK_EPOCH: 5\nSLOT_DURATION_MS_HEZE: 9000\nISAN_FORK_EPOCH: 5\nSLOT_DURATION_MS_ISAN: 6000\n",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -250,6 +252,8 @@ func TestSlotDurationFallbacks(t *testing.T) {
 		{Config{SlotDurationMs: 6000, SecondsPerSlot: 12}, 6000},
 		{Config{SecondsPerSlot: 6}, 6000},
 		{Config{}, 12000},
+		// An absurd legacy value cannot be represented, so it falls back.
+		{Config{SecondsPerSlot: math.MaxUint64}, 12000},
 	} {
 		if got := tc.cfg.genesisSlotDurationMs(); got != tc.want {
 			t.Errorf("%+v: slot duration = %d, want %d", tc.cfg, got, tc.want)
@@ -257,6 +261,18 @@ func TestSlotDurationFallbacks(t *testing.T) {
 		if got := tc.cfg.SlotDurations(); len(got) != 1 || got[0].DurationMs != tc.want {
 			t.Errorf("%+v: schedule = %+v, want one %dms segment", tc.cfg, got, tc.want)
 		}
+	}
+}
+
+// A hand-built config skips LoadConfig's bound, so the Duration conversion
+// must saturate rather than wrap negative.
+func TestSlotDurationSaturates(t *testing.T) {
+	cfg := Config{SlotDurationMs: math.MaxUint64}
+	if got := cfg.SlotDuration(0); got != time.Duration(math.MaxInt64) {
+		t.Errorf("SlotDuration = %v, want saturated maximum", got)
+	}
+	if got := cfg.SlotDurationSummary(); strings.HasPrefix(got, "-") {
+		t.Errorf("summary went negative: %q", got)
 	}
 }
 
