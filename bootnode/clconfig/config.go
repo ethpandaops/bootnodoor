@@ -46,7 +46,9 @@ type Config struct {
 	BlobSchedule            []BlobScheduleEntry `yaml:"BLOB_SCHEDULE"`
 
 	// Time parameters
-	SecondsPerSlot uint64 `yaml:"SECONDS_PER_SLOT"`
+	SecondsPerSlot     uint64 `yaml:"SECONDS_PER_SLOT"`
+	SlotDurationMs     uint64 `yaml:"SLOT_DURATION_MS"`
+	SlotDurationMsHeze uint64 `yaml:"SLOT_DURATION_MS_HEZE"`
 
 	// Parsed values (not in YAML)
 	customGenesisTime     uint64
@@ -557,16 +559,103 @@ func (c *Config) GetForkDigestForEpoch(epoch uint64) ForkDigest {
 // currentEpochNow computes the current epoch from genesis time and wall
 // clock. The second return is false when no genesis time is configured.
 func (c *Config) currentEpochNow() (uint64, bool) {
-	genesisTime := c.GetGenesisTime()
-	if genesisTime == 0 {
+	return c.EpochAtTime(time.Now())
+}
+
+// genesisSlotDurationMs returns the slot duration in milliseconds before Heze.
+func (c *Config) genesisSlotDurationMs() uint64 {
+	if c.SlotDurationMs != 0 {
+		return c.SlotDurationMs
+	}
+	if c.SecondsPerSlot != 0 && c.SecondsPerSlot <= math.MaxUint64/1000 {
+		return c.SecondsPerSlot * 1000
+	}
+	return 12000
+}
+
+// slotSchedule returns the genesis slot duration and, when Heze changes it,
+// the first Heze slot and the Heze slot duration (both in milliseconds).
+func (c *Config) slotSchedule() (d0, forkSlot, d1 uint64, changes bool) {
+	d0 = c.genesisSlotDurationMs()
+	d1 = c.SlotDurationMsHeze
+	if d1 == 0 || d1 == d0 {
+		return d0, 0, 0, false
+	}
+	hezeEpoch := c.GetForkEpoch("Heze")
+	if hezeEpoch == nil || *hezeEpoch == math.MaxUint64 {
+		return d0, 0, 0, false
+	}
+	slotsPerEpoch := c.GetSlotsPerEpoch()
+	if *hezeEpoch > math.MaxUint64/slotsPerEpoch {
+		return d0, 0, 0, false
+	}
+	forkSlot = *hezeEpoch * slotsPerEpoch
+	if forkSlot > math.MaxUint64/d0 {
+		return d0, 0, 0, false
+	}
+	return d0, forkSlot, d1, true
+}
+
+// slotStartMs returns the milliseconds from genesis to the start of a slot,
+// reporting false if the result would overflow.
+func (c *Config) slotStartMs(slot uint64) (uint64, bool) {
+	d0, forkSlot, d1, changes := c.slotSchedule()
+	if !changes || slot <= forkSlot {
+		if slot > math.MaxUint64/d0 {
+			return 0, false
+		}
+		return slot * d0, true
+	}
+	base := forkSlot * d0
+	rest := slot - forkSlot
+	if rest > math.MaxUint64/d1 || base > math.MaxUint64-rest*d1 {
 		return 0, false
 	}
-	currentTime := uint64(time.Now().Unix())
-	secondsPerSlot := c.SecondsPerSlot
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
+	return base + rest*d1, true
+}
+
+// slotAtMs returns the slot active the given milliseconds after genesis.
+func (c *Config) slotAtMs(ms uint64) uint64 {
+	d0, forkSlot, d1, changes := c.slotSchedule()
+	if !changes || ms < forkSlot*d0 {
+		return ms / d0
 	}
-	return uint64(GetCurrentEpoch(genesisTime, currentTime, secondsPerSlot, c.GetSlotsPerEpoch())), true
+	return forkSlot + (ms-forkSlot*d0)/d1
+}
+
+// EpochStartTime returns the wall clock start of an epoch, reporting false
+// without a genesis time or if the epoch is beyond representable time.
+func (c *Config) EpochStartTime(epoch uint64) (time.Time, bool) {
+	genesis := c.GetGenesisTime()
+	if genesis == 0 || genesis > math.MaxInt64 {
+		return time.Time{}, false
+	}
+	slotsPerEpoch := c.GetSlotsPerEpoch()
+	if epoch > math.MaxUint64/slotsPerEpoch {
+		return time.Time{}, false
+	}
+	offset, ok := c.slotStartMs(epoch * slotsPerEpoch)
+	if !ok || offset/1000 > uint64(math.MaxInt64)-genesis {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(genesis+offset/1000), int64(offset%1000)*int64(time.Millisecond)), true
+}
+
+// EpochAtTime returns the epoch active at t, or 0 before genesis. The second
+// return is false when no genesis time is configured.
+func (c *Config) EpochAtTime(t time.Time) (uint64, bool) {
+	genesis := c.GetGenesisTime()
+	if genesis == 0 {
+		return 0, false
+	}
+	if genesis > math.MaxInt64/1000 {
+		return 0, true
+	}
+	elapsed := t.UnixMilli() - int64(genesis)*1000
+	if elapsed < 0 {
+		return 0, true
+	}
+	return c.slotAtMs(uint64(elapsed)) / c.GetSlotsPerEpoch(), true
 }
 
 // forkBoundaryEpochs returns every epoch at which the wire digest can change:
@@ -755,35 +844,6 @@ func hexToBytes4(s string) ([4]byte, error) {
 
 	copy(result[:], bytes)
 	return result, nil
-}
-
-// Epoch represents a beacon chain epoch.
-type Epoch uint64
-
-// GetCurrentEpoch computes the current epoch from a Unix timestamp.
-//
-// Parameters:
-//   - genesisTime: Unix timestamp of genesis
-//   - currentTime: Current Unix timestamp
-//   - secondsPerSlot: Seconds per slot (default 12)
-//   - slotsPerEpoch: Slots per epoch (default 32)
-func GetCurrentEpoch(genesisTime, currentTime uint64, secondsPerSlot, slotsPerEpoch uint64) Epoch {
-	if currentTime < genesisTime {
-		return 0
-	}
-
-	if secondsPerSlot == 0 {
-		secondsPerSlot = 12
-	}
-	if slotsPerEpoch == 0 {
-		slotsPerEpoch = 32
-	}
-
-	elapsedTime := currentTime - genesisTime
-	currentSlot := elapsedTime / secondsPerSlot
-	currentEpoch := currentSlot / slotsPerEpoch
-
-	return Epoch(currentEpoch)
 }
 
 // ParseETH2Field extracts the fork digest from an eth2 ENR field.
