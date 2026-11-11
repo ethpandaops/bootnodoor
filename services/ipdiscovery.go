@@ -82,10 +82,9 @@ type ipReport struct {
 	lastSeen  time.Time
 	// Counted by identity as well as by source IP: source addresses are
 	// spoofable, so one node ID must not satisfy the thresholds on its own.
-	// Both sets stop growing at minDistinctIPs, the only value they are
-	// compared against: the report for our own address is refreshed by every
-	// PONG and never expires, so an unbounded set grows with every node ID
-	// that ever answers us.
+	// Capped at minDistinctIPs, the only value they are compared against: the
+	// report for our own address never expires, so uncapped sets grow with
+	// every node ID that answers.
 	reporterIDs map[string]struct{}
 	reporterIPs map[string]struct{}
 }
