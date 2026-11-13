@@ -68,3 +68,35 @@ func TestConsensusReachedWithDistinctReporters(t *testing.T) {
 		t.Fatal("distinct reporters did not reach consensus")
 	}
 }
+
+// Every PONG refreshes the report for our own address, so it never expires.
+// Its reporter sets must not grow with each node ID that ever answers.
+func TestReporterSetsStayBounded(t *testing.T) {
+	ipd, reached := quietIPDiscovery(t)
+
+	external := net.ParseIP("203.0.113.7")
+	for i := 0; i < 10000; i++ {
+		reporterIP := net.IPv4(10, byte(i>>16), byte(i>>8), byte(i))
+		ipd.ReportIP(external, 30303, fmt.Sprintf("reporter-node-id-%026d", i), reporterIP)
+	}
+
+	report := ipd.ipv4Reports["203.0.113.7:30303"]
+	if report == nil {
+		t.Fatal("no report for 203.0.113.7:30303")
+	}
+	if n := len(report.reporterIDs); n > ipd.minDistinctIPs {
+		t.Fatalf("reporterIDs holds %d entries, want at most %d", n, ipd.minDistinctIPs)
+	}
+	if n := len(report.reporterIPs); n > ipd.minDistinctIPs {
+		t.Fatalf("reporterIPs holds %d entries, want at most %d", n, ipd.minDistinctIPs)
+	}
+
+	select {
+	case addr := <-reached:
+		if addr != "203.0.113.7:30303" {
+			t.Fatalf("consensus on %s, want 203.0.113.7:30303", addr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bounded reporter sets prevented consensus")
+	}
+}
