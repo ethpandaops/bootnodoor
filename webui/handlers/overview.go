@@ -59,7 +59,9 @@ type OverviewPageData struct {
 	CLGenericENR       string
 	CLLocalENRSeq      uint64
 	CurrentFork        string
+	CurrentEpoch       uint64
 	CurrentDigest      string
+	SlotDuration       string // schedule summary, e.g. "12s, 9s from epoch 5"
 	PreviousFork       string
 	PreviousDigest     string
 	GenesisDigest      string
@@ -394,6 +396,11 @@ func (fh *FrontendHandler) getOverviewPageData() (*OverviewPageData, error) {
 
 	// Get CL fork list - show all forks (past, current, and future)
 	if clConfig := fh.bootnodeService.CLConfig(); clConfig != nil {
+		pageData.SlotDuration = clConfig.SlotDurationSummary()
+		if epoch, ok := clConfig.EpochAtTime(time.Now()); ok {
+			pageData.CurrentEpoch = epoch
+		}
+
 		allForkInfos := clConfig.GetAllForkDigestInfos()
 
 		// Filter to keep only the last fork at each epoch

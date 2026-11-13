@@ -762,24 +762,6 @@ func (s *Service) nextForkRefreshDelay() time.Duration {
 	return delay
 }
 
-// forkOffsetSeconds returns seconds from genesis to an epoch, reporting false if
-// any step would overflow. Each multiplication is checked before it happens: a
-// placeholder epoch or an absurd slot length would otherwise wrap, and dividing
-// by an already-wrapped product panics.
-func forkOffsetSeconds(epoch, slotsPerEpoch, secondsPerSlot uint64) (uint64, bool) {
-	if slotsPerEpoch == 0 || secondsPerSlot == 0 {
-		return 0, false
-	}
-	if slotsPerEpoch > math.MaxUint64/secondsPerSlot {
-		return 0, false
-	}
-	epochSeconds := slotsPerEpoch * secondsPerSlot
-	if epoch > math.MaxUint64/epochSeconds {
-		return 0, false
-	}
-	return epoch * epochSeconds, true
-}
-
 // nextForkBoundary returns the earliest CL or EL fork activation after now.
 func (s *Service) nextForkBoundary(now time.Time) (time.Time, bool) {
 	var next time.Time
@@ -820,18 +802,9 @@ func (s *Service) lastForkBoundary(now time.Time) (time.Time, bool) {
 // eachForkBoundary calls fn with every scheduled fork activation time.
 func (s *Service) eachForkBoundary(consider func(time.Time)) {
 	if cfg := s.config.CLConfig; cfg != nil {
-		genesis := cfg.GetGenesisTime()
-		slotsPerEpoch := cfg.GetSlotsPerEpoch()
-		secondsPerSlot := cfg.SecondsPerSlot
-		if genesis > 0 && slotsPerEpoch > 0 && secondsPerSlot > 0 {
-			for _, epoch := range cfg.ForkEpochs() {
-				offset, ok := forkOffsetSeconds(epoch, slotsPerEpoch, secondsPerSlot)
-				// Bound offset first: MaxInt64-offset is unsigned arithmetic and
-				// would wrap for an offset past MaxInt64, letting the guard pass.
-				if !ok || offset > math.MaxInt64 || genesis > math.MaxInt64-offset {
-					continue
-				}
-				consider(time.Unix(int64(genesis+offset), 0))
+		for _, epoch := range cfg.ForkEpochs() {
+			if t, ok := cfg.EpochStartTime(epoch); ok {
+				consider(t)
 			}
 		}
 	}

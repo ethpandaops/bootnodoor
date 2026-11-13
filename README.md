@@ -475,13 +475,21 @@ CAPELLA_FORK_VERSION: 0x03000000
 DENEB_FORK_VERSION: 0x04000000
 
 # Network parameters
-SECONDS_PER_SLOT: 12
+SLOT_DURATION_MS: 12000   # legacy configs use SECONDS_PER_SLOT: 12 instead
 SLOTS_PER_EPOCH: 32
+
+# Optional: a fork may change the slot duration from its first slot onwards
+# (EIP-7782 / EIP-8198). The suffix names the fork, e.g. HEZE or EIP8198.
+HEZE_FORK_EPOCH: 5
+SLOT_DURATION_MS_HEZE: 9000
 ```
 
 The bootnode automatically:
 1. Computes fork digests: `compute_fork_digest(fork_version, genesis_validators_root)[:4]`
-2. Determines current fork based on network time
+2. Determines current fork based on network time, following the slot duration
+   schedule: slots before a `SLOT_DURATION_MS_<FORK>` fork use the previous
+   duration, slots from that fork on use the new one, so fork activation times
+   and the current epoch stay correct across the change
 3. Accepts nodes with current fork digest
 4. Accepts nodes with old fork digests within grace period (default: 60 minutes)
 5. Deprioritizes but accepts historical fork digests
