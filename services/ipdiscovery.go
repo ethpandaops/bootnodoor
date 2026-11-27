@@ -82,8 +82,11 @@ type ipReport struct {
 	lastSeen  time.Time
 	// Counted by identity as well as by source IP: source addresses are
 	// spoofable, so one node ID must not satisfy the thresholds on its own.
-	reporterIDs map[string]int // Track distinct reporter node IDs -> count
-	reporterIPs map[string]int // Track distinct reporter IPs -> count
+	// Capped at minDistinctIPs, the only value they are compared against: the
+	// report for our own address never expires, so uncapped sets grow with
+	// every node ID that answers.
+	reporterIDs map[string]struct{}
+	reporterIPs map[string]struct{}
 }
 
 // IPDiscoveryConfig contains configuration for IP discovery
@@ -201,8 +204,8 @@ func (ipd *IPDiscovery) ReportIP(ip net.IP, port uint16, reporterID string, repo
 			ip:          ip,
 			port:        port,
 			firstSeen:   now,
-			reporterIDs: make(map[string]int),
-			reporterIPs: make(map[string]int),
+			reporterIDs: make(map[string]struct{}, ipd.minDistinctIPs),
+			reporterIPs: make(map[string]struct{}, ipd.minDistinctIPs),
 		}
 		reports[addrKey] = report
 	}
@@ -210,11 +213,9 @@ func (ipd *IPDiscovery) ReportIP(ip net.IP, port uint16, reporterID string, repo
 	// Update report
 	report.count++
 	report.lastSeen = now
-	report.reporterIDs[reporterID]++
-
-	// Track reporter IP
 	reporterIPStr := reporterIP.String()
-	report.reporterIPs[reporterIPStr]++
+	addDistinct(report.reporterIDs, reporterID, ipd.minDistinctIPs)
+	addDistinct(report.reporterIPs, reporterIPStr, ipd.minDistinctIPs)
 
 	*totalReports++
 
@@ -232,6 +233,12 @@ func (ipd *IPDiscovery) ReportIP(ip net.IP, port uint16, reporterID string, repo
 
 	// Check for consensus (check both IPv4 and IPv6)
 	ipd.checkConsensusLocked()
+}
+
+func addDistinct(set map[string]struct{}, key string, limit int) {
+	if len(set) < limit {
+		set[key] = struct{}{}
+	}
 }
 
 // checkConsensusLocked checks if an IP:Port has reached consensus for both IPv4 and IPv6.
